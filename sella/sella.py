@@ -5,8 +5,8 @@ from __future__ import division
 import numpy as np
 import scipy
 from scipy.linalg import eigh_tridiagonal, logm, expm, eigh, sqrtm
-from eigensolvers import lobpcg, NumericalHessian, ProjectedMatrix, atoms_tr_projection, exact, davidson
-from cython_routines import symmetrize_Y2
+from .eigensolvers import lobpcg, NumericalHessian, ProjectedMatrix, atoms_tr_projection, exact, davidson
+from .cython_routines import symmetrize_Y2
 
 class MinMode(object):
     def __init__(self, f, d, minmode=davidson, molecule=False, H0=None, v0=None,

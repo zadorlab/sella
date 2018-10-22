@@ -8,7 +8,7 @@ import scipy
 from scipy.linalg import eigh, eigh_tridiagonal, eig
 from scipy.sparse.linalg import LinearOperator, bicg, lsqr
 
-from cython_routines import ortho, symmetrize_Y2
+from .cython_routines import ortho, symmetrize_Y2
 
 def Levi_Civita(n):
     LC = np.zeros((n, n, n))
