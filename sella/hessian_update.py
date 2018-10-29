@@ -31,16 +31,17 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2):
     Ytilde = symmetrize_Y(S, Y, symm)
 
     if method == 'BFGS':
-        Bplus = B + _MS_BFGS(B, S, Ytilde)
+        Bplus = _MS_BFGS(B, S, Ytilde)
     elif method == 'TS-BFGS':
-        Bplus = B + _MS_TS_BFGS(B, S, Ytilde)
+        Bplus = _MS_TS_BFGS(B, S, Ytilde)
     elif method == 'PSB':
-        Bplus = B + _MS_TS_BFGS(B, S, Ytilde)
+        Bplus = _MS_PSB(B, S, Ytilde)
     elif method == 'SR1':
-        Bplus = B + _MS_SR1(B, S, Ytilde)
+        Bplus = _MS_SR1(B, S, Ytilde)
     else:
         raise ValueError('Unknown update method {}'.format(method))
     
+    Bplus += B
     Bplus -= np.tril(Bplus.T - Bplus, -1).T
 
     return Bplus
