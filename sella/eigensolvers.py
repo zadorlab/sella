@@ -1,14 +1,12 @@
 #!/usr/bin/env python
 
-from __future__ import division
-
 import numpy as np
-import scipy
 
-from scipy.linalg import eigh, eigh_tridiagonal, eig
+from scipy.linalg import eigh, null_space, lstsq
 from scipy.sparse.linalg import LinearOperator, bicg, lsqr
 
-from .cython_routines import ortho, symmetrize_Y2
+from .cython_routines import ortho
+from .hessian_update import symmetrize_Y
 
 def Levi_Civita(n):
     LC = np.zeros((n, n, n))
@@ -19,18 +17,6 @@ def Levi_Civita(n):
     return LC
 
 LC = Levi_Civita(3)
-
-def symmetrize_Y(S, Y, method=1):
-    if method == 0:
-        STY = S.T @ Y
-        return S @ scipy.linalg.lstsq(S.T @ S, np.tril(STY - STY.T, -1).T)[0]
-        #return S @ np.linalg.lstsq(S.T @ S, np.tril(S.T @ Y - Y.T @ S, -1).T, rcond=None)[0]
-    elif method == 1:
-        STY = S.T @ Y
-        return Y @ scipy.linalg.lstsq(STY, np.tril(STY - STY.T, -1).T)[0]
-        #return Y @ np.linalg.lstsq(S.T @ Y, np.tril(S.T @ Y - Y.T @ S, -1).T, rcond=None)[0]
-    elif method == 2:
-        return symmetrize_Y2(S, Y)
 
 def atoms_tr_projection(x0):
     d = len(x0)
@@ -466,7 +452,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     AV = np.hstack((AV, AT))
 
     method = 2
-    Atilde = V.T @ (AV + symmetrize_Y(V, AV, method=method))
+    Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
     #Atilde -= np.tril(Atilde - Atilde.T, -1)
     lams, vecs = eigh(Atilde)
     nneg = max(2, np.sum(lams < 0) + 1, nvecs)
@@ -474,7 +460,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     V = V @ vecs
     #L = np.tril(V.T @ AV - AV.T @ V, -1)
     #Ytilde = AV - V @ L
-    Ytilde = AV + symmetrize_Y(V, AV, method=method)
+    Ytilde = symmetrize_Y(V, AV, symm=method)
     #AV = Ytilde
     #R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
     R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
@@ -498,7 +484,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
                 break
 
         #Proj = I - V @ V.T #- T @ T.T
-        Vnull = scipy.linalg.null_space(V.T)
+        Vnull = null_space(V.T)
         Proj = Vnull @ Vnull.T
         #if Rnorm[i] < 0.1 * abs(lams[i]):
         if True:
@@ -508,7 +494,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
             #PProj = Proj @ (P_shift - 1.15 * P_lams[0] * I) @ Proj
             PProj = Proj @ P_shift - 1.15 * P_lams[0] * Proj
         #t, _, _, _ = np.linalg.lstsq(PProj, -Proj @ Rfit, rcond=None)
-        t, _, _, _ = scipy.linalg.lstsq(PProj, -Proj @ Rfit)
+        t, _, _, _ = lstsq(PProj, -Proj @ Rfit)
         t = ortho(t, V)
         if t.shape[0] == 0:
 #            print("Davidson failed, using Lanczos step")
@@ -523,7 +509,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
         
         V = np.hstack([V, t])
         AV = np.hstack([AV, At])
-        Atilde = V.T @ (AV + symmetrize_Y(V, AV, method=method))
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
         #Atilde = V.T @ AV
         #Atilde -= np.tril(Atilde - Atilde.T, -1)  # symmetrize approximation to A
         lams, vecs = eigh(Atilde)
@@ -531,7 +517,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
         AV = AV @ vecs
         V = V @ vecs
         
-        Ytilde = AV + symmetrize_Y(V, AV, method=method)
+        Ytilde = symmetrize_Y(V, AV, symm=method)
         #AV = Ytilde
         #R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
         R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
@@ -595,7 +581,7 @@ def lanczos2(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nrandom
     AV = np.hstack((AV, AT))
 
     method = 2
-    Atilde = V.T @ (AV + symmetrize_Y(V, AV, method=method))
+    Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
     #Atilde -= np.tril(Atilde - Atilde.T, -1)
     lams, vecs = eigh(Atilde)
     nneg = max(2, np.sum(lams < 0) + 1, nvecs)
@@ -603,7 +589,7 @@ def lanczos2(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nrandom
     V = V @ vecs
     #L = np.tril(V.T @ AV - AV.T @ V, -1)
     #Ytilde = AV - V @ L
-    Ytilde = AV + symmetrize_Y(V, AV, method=method)
+    Ytilde = symmetrize_Y(V, AV, symm=method)
     #AV = Ytilde
     R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
     Rnorm = np.linalg.norm(R, axis=0)
@@ -646,7 +632,7 @@ def lanczos2(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nrandom
         
         V = np.hstack([V, t])
         AV = np.hstack([AV, At])
-        Atilde = V.T @ (AV + symmetrize_Y(V, AV, method=method))
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
         #Atilde = V.T @ AV
         #Atilde -= np.tril(Atilde - Atilde.T, -1)  # symmetrize approximation to A
         lams, vecs = eigh(Atilde)
@@ -654,7 +640,7 @@ def lanczos2(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nrandom
         AV = AV @ vecs
         V = V @ vecs
         
-        Ytilde = AV + symmetrize_Y(V, AV, method=method)
+        Ytilde = symmetrize_Y(V, AV, symm=method)
         #AV = Ytilde
         R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
         Rnorm = np.linalg.norm(R, axis=0)
