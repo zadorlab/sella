@@ -4,7 +4,7 @@ from __future__ import division
 
 import numpy as np
 import scipy
-from scipy.linalg import eigh
+from scipy.linalg import eigh, lstsq
 from .eigensolvers import lobpcg, NumericalHessian, ProjectedMatrix, atoms_tr_projection, exact, davidson
 
 def p_rfo(minmode, x0, maxiter, ftol, **kwargs):
@@ -182,19 +182,19 @@ def rs_prfo(minmode, g, r_tr, order=1, xi=1.):
     A1 = np.zeros((order + 1, order + 1))
     r1 = np.arange(1, order + 1)  # diagonal indices excluding [0,0]
 
-    A1[0, 1:] = -g_proj[:order]
-    A1[1:, 0] = -g_proj[:order]
+    A1[0, 1:] = A1[1:, 0] = g_proj[:order]
     A1[r1, r1] = lams[:order]
 
     A2 = np.zeros((d - order + 1, d - order + 1))
     r2 = np.arange(1, d - order + 1)  # diagonal indices excluding [0,0]
 
-    A2[0, 1:] = -g_proj[order:]
-    A2[1:, 0] = -g_proj[order:]
+    A2[0, 1:] = A2[1:, 0] = g_proj[order:]
     A2[r2, r2] = lams[order:]
 
     B1 = np.eye(order + 1)
     B2 = np.eye(d - order + 1)
+
+    xi = 1.
 
     bound_clip = False
     while True:
@@ -207,6 +207,7 @@ def rs_prfo(minmode, g, r_tr, order=1, xi=1.):
 
         dx = vecs @ dx_proj
         dx_mag = np.linalg.norm(dx)
+        #print(xi, dx_mag / r_tr)
 
         if not bound_clip:
             if dx_mag < r_tr:
@@ -217,7 +218,7 @@ def rs_prfo(minmode, g, r_tr, order=1, xi=1.):
                 bound_clip = True
                 continue
         else:
-            if abs(dx_mag - r_tr) < 1e-14 * r_tr:
+            if abs(dx_mag - r_tr) < 1e-10 * r_tr:
                 break
 
             if dx_mag > r_tr:
@@ -431,6 +432,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
     xi = 1.
     while True:
         dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, g, r_trust, 1, xi)
+        #dx, dx_mag, xi, bound_clip, df_pred =  rs_prfo(minmode, g, r_trust, 1, xi)
 
         f0, g0 = f, g
         H0 = minmode.H.copy()
@@ -446,9 +448,6 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         if np.linalg.norm(g1) < ftol:
             return x + dx
     
-        df = f1 - f0
-        ratio = df_pred / df
-
         method = None
         alpha = 1.
 
@@ -479,9 +478,9 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
             f, g = f1, g1
 
         x += alpha * dx
-        #ratio = df_pred / df
         evnext = False
 
+        ratio = minmode.ratio
         if ratio < dec_lb or ratio > dec_ub:
             r_trust = dx_mag * dec_factr
             f, g = minmode.f_update(x)
@@ -495,8 +494,90 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         
         print(f1, np.linalg.norm(g1), ratio, alpha, dx_mag / r_trust, r_trust, method, minmode.lams[0])
 
-def gediis(minmode, x0, maxcalls, ftol, nqn=0, nhist=5,
-           dx_max=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
+class GDIIS(object):
+    def __init__(self, d, nhist):
+        self.d = d
+        self.nhist = nhist
+
+        self.E = np.zeros(nhist, dtype=np.float64)
+        self.R = np.zeros((d, nhist), dtype=np.float64)
+        self.G = np.zeros((d, nhist), dtype=np.float64)
+        self.HG = np.zeros((d, nhist), dtype=np.float64)
+        self.GTG = np.zeros((nhist, nhist), dtype=np.float64)
+
+        self._n = 0
+
+    def update(self, e, r, g, minmode):
+        vecs = minmode.vecs
+        L = abs(minmode.lams)
+        L[0] *= -1
+
+        self.E = np.roll(self.E, 1)
+        self.R = np.roll(self.R, 1, 1)
+        self.G = np.roll(self.G, 1, 1)
+        self.HG = np.roll(self.HG, 1, 1)
+        self.GTG = np.roll(self.GTG, 1, (0, 1))
+
+        self.E[0] = e
+        self.R[:, 0] = r.copy()
+        self.G[:, 0] = g.copy()
+        #self.HG = vecs @ np.diag(L) @ vecs.T @ self.G
+        #self.GTG = self.HG.T @ self.HG
+        self.HG[:, 0] = vecs @ ((vecs.T @ g) / L)
+        self.GTG[0, :] = self.GTG[:, 0] = self.HG.T @ self.HG[:, 0]
+
+        self.n = min(self.n + 1, self.nhist)
+
+    def _calc_c(self):
+        c = np.zeros(self.nhist)
+        c[0] = 1.
+        resmin = np.infty
+        for mask in mask_gen2(self.n):
+            c[:self.n] = mask * lstsq(self.GTG[:self.n, :self.n], mask)[0]
+            c /= c.sum()
+            # only interpolate, and ensure latest point contributes to fit
+            #if np.all(self._c >= 0.) and self._c[self.n - 1] > 1. / self.n:
+            if np.all(c >= 0.):
+                res = np.linalg.norm(self.HG @ c)
+                if res < resmin:
+                    self._c = c
+                    resmin = res
+        print(self._c, resmin)
+
+    def reset(self):
+        self.n = 1
+        self._calc_c()
+
+    @property
+    def n(self):
+        return self._n
+
+    @n.setter
+    def n(self, val):
+        self._n = val
+        self._c = None
+
+    @property
+    def c(self):
+        if self._c is None:
+            self._calc_c()
+        return self._c
+
+    @property
+    def r(self):
+        return self.R @ self.c
+
+    @property
+    def g(self):
+        return self.G @ self.c
+
+    @property
+    def e(self):
+        return self.E @ self.c
+
+
+def gediis(minmode, x0, maxcalls, ftol, nqn=0, nhist=10,
+           r_trust=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
            inc_lb=0.8, inc_ub=1.2, gnorm_ev_thr=2., **kwargs):
     d = len(x0)
     minmode.calls = 0
@@ -505,181 +586,64 @@ def gediis(minmode, x0, maxcalls, ftol, nqn=0, nhist=5,
     gnormlast = 0.
     evnext = True
 
-    G = np.zeros((d, nhist), dtype=np.float64)
-    R = np.zeros((d, nhist), dtype=np.float64)
-    E = np.zeros(nhist, dtype=np.float64)
-    HG = np.zeros((d, nhist), dtype=np.float64)
-    R[:, 0] = x0.copy()
-    G[:, 0] = g1.copy()
-    E[0] = f1
-    HG[:, 0], _, _, _ = scipy.linalg.lstsq(minmode.H, g1)
-
-    H = np.zeros((d, d, nhist), dtype=np.float64)
-    H[:, :, 0] = minmode.H.copy()
+    gdiis = GDIIS(d, nhist)
+    gdiis.update(f1, x0, g1, minmode)
 
     f, g = f1, g1
     I = np.eye(d)
 
     xi = 0.5
-    c = np.array([1.])
 
-    n = 1
     neval = 0
     lam_last = 1
     while True:
-        print(c)
+        dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, gdiis.g, r_trust, 1, xi)
+
         lams = minmode.lams
         vecs = minmode.vecs
         allow_increase = True
 
         L = np.abs(lams)
 
-        if lams[0] > 0:
-            print('positive eigenvalue found')
-            #bound_clip = True
-            evnext = True
-            #allow_increase = False
-            #c[:-1] = 0.
-            #c[-1] = 1.
-            nclimb = 2
-            #L[:nclimb] *= -1
-            L[:nclimb] = -1
-            L[nclimb:] = 0
-            dx = -vecs[:, :nclimb] @ np.diag(1 / L[:nclimb]) @ vecs[:, :nclimb].T @ G[:, :n] @ c
-
-            #dx = vecs[:, 0] * np.sign(vecs[:, 0].T @ G[:, :n] @ c)
-            #nclimb = d
-            #dx = vecs[:, :nclimb] @ np.diag(1 / lams[:nclimb]) @ vecs[:, :nclimb].T @ G[:, :n] @ c
-            #dx *= dx_max / np.linalg.norm(dx)
-            #dx_mag = dx_max
-            #dx_rms = np.sqrt(np.average(dx**2))
-        else:
-            L[0] *= -1
-            dx = -vecs @ np.diag(1 / L) @ vecs.T @ G[:, :n] @ c
-
-        dx_rms = np.sqrt(np.average(dx**2))
-
-        dx_mag = np.linalg.norm(dx)
-
-            
-        bound_clip = False
-        if dx_mag > dx_max:
-            xi /= 2.
-            bound_clip = True
-            rfo_counter = 0
-            xilower = 0
-            xiupper = None
-            #L = np.abs(lams)
-            #L[0] *= -1
-            while True:
-                if xiupper is None:
-                    xi *= 2
-                else:
-                    xi = (xilower + xiupper) / 2.
-                #Htilde = vecs @ np.diag(L + xi / L) @ vecs.T
-                #dx, _, _, _ = scipy.linalg.lstsq(Htilde, -G[:, :n] @ c)
-                dx = -vecs @ np.diag(L / (L * L + xi)) @ vecs.T @ G[:, :n] @ c
-                dx_mag = np.linalg.norm(dx)
-                if abs(dx_mag - dx_max) < 1e-8 * dx_max:
-                    print(xi, rfo_counter)
-                    break
-
-                if dx_mag > dx_max:
-                    xilower = xi
-                else:
-                    xiupper = xi
-                rfo_counter += 1
-        
-        dr = (R[:, :n] @ c - R[:, n - 1]) + dx
-        df_pred = dr @ G[:, n - 1] + 0.5 * dr @ minmode.H @ dr
-        #dR = (R[:, :n] @ c + dx)[:, np.newaxis] - R[:, :n]
-        #df_pred = np.diag(dR.T @ (G[:, :n] + minmode.H @ dR / 2.)) @ c
-
+        x1 = gdiis.r + dx
         if evnext or (nqn > 0 and neval % nqn == 0):
             V0 = dx[:, np.newaxis].copy()
-            f1, g1 = minmode.f_minmode(R[:, :n] @ c + dx, V0=V0, **kwargs)
+            f1, g1 = minmode.f_minmode(x1, V0=V0, **kwargs)
             neval = 0
             evnext = False
         else:
             f1last, g1last = f1, g1
-            f1, g1 = minmode.f_update(R[:, :n] @ c + dx)
+            f1, g1 = minmode.f_update(x1)
 
         if minmode.calls >= maxcalls:
-            return R[:, :n] @ c + dx
+            return x1
 
         neval += 1
 
         if np.linalg.norm(g1) < ftol:
-            return R[:, :n] @ c + dx
+            return x1
 
-        #df = f1 - E[:n] @ c
-        df = f1 - E[n - 1]
-        ratio = df_pred / df
+        ratio = minmode.ratio
 
         gnormlast = gnorm
         gnorm = np.linalg.norm(g1)
         #if gnorm > gnormlast:
         #    allow_increase = False
 
+        x = x1
+
         if ratio < dec_lb or ratio > dec_ub:
-            print(f1, np.linalg.norm(g1), ratio, dx_mag / dx_max, dx_max, lams[0])
-            dx_max = dx_mag * dec_factr
-            evnext = True
-            c[:-1] = 0.
-            c[-1] = 1.
-            continue
+            gdiis.n = 0
+            r_trust = dx_mag * dec_factr
+            f1, g1 = minmode.f_update(x)
+        elif bound_clip and inc_lb < ratio < inc_ub:
+            r_trust /= inc_factr
 
-        #elif (bound_clip or abs(dx_mag - dx_max) < 1e-3 * dx_max) and inc_lb < ratio < inc_ub:
-        elif allow_increase and (bound_clip or abs(dx_mag - dx_max) < 1e-3 * dx_max) and inc_lb < ratio < inc_ub:
-            dx_max /= inc_factr
+        gdiis.update(f1, x1, g1, minmode)
+        #if bound_clip:
+        #    gdiis.n = 1
 
-        x = R[:, :n] @ c + dx
-
-        if n >= nhist:
-            G[:, :-1] = G[:, 1:].copy()
-            R[:, :-1] = R[:, 1:].copy()
-            E[:-1] = E[1:].copy()
-            #H[:, :, :-1] = H[:, :, 1:].copy()
-            HG[:, :-1] = HG[:, 1:].copy()
-
-
-        n = min(n + 1, nhist)
-
-        lams = minmode.lams
-        vecs = minmode.vecs
-        L = abs(lams)
-        if lams[0] > 0:
-            L *= -1
-        else:
-            L[0] *= -1
-        HG[:, n - 1] = vecs @ np.diag(1 / L) @ vecs.T @ g1
-
-        G[:, n - 1] = g1.copy()
-        R[:, n - 1] = x.copy()
-        E[n - 1] = f1
-        #H[:, :, n - 1] = minmode.H.copy()
-        #HG[:, n - 1], _, _, _ = scipy.linalg.lstsq(minmode.H, g1)
-        #HG = vecs @ np.diag(1 / L) @ vecs.T @ G[:, :n]
-
-        #HG, _, _, _ = scipy.linalg.lstsq(minmode.H, G[:, :n])
-        #HG = np.zeros((d, n), dtype=np.float64)
-        #for i in range(n):
-        #    HG[:, i], _, _, _ = scipy.linalg.lstsq(H[:, :, i], G[:, i])
-        #GTG = HG.T @ HG
-        GTG = HG[:, :n].T @ HG[:, :n]
-        #GTG = G[:, :n].T @ G[:, :n]
-        ONES = np.ones(n)
-        gnorm_max = np.infty
-        c = np.zeros(n)
-        c[-1] = 1.
-        for mask in mask_gen(n):
-            Y, _, _, _ = scipy.linalg.lstsq(GTG, ONES - mask)
-            c = (Y / (Y @ (ONES - mask))) @ (np.eye(n) - np.diag(mask))
-            #if np.all(c >= 0.): # and np.all(c[-1] > c[:-1]):
-            if np.all(c >= 0.) and c[-1] > 1. / n:
-                break
-
-        print(f1, np.linalg.norm(g1), ratio, dx_mag/dx_max, dx_max, lams[0])
+        print(f1, np.linalg.norm(g1), ratio, dx_mag/r_trust, r_trust, lams[0])
 
 def lbfgs(minmode, x0, maxiter, ftol, inicurv=1., maxls=10, exact_diag=False, **kwargs):
     d = len(x0)
@@ -819,5 +783,17 @@ def mask_gen(n):
             mask[i + 1] += mask[i] // 2
             mask[i] %= 2
         if mask[-1] == 1:
+            return
+        yield mask.copy()
+
+def mask_gen2(n):
+    mask = np.ones(n, dtype=int)
+    yield mask.copy()
+    while True:
+        mask[-1] -= 1
+        for i in range(n - 2, -1, -1):
+            mask[i] += mask[i + 1] // 2
+            mask[i + 1] %= 2
+        if mask[0] == 0:
             return
         yield mask.copy()

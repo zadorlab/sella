@@ -11,26 +11,39 @@ class MinMode(object):
         self.f = f
         self.d = d
         self.v = v0
-        self.lam = 1
         self.minmode = minmode
         self.H = None
+        self.flast = None
         self.xlast = None
         self.glast = None
-        self.Hproj = None
         self.molecule = molecule
         self.H0 = H0
         self.shift = trshift
         self.shift_factor = trshift_factor
         self.calls = 0
         self.Hlast = None
-        self.Hinv = None
+        self.df = None
+        self.df_pred = None
+        self.ratio = None
 
     def f_update(self, x):
+        if self.xlast is not None and np.all(x == self.xlast):
+            return self.flast, self.glast
+
         self.calls += 1
         f, g = self.f(x)
+
+        if self.flast is not None:
+            self.df = f - self.flast
+            dx = x - self.xlast
+            self.df_pred = self.glast.T @ dx + (dx.T @ self.H @ dx) / 2.
+            self.ratio = self.df_pred / self.df
+
         if self.xlast is not None and self.glast is not None:
             self.H = update_H(self.H, x - self.xlast, g - self.glast)
             self.lams, self.vecs = eigh(self.H)
+
+        self.flast = f
         self.xlast = x.copy()
         self.glast = g.copy()
         return f, g
