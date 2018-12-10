@@ -534,7 +534,7 @@ class GDIIS(object):
         c = np.zeros(self.nhist)
         c[0] = 1.
         resmin = np.infty
-        for mask in mask_gen2(self.n):
+        for mask in mask_gen(self.n):
             c[:self.n] = mask * lstsq(self.GTG[:self.n, :self.n], mask)[0]
             c /= c.sum()
             # only interpolate, and ensure latest point contributes to fit
@@ -777,18 +777,6 @@ def lbfgs(minmode, x0, maxiter, ftol, inicurv=1., maxls=10, exact_diag=False, **
         print(f, np.linalg.norm(g), tau, np.sign(minmode.lams[0]) * np.sqrt(np.abs(minmode.lams[0])) * 3276.4983)
 
 def mask_gen(n):
-    mask = np.zeros(n, dtype=int)
-    yield mask.copy()
-    while True:
-        mask[0] += 1
-        for i in range(n - 1):
-            mask[i + 1] += mask[i] // 2
-            mask[i] %= 2
-        if mask[-1] == 1:
-            return
-        yield mask.copy()
-
-def mask_gen2(n):
     mask = np.ones(n, dtype=int)
     yield mask.copy()
     while True:
