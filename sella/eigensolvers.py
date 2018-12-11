@@ -219,7 +219,7 @@ class MatrixSum(LinearOperator):
         return MatrixSum(self, other)
 
 
-def exact(A, maxres=None, P=None):
+def exact(A, maxres=None, P=None, T=None, shift=None, nlan=None):
     if isinstance(A, np.ndarray):
         lams, vecs = eigh(A)
     else:
