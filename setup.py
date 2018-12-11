@@ -30,6 +30,6 @@ setup(name='Sella',
                    'Topic :: Scientific/Engineering :: Chemistry',
                    'Topic :: Scientific/Engineering :: Mathematics',
                    'Topic :: Scientific/Engineering :: Physics'],
-      python_requires='>=3.6',
-      install_requires=['numpy', 'scipy', 'cython'],
+      python_requires='>=3.5',
+      install_requires=['numpy', 'scipy>=1.1.0', 'cython'],
       )
