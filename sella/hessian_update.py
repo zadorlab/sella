@@ -20,7 +20,7 @@ def symmetrize_Y(S, Y, symm):
     else:
         raise ValueError("Unknown symmetrization method {}".format(symm))
 
-def update_H(B, S, Y, method='TS-BFGS', symm=2):
+def update_H(B, S, Y, method='BFGS_auto', symm=2):
     if len(S.shape) == 1:
         if np.linalg.norm(S) < 1e-8:
             return B
@@ -29,6 +29,16 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2):
         Y = Y[:, np.newaxis]
 
     Ytilde = symmetrize_Y(S, Y, symm)
+
+    if method == 'BFGS_auto':
+        # Default to TS-BFGS, and only use BFGS if B and S.T @ Y are
+        # both positive definite
+        method = 'TS-BFGS'
+        lams_B, vecs_B = eigh(B)
+        if np.all(lams_B > 0):
+            lams_STY, vecs_STY = S.T @ Ytilde
+            if np.all(lams_STY > 0):
+                method = 'BFGS'
 
     if method == 'BFGS':
         Bplus = _MS_BFGS(B, S, Ytilde)
