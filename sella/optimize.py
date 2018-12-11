@@ -422,6 +422,8 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
     f1, g1 = minmode.f_minmode(x0, **kwargs)
     f, g = f1, g1
 
+    r_trust_min = kwargs.get('dxL', r_trust / 100.)
+
     x = x0.copy()
     xlast = x.copy()
     I = np.eye(d)
@@ -484,7 +486,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
         ratio = minmode.ratio
         if ratio < dec_lb or ratio > dec_ub:
-            r_trust = dx_mag * dec_factr
+            r_trust = max(dx_mag * dec_factr, r_trust_min)
             f, g = minmode.f_update(x)
         elif bound_clip and inc_lb < ratio < inc_ub:
             r_trust /= inc_factr
