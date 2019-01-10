@@ -11,6 +11,8 @@ ext_modules = [Extension('sella.force_match',
                          ['sella/force_match.pyx']),
                Extension('sella.cython_routines',
                          ['sella/cython_routines.pyx']),
+               Extension('sella.internal_cython',
+                         ['sella/internal_cython.pyx']),
                ]
 
 setup(name='Sella',
