@@ -66,8 +66,7 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
     cdef size_t natoms = len(atoms)
 
     cdef double[:, :] rij = memoryview(atoms.get_all_distances())
-    #cdef double[:] rcov = memoryview((1.5 * np.array([covalent_radii[atom.number] for atom in atoms])))
-    cdef double[:] rcov = memoryview((0.6 * np.array([covalent_radii[atom.number] for atom in atoms])))
+    cdef double[:] rcov = memoryview((1.5 * np.array([covalent_radii[atom.number] for atom in atoms])))
 
     # c10y == connectivity
     c10y_np = -np.ones((natoms, _MAX_BONDS), dtype=np.int32)
