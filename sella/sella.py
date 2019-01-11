@@ -2,12 +2,13 @@
 
 import numpy as np
 from scipy.linalg import eigh, null_space
-from .eigensolvers import NumericalHessian, ProjectedMatrix, atoms_tr_projection, davidson
+from .eigensolvers import NumericalHessian, ProjectedMatrix, atoms_tr_projection, davidson, project_translation, project_rotation
 from .hessian_update import update_H
 
 class MinMode(object):
     def __init__(self, f, d, minmode=davidson, molecule=False, H0=None, v0=None,
-                 trshift=1000, trshift_factor=4.):
+                 trshift=1000, trshift_factor=4., project_translations=False,
+                 project_rotations=False):
         self.f = f
         self.d = d
         self.v = v0
@@ -25,6 +26,8 @@ class MinMode(object):
         self.df = None
         self.df_pred = None
         self.ratio = None
+        self.project_translations = molecule or project_translations
+        self.project_rotations = molecule or project_rotations
 
     def f_update(self, x):
         if self.xlast is not None and np.all(x == self.xlast):
@@ -56,17 +59,19 @@ class MinMode(object):
         Htrue = NumericalHessian(self.f, x0, g0, dxL, threepoint)
 
         I = np.eye(self.d)
-        if self.molecule:
-            T = atoms_tr_projection(x0)
-            _, ntr = T.shape
-        else:
-            T = np.empty((self.d, 0))
-            ntr = 0
+        T = np.empty((self.d, 0))
+        if self.project_translations:
+            T = np.hstack((T, project_translation(x0)))
+        if self.project_rotations:
+            T = np.hstack((T, project_rotation(x0)))
+        _, ntr = T.shape
+
 
         P = self.H
         if P is None:
             if self.H0 is not None:
                 self.H = self.H0
+                self.lams, self.vecs = eigh(self.H)
                 P = self.H
             elif self.v is not None:
                 P = I - 2 * np.outer(self.v, self.v)

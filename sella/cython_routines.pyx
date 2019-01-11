@@ -97,7 +97,9 @@ def ortho(X, Y, M=None, double eps=1e-15):
     n, nx = X_local.shape
     _, ny = Y_local.shape
     if nx + ny > n:
-        raise RuntimeError
+        ny = n - nx
+        #Y_local = np.empty((n, ny), order='C')
+        Y_local = Y_local[:, :ny]
 
     if ny == n:
         return np.empty((0, n))
@@ -179,7 +181,8 @@ def simple_ortho(X, Y, double eps=1e-15):
     n, nx = X_local.shape
     _, ny = Y_local.shape
     if nx + ny > n:
-        raise RuntimeError
+        ny = n - nx
+        Y_local = Y_local[:, :ny]
 
     if ny == n:
         return np.empty((0, n))
