@@ -315,15 +315,29 @@ cdef void cart_to_angle(int[:, :] angles,
     cdef size_t nangles = len(angles)
 
     cdef double[:] x12, x23
+    cdef double[:] x12_x23 = array(shape=(3,), itemsize=sizeof(double), format="d")
 
-    cdef size_t i, j, k, m, n, p
+    cdef size_t i, j, k
     cdef size_t a1, a2, a3
-    cdef double tmp1, tmp2, tmp3, tmp4, tmp5
-    cdef double r12, r23, cosq, sinq, r122, r232
+    cdef double tmp1, tmp2, tmp3, tmp4
+    cdef double r12, r23, r122, r232, r12x23, r12d23
+
+    cdef double[:, :] dq_int = array(shape=(2, 3), itemsize=sizeof(double), format="d")
+
+    cdef double[:, :, :, :] d2q_int = array(shape=(2, 3, 2, 3), itemsize=sizeof(double), format="d")
 
     cdef int sd_dx = dx.strides[2] // 8
     cdef int sd_dq = dq.strides[2] // 8
     cdef int sd_d2q = d2q.strides[2] // 8
+    cdef int sd_d2int = d2q_int.strides[1] // 8
+
+    # The standard way of calculating the angle between two vectors
+    # a and b is arccos((a.b)/(|a| |b|)). Here, we use a different
+    # approach that depends on the relation |sin q| = |a| |b| |axb|.
+    # Rather than using arccos (or arcsin), we use arctan2(|axb|, (a.b)).
+    # This is primarily because the curvature becomes easier to evaluate
+    # (perhaps somewhat counterintuitively). arctan2 is also *somewhat*
+    # more accurate than arccos, though this is probably negligable.
 
     for i in range(nangles):
         a1 = angles[i, 0]
@@ -333,106 +347,83 @@ cdef void cart_to_angle(int[:, :] angles,
         x12 = dx[i, 0]
         x23 = dx[i, 1]
 
-        r12 = sqrt(ddot(&THREE, &x12[0], &sd_dx, &x12[0], &sd_dx))
-        r23 = sqrt(ddot(&THREE, &x23[0], &sd_dx, &x23[0], &sd_dx))
-        cosq = ddot(&THREE, &x12[0], &sd_dx, &x23[0], &sd_dx) / (r12 * r23)
+        r12d23 = ddot(&THREE, &x12[0], &sd_dx, &x23[0], &sd_dx)
 
-        q[i] = acos(cosq)
+        cross(x12, x23, x12_x23)
+        r12x23 = dnrm2(&THREE, &x12_x23[0], &UNITY)
+
+        q[i] = atan2(r12d23, r12x23)
 
         if not (gradient or curvature):
             continue
 
+        r12 = dnrm2(&THREE, &x12[0], &sd_dx)
+        r23 = dnrm2(&THREE, &x23[0], &sd_dx)
+
         r122 = r12 * r12
         r232 = r23 * r23
+        memset(&dq_int[0, 0,], 0, 6 * sizeof(double))
 
-        sinq = sqrt(1 - cosq * cosq)
+        tmp1 = -r12d23 / (r122 * r12x23)
+        tmp2 = 1 / r12x23
+        daxpy(&THREE, &tmp1, &x12[0], &sd_dx, &dq_int[0, 0], &UNITY)
+        daxpy(&THREE, &tmp2, &x23[0], &sd_dx, &dq_int[0, 0], &UNITY)
 
-        tmp1 = -cosq / (sinq * r122)
-        tmp2 = 1. / (sinq * r12 * r23)
-        daxpy(&THREE, &tmp1, &x12[0], &sd_dx, &dq[i,a1,0], &sd_dq)
-        daxpy(&THREE, &tmp2, &x23[0], &sd_dx, &dq[i,a1,0], &sd_dq)
+        tmp1 = -r12d23 / (r232 * r12x23)
+        daxpy(&THREE, &tmp1, &x23[0], &sd_dx, &dq_int[1, 0], &UNITY)
+        daxpy(&THREE, &tmp2, &x12[0], &sd_dx, &dq_int[1, 0], &UNITY)
 
-        tmp1 = -tmp2
-        tmp2 = cosq / (sinq * r232)
-        daxpy(&THREE, &tmp1, &x12[0], &sd_dx, &dq[i,a3,0], &sd_dq)
-        daxpy(&THREE, &tmp2, &x23[0], &sd_dx, &dq[i,a3,0], &sd_dq)
+        dcopy(&THREE, &dq_int[0, 0], &UNITY, &dq[i, a2, 0], &sd_dq)
+        dcopy(&THREE, &dq_int[1, 0], &UNITY, &dq[i, a3, 0], &sd_dq)
 
-        daxpy(&THREE, &DNUNITY, &dq[i,a1,0], &sd_dq, &dq[i,a2,0], &sd_dq)
-        daxpy(&THREE, &DNUNITY, &dq[i,a3,0], &sd_dq, &dq[i,a2,0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[0, 0], &UNITY, &dq[i, a1, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[1, 0], &UNITY, &dq[i, a2, 0], &sd_dq)
+
 
         if not curvature:
             continue
+        memset(&d2q_int[0, 0, 0, 0], 0, 36 * sizeof(double))
 
-        # d2q is (3 x 3 x 3 x 3), or (9 x 9).
-        # It can be broken up into 9 blocks of 3x3 submatrices
-        #
-        # +---+---+---+
-        # |   |   |   |
-        # |0,0|1,0|2,0|
-        # |   |   |   |
-        # +---+---+---+
-        # |   |   |   |
-        # |0,1|1,1|2,1|
-        # |   |   |   |
-        # +---+---+---+
-        # |   |   |   |
-        # |0,2|1,2|2,2|
-        # |   |   |   |
-        # +---+---+---+
-        #
-        # We fill these blocks one at a time. Because d2q is a Hessian
-        # matrix, it is symmetric, and we can use this property to avoid
-        # recalculating the same thing multiple times.
 
-        tmp5 = -cosq / sinq
+        # 0, 0
+        tmp1 = -r12d23 / (r122 * r12x23)
+        tmp2 = -r232 / (r12x23**3)
+        tmp3 = r12d23 / (r12x23**3)
+        tmp4 = r12d23 * (2 / r122 + r232 / r12x23**2) / (r122 * r12x23)
 
-        # First we fill in (0,0)
-        tmp1 = cosq / (sinq * r122)
-        tmp2 = -3 * cosq / (sinq * r122 * r122)
-        tmp3 = 1 / (sinq * r12 * r122 * r23)
+        dlaset('L', &THREE, &THREE, &DZERO, &tmp1, &d2q_int[0, 0, 0, 0], &sd_d2int)
+        dsyr2('L', &THREE, &tmp2, &x12[0], &sd_dx, &x23[0], &sd_dx, &d2q_int[0, 0, 0, 0], &sd_d2int)
+        dsyr('L', &THREE, &tmp3, &x23[0], &sd_dx, &d2q_int[0, 0, 0, 0], &sd_d2int)
+        dsyr('L', &THREE, &tmp4, &x12[0], &sd_dx, &d2q_int[0, 0, 0, 0], &sd_d2int)
 
-        dlaset('G', &THREE, &THREE, &DZERO, &tmp1, &d2q[i, a1, 0, a1, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp2, &x12[0], &sd_dx, &x12[0], &sd_dx, &d2q[i, a1, 0, a1, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp3, &x12[0], &sd_dx, &x23[0], &sd_dx, &d2q[i, a1, 0, a1, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp3, &x23[0], &sd_dx, &x12[0], &sd_dx, &d2q[i, a1, 0, a1, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp5, &dq[i, a1, 0], &sd_dq, &dq[i, a1, 0], &sd_dq, &d2q[i, a1, 0, a1, 0], &sd_d2q)
+        # 0, 1
+        tmp1 = 1 / r12x23**3
+        dsyr('L', &THREE, &tmp1, &x12_x23[0], &UNITY, &d2q_int[0, 0, 1, 0], &sd_d2int)
+        symmetrize(&d2q_int[0, 0, 1, 0], 3, 6)
 
-        # Then (0,2)
-        tmp1 = 1 / (sinq * r12 * r23)
-        tmp2 = -tmp3
-        tmp3 = cosq / (sinq * r122 * r232)
-        tmp4 = -1 / (sinq * r12 * r232 * r23)
+        # 1, 1
+        tmp1 = -r12d23 / (r232 * r12x23)
+        tmp2 = -r122 / (r12x23**3)
+        tmp4 = r12d23 * (2 / r232 + r122 / r12x23**2) / (r232 * r12x23)
 
-        dlaset('G', &THREE, &THREE, &DZERO, &tmp1, &d2q[i, a1, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp2, &x12[0], &sd_dx, &x12[0], &sd_dx, &d2q[i, a1, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp3, &x12[0], &sd_dx, &x23[0], &sd_dx, &d2q[i, a1, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp4, &x23[0], &sd_dx, &x23[0], &sd_dx, &d2q[i, a1, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp5, &dq[i, a1, 0], &sd_dq, &dq[i, a3, 0], &sd_dq, &d2q[i, a1, 0, a3, 0], &sd_d2q)
+        dlaset('L', &THREE, &THREE, &DZERO, &tmp1, &d2q_int[1, 0, 1, 0], &sd_d2int)
+        dsyr2('L', &THREE, &tmp2, &x12[0], &sd_dx, &x23[0], &sd_dx, &d2q_int[1, 0, 1, 0], &sd_d2int)
+        dsyr('L', &THREE, &tmp3, &x12[0], &sd_dx, &d2q_int[1, 0, 1, 0], &sd_d2int)
+        dsyr('L', &THREE, &tmp4, &x23[0], &sd_dx, &d2q_int[1, 0, 1, 0], &sd_d2int)
 
-        # Then (2,2)
-        tmp1 = cosq / (sinq * r232)
-        tmp2 = -3 * cosq / (sinq * r232 * r232)
-        tmp3 = -tmp4
+        symmetrize(&d2q_int[0, 0, 0, 0], 6, 6)
 
-        dlaset('G', &THREE, &THREE, &DZERO, &tmp1, &d2q[i, a3, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp2, &x23[0], &sd_dx, &x23[0], &sd_dx, &d2q[i, a3, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp3, &x12[0], &sd_dx, &x23[0], &sd_dx, &d2q[i, a3, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp3, &x23[0], &sd_dx, &x12[0], &sd_dx, &d2q[i, a3, 0, a3, 0], &sd_d2q)
-        dger(&THREE, &THREE, &tmp5, &dq[i, a3, 0], &sd_dq, &dq[i, a3, 0], &sd_dq, &d2q[i, a3, 0, a3, 0], &sd_d2q)
-
-        # (0,1) and (1,2) can be obtained from (0,0), (0,2), and (2,2).
-        # Similarly, (1,1) can be obtained from (0, 1) and (1, 2).
-        # Also, fill in the three empty blocks: (2,0), (1, 0), and (2,1)
         for j in range(3):
+            for k in range(j, 3):
+                d2q[i, a1, j, a1, k] = d2q[i, a1, k, a1, j] = d2q_int[0, j, 0, k]
+                d2q[i, a2, j, a2, k] = d2q[i, a2, k, a2, j] = d2q_int[1, j, 1, k] + d2q_int[0, j, 0, k] - d2q_int[0, k, 1, j] - d2q_int[0, j, 1, k]
+                d2q[i, a3, j, a3, k] = d2q[i, a3, k, a3, j] = d2q_int[1, j, 1, k]
             for k in range(3):
-                d2q[i, a1, j, a2, k] = -d2q[i, a1, j, a1, k] - d2q[i, a1, j, a3, k]
-                d2q[i, a2, j, a3, k] = -d2q[i, a1, j, a3, k] - d2q[i, a3, j, a3, k]
-                d2q[i, a2, j, a2, k] -= d2q[i, a1, j, a2, k]
-                d2q[i, a2, k, a2, j] -= d2q[i, a2, j, a3, k]
+                d2q[i, a1, j, a2, k] = d2q[i, a2, k, a1, j] = d2q_int[0, j, 1, k] - d2q_int[0, j, 0, k]
+                d2q[i, a1, j, a3, k] = d2q[i, a3, k, a1, j] = -d2q_int[0, j, 1, k]
 
-                d2q[i, a3, k, a1, j] = d2q[i, a1, j, a3, k]
-                d2q[i, a2, k, a1, j] = d2q[i, a1, j, a2, k]
-                d2q[i, a3, k, a2, j] = d2q[i, a2, j, a3, k]
+                d2q[i, a2, j, a3, k] = d2q[i, a3, k, a2, j] = d2q_int[0, j, 1, k] - d2q_int[1, j, 1, k]
+
 
 cdef void cart_to_dihedral(int[:, :] dihedrals,
                            double[:, :, :] dx,
@@ -550,8 +541,9 @@ cdef void cart_to_dihedral(int[:, :] dihedrals,
         dger(&THREE, &THREE, &DUNITY, &x34[0], &sd_dx, &x23[0], &sd_dx, &d2denom[0, 0, 1, 0], &sd_d2int)
 
         tmp1 = -r23 * r23
-        dlaset('G', &THREE, &THREE, &DZERO, &tmp1, &d2denom[0, 0, 2, 0], &sd_d2int)
-        dger(&THREE, &THREE, &DUNITY, &x23[0], &sd_dx, &x23[0], &sd_dx, &d2denom[0, 0, 2, 0], &sd_d2int)
+        dlaset('L', &THREE, &THREE, &DZERO, &tmp1, &d2denom[0, 0, 2, 0], &sd_d2int)
+        dsyr('L', &THREE, &DUNITY, &x23[0], &sd_dx, &d2denom[0, 0, 2, 0], &sd_d2int)
+        symmetrize(&d2denom[0, 0, 2, 0], 3, sd_d2int)
 
         tmp1 = -2 * ddot(&THREE, &x12[0], &sd_dx, &x34[0], &sd_dx)
         dlaset('L', &THREE, &THREE, &DZERO, &tmp1, &d2denom[1, 0, 1, 0], &sd_d2int)
@@ -583,7 +575,6 @@ cdef void cart_to_dihedral(int[:, :] dihedrals,
         dger(&THREE, &THREE, &tmp1, &x12_x23[0], &UNITY, &x23[0], &sd_dx, &d2numer[1, 0, 2, 0], &sd_d2int)
 
         dsyr2('L', &NINE, &DNUNITY, &dq_int[0, 0], &UNITY, &ddenom[0, 0], &UNITY, &d2numer[0, 0, 0, 0], &NINE)
-
         dsyr2('L', &NINE, &DUNITY, &dq_int[0, 0], &UNITY, &dnumer[0, 0], &UNITY, &d2denom[0, 0, 0, 0], &NINE)
 
         memset(&d2q_int[0, 0, 0, 0], 0, 81 * sizeof(double))
