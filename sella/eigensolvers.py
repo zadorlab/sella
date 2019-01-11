@@ -16,7 +16,43 @@ def Levi_Civita(n):
         LC[tuple(even[::-1])] = -1.
     return LC
 
+def project_translation(x0):
+    d = len(x0)
+    if d % 3 != 0:
+        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
+
+    natoms = d // 3
+    tvecs = np.zeros((3, d))
+    tvec = np.array([[1., 0., 0.] for i in range(natoms)]).ravel()
+    tvec /= np.linalg.norm(tvec)
+    for i in range(3):
+        tvecs[i] = np.roll(tvec, i)
+
+    return tvecs.T
+
 LC = Levi_Civita(3)
+
+def project_rotation(x0):
+    d = len(x0)
+    if d % 3 != 0:
+        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
+
+    natoms = d // 3
+    rvecs = np.zeros((3, d))
+    nrot = 0
+
+    x0_mat = x0.reshape((-1, 3))
+    com = np.average(x0_mat, axis=0)
+    x0_com = x0_mat - com
+    _, I = eigh(np.sum(x0_com**2) * np.eye(3) - x0_com.T @ x0_com)
+    rvecs_guess = np.einsum('ij,jk,klm,nm->lin', x0_com, I, LC, I).reshape((3, d))
+    for rvec in rvecs_guess:
+        rvec_norm = np.linalg.norm(rvec)
+        if rvec_norm > 1e-8:
+            rvecs[nrot] = rvec / rvec_norm
+            nrot += 1
+
+    return rvecs[:nrot].T
 
 def atoms_tr_projection(x0):
     d = len(x0)
@@ -219,7 +255,7 @@ class MatrixSum(LinearOperator):
         return MatrixSum(self, other)
 
 
-def exact(A, maxres=None, P=None):
+def exact(A, maxres=None, P=None, T=None, shift=None, nlan=None):
     if isinstance(A, np.ndarray):
         lams, vecs = eigh(A)
     else:

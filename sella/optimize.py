@@ -244,8 +244,8 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     lams = minmode.lams
     vecs = minmode.vecs
     L = np.abs(lams)
-#    L[:order] *= -1
-    L[0] *= -1
+    L[:order] *= -1
+#    L[0] *= -1
     Vg = vecs.T @ g
     dx = -vecs @ (Vg / L)
     dx_mag = np.linalg.norm(dx)
@@ -417,11 +417,27 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
           r_trust=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
           inc_lb=0.8, inc_ub=1.2, **kwargs):
     d = len(x0)
-    f1, g1 = minmode.f_minmode(x0, **kwargs)
-    f, g = f1, g1
 
     x = x0.copy()
+    f1, g1 = minmode.f_minmode(x, **kwargs)
     xlast = x.copy()
+
+    # Detect if x0 lies on a ridge; if it is, push it off
+    print(minmode.lams)
+    ridge = False
+    for i, lam in enumerate(minmode.lams):
+        if lam > 0:
+            break
+        if minmode.vecs[:, i].T @ g1 < 1e-3 * np.linalg.norm(g1):
+            print("Ridge found!")
+            ridge = True
+            x += 1e-2 * minmode.vecs[:, i]
+
+    if ridge:
+        f1, g1 = minmode.f_minmode(x, **kwargs)
+
+    f, g = f1, g1
+
     I = np.eye(d)
 
     evnext = False
