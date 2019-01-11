@@ -245,7 +245,6 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     vecs = minmode.vecs
     L = np.abs(lams)
     L[:order] *= -1
-#    L[0] *= -1
     Vg = vecs.T @ g
     dx = -vecs @ (Vg / L)
     dx_mag = np.linalg.norm(dx)
@@ -261,7 +260,10 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
                 xi *= 2
             else:
                 xi = (xilower + xiupper) / 2.
-            dx = -vecs @ (Vg * (L / (LL + xi)))
+            if order == 0:
+                dx = -vecs * (Vg / (L + xi))
+            else:
+                dx = -vecs @ (Vg * (L / (LL + xi)))
             dx_mag = np.linalg.norm(dx)
             if abs(dx_mag - r_tr) < 1e-14 * r_tr:
                 break
@@ -415,8 +417,10 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
 
 def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
           r_trust=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
-          inc_lb=0.8, inc_ub=1.2, **kwargs):
+          inc_lb=0.8, inc_ub=1.2, order=1, **kwargs):
     d = len(x0)
+
+    r_trust_min = kwargs.get('dxL', r_trust / 100.)
 
     x = x0.copy()
     f1, g1 = minmode.f_minmode(x, **kwargs)
@@ -447,8 +451,8 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
     n = 1
     xi = 1.
     while True:
-        dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, g, r_trust, 1, xi)
-        #dx, dx_mag, xi, bound_clip, df_pred =  rs_prfo(minmode, g, r_trust, 1, xi)
+        dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, g, r_trust, order, xi)
+        #dx, dx_mag, xi, bound_clip, df_pred =  rs_prfo(minmode, g, r_trust, order, xi)
 
         f0, g0 = f, g
         H0 = minmode.H.copy()
@@ -498,7 +502,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
         ratio = minmode.ratio
         if ratio < dec_lb or ratio > dec_ub:
-            r_trust = dx_mag * dec_factr
+            r_trust = max(dx_mag * dec_factr, r_trust_min)
             f, g = minmode.f_update(x)
         elif bound_clip and inc_lb < ratio < inc_ub:
             r_trust /= inc_factr
@@ -548,7 +552,7 @@ class GDIIS(object):
         c = np.zeros(self.nhist)
         c[0] = 1.
         resmin = np.infty
-        for mask in mask_gen2(self.n):
+        for mask in mask_gen(self.n):
             c[:self.n] = mask * lstsq(self.GTG[:self.n, :self.n], mask)[0]
             c /= c.sum()
             # only interpolate, and ensure latest point contributes to fit
@@ -594,7 +598,7 @@ class GDIIS(object):
 
 def gediis(minmode, x0, maxcalls, ftol, nqn=0, nhist=10,
            r_trust=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
-           inc_lb=0.8, inc_ub=1.2, gnorm_ev_thr=2., **kwargs):
+           inc_lb=0.8, inc_ub=1.2, gnorm_ev_thr=2., order=1, **kwargs):
     d = len(x0)
     minmode.calls = 0
     f1, g1 = minmode.f_minmode(x0, **kwargs)
@@ -613,7 +617,7 @@ def gediis(minmode, x0, maxcalls, ftol, nqn=0, nhist=10,
     neval = 0
     lam_last = 1
     while True:
-        dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, gdiis.g, r_trust, 1, xi)
+        dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, gdiis.g, r_trust, order, xi)
 
         lams = minmode.lams
         vecs = minmode.vecs
@@ -791,18 +795,6 @@ def lbfgs(minmode, x0, maxiter, ftol, inicurv=1., maxls=10, exact_diag=False, **
         print(f, np.linalg.norm(g), tau, np.sign(minmode.lams[0]) * np.sqrt(np.abs(minmode.lams[0])) * 3276.4983)
 
 def mask_gen(n):
-    mask = np.zeros(n, dtype=int)
-    yield mask.copy()
-    while True:
-        mask[0] += 1
-        for i in range(n - 1):
-            mask[i + 1] += mask[i] // 2
-            mask[i] %= 2
-        if mask[-1] == 1:
-            return
-        yield mask.copy()
-
-def mask_gen2(n):
     mask = np.ones(n, dtype=int)
     yield mask.copy()
     while True:
