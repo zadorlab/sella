@@ -352,7 +352,7 @@ cdef void cart_to_angle(int[:, :] angles,
         cross(x12, x23, x12_x23)
         r12x23 = dnrm2(&THREE, &x12_x23[0], &UNITY)
 
-        q[i] = atan2(r12d23, r12x23)
+        q[i] = atan2(r12x23, -r12d23)
 
         if not (gradient or curvature):
             continue
