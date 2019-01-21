@@ -261,7 +261,7 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
             else:
                 xi = (xilower + xiupper) / 2.
             if order == 0:
-                dx = -vecs * (Vg / (L + xi))
+                dx = -vecs @ (Vg / (L + xi))
             else:
                 dx = -vecs @ (Vg * (L / (LL + xi)))
             dx_mag = np.linalg.norm(dx)
@@ -426,19 +426,19 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
     f1, g1 = minmode.f_minmode(x, **kwargs)
     xlast = x.copy()
 
-    # Detect if x0 lies on a ridge; if it is, push it off
-    print(minmode.lams)
-    ridge = False
-    for i, lam in enumerate(minmode.lams):
-        if lam > 0:
-            break
-        if minmode.vecs[:, i].T @ g1 < 1e-3 * np.linalg.norm(g1):
-            print("Ridge found!")
-            ridge = True
-            x += 1e-2 * minmode.vecs[:, i]
+    ## Detect if x0 lies on a ridge; if it is, push it off
+    #print(minmode.lams)
+    #ridge = False
+    #for i, lam in enumerate(minmode.lams):
+    #    if lam > 0:
+    #        break
+    #    if minmode.vecs[:, i].T @ g1 < 1e-3 * np.linalg.norm(g1):
+    #        print("Ridge found!")
+    #        ridge = True
+    #        x += 1e-2 * minmode.vecs[:, i]
 
-    if ridge:
-        f1, g1 = minmode.f_minmode(x, **kwargs)
+    #if ridge:
+    #    f1, g1 = minmode.f_minmode(x, **kwargs)
 
     f, g = f1, g1
 
@@ -456,23 +456,25 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
         f0, g0 = f, g
         H0 = minmode.H.copy()
-
-        if minmode.lams[0] > 0 or evnext or (nqn > 0 and n % nqn == 0):
-            f1, g1 = minmode.f_minmode(x + dx, **kwargs)
+        xlast = x.copy()
+        ev = (minmode.lams[0] > 0 and order > 0) or evnext or (nqn > 0 and n % nqn == 0)
+        f1, g1, dx1 = minmode.kick(dx, ev, **kwargs)
+        n += 1
+        if ev:
             n = 1
-        else:
-            f1last, g1last = f1, g1
-            f1, g1 = minmode.f_update(x + dx)
-            n += 1
-    
+
         if np.linalg.norm(g1) < ftol:
-            return x + dx
+            return minmode.xlast
     
         method = None
         alpha = 1.
 
+        # FIXME: this looks like it's wrong because of poor naming conventions.
+        # Rename minmode.xlast to minmode.x.
+        dx_actual = minmode.dx(xlast)
+
         try:
-            f, g, alpha = interpolate_quartic_constrained(f0, f1, g0, g1, dx, r_trust)
+            f, g, alpha = interpolate_quartic_constrained(f0, f1, g0, g1, dx_actual, r_trust)
         except ValueError:
             pass
         else:
@@ -480,7 +482,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
         if method is None:
             try:
-                f, g, alpha = interpolate_cubic(f0, f1, g0, g1, dx, r_trust)
+                f, g, alpha = interpolate_cubic(f0, f1, g0, g1, dx_actual, r_trust)
             except ValueError:
                 pass
             else:
@@ -488,7 +490,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
         if method is None:
             try:
-                f, g, alpha = interpolate_quadratic(f0, f1, g0, g1, dx, r_trust)
+                f, g, alpha = interpolate_quadratic(f0, f1, g0, g1, dx_actual, r_trust)
             except ValueError:
                 pass
             else:
@@ -497,22 +499,28 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         if method is None:
             f, g = f1, g1
 
-        x += alpha * dx
-        evnext = False
+        if alpha < 0:
+            raise RuntimeError("Extrapolation wants to go backwards! This should never happen.")
 
+        evnext = False
+        reeval = False
         ratio = minmode.ratio
         if ratio < dec_lb or ratio > dec_ub:
             r_trust = max(dx_mag * dec_factr, r_trust_min)
-            f, g = minmode.f_update(x)
+            reeval = True
         elif bound_clip and inc_lb < ratio < inc_ub:
             r_trust /= inc_factr
-#        elif bound_clip and inc_lb < ratio < inc_ub:
-#            r_trust /= inc_factr
+
+        if reeval:
+            f, g, v1 = minmode.kick((1 - alpha) * dx1)
+            x = minmode.xlast.copy()
+        else:
+            x = minmode.xpolate(alpha)
 
         gnorm = np.linalg.norm(g)
         gnormlast = gnorm
         
-        print(f1, np.linalg.norm(g1), ratio, alpha, dx_mag / r_trust, r_trust, method, minmode.lams[0])
+        print(f1, np.linalg.norm(g1), ratio, minmode.ratio, alpha, dx_mag / r_trust, r_trust, method, minmode.lams[0])
 
 class GDIIS(object):
     def __init__(self, d, nhist):

@@ -27,7 +27,7 @@ cdef size_t _MAX_BONDS = 12
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-cdef inline void cross(double[:] x, double[:] y, double[:] z):
+cdef inline void cross(double[:] x, double[:] y, double[:] z) nogil:
     z[0] = x[1] * y[2] - y[1] * x[2]
     z[1] = x[2] * y[0] - y[2] * x[0]
     z[2] = x[0] * y[1] - y[0] * x[1]
@@ -35,7 +35,7 @@ cdef inline void cross(double[:] x, double[:] y, double[:] z):
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-cdef inline void skew(double[:] x, double[:, :] Y, double scale=1.):
+cdef inline void skew(double[:] x, double[:, :] Y, double scale=1.) nogil:
     Y[2, 1] = scale * x[0]
     Y[0, 2] = scale * x[1]
     Y[1, 0] = scale * x[2]
@@ -47,13 +47,24 @@ cdef inline void skew(double[:] x, double[:, :] Y, double scale=1.):
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-cdef inline void symmetrize(double* X, size_t n, size_t lda):
+cdef inline void symmetrize(double* X, size_t n, size_t lda) nogil:
     cdef size_t i, j
     for i in range(n):
         for j in range(i + 1, n):
             X[j * lda + i] = X[i * lda + j]
 
-def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef void flood_fill(size_t idx, size_t[:] nbonds, int[:, :] c10y, int[:] labels, size_t label) nogil:
+    cdef size_t i, j
+    for i in range(nbonds[idx]):
+        j = <size_t>c10y[idx, i]
+        if labels[j] != label:
+            labels[j] = label
+            flood_fill(j, nbonds, c10y, labels, label)
+
+def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, list add_bonds=None):
     """Find bonding (and optionally angle bend/dihedral) internal
     coordinates of a molecule.
 
@@ -62,11 +73,11 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
     use_angles -- Include angle bends in internal coordinate search
     use_dihedrals -- Include dihedral angles
     """
-    cdef size_t i, j
+    cdef size_t i, j, k
     cdef size_t natoms = len(atoms)
 
     cdef double[:, :] rij = memoryview(atoms.get_all_distances())
-    cdef double[:] rcov = memoryview((1.5 * np.array([covalent_radii[atom.number] for atom in atoms])))
+    cdef double[:] rcov = memoryview((1.335 * np.array([covalent_radii[atom.number] for atom in atoms])))
 
     # c10y == connectivity
     c10y_np = -np.ones((natoms, _MAX_BONDS), dtype=np.int32)
@@ -82,27 +93,63 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
     bonds_np = -np.ones((_MAX_BONDS * natoms // 2, 2), dtype=np.int32)
     cdef int[:, :] bonds = memoryview(bonds_np)
 
+    cdef size_t nfrag = natoms
+    fragments_np = -np.ones(natoms, dtype=np.int32)
+    cdef int[:] fragments = memoryview(fragments_np)
+    cdef double scale = 1.
 
+    if add_bonds is not None:
+        for i, j in add_bonds:
+            bonds[nbonds_tot, 0] = min(i, j)
+            bonds[nbonds_tot, 1] = max(i, j)
+            nbonds_tot += 1
 
-    # FIXME: Implement self-bonding, as this can happen with periodic
-    # boundary conditions and is relevant for angles/dihedrals.
-    for i in range(natoms):
-        for j in range(i + 1, natoms):
-            if rij[i, j] <= rcov[i] + rcov[j]:
-                assert nbonds[i] < _MAX_BONDS
-                assert nbonds[j] < _MAX_BONDS
+            c10y[i, nbonds[i]] = j
+            nbonds[i] += 1
 
-                bonds[nbonds_tot, 0] = i
-                bonds[nbonds_tot, 1] = j
+            c10y[j, nbonds[j]] = i
+            nbonds[j] += 1
 
-                nbonds_tot += 1
+    while nfrag > 1:
+        # FIXME: Implement self-bonding, as this can happen with periodic
+        # boundary conditions and is relevant for angles/dihedrals.
+        for i in range(natoms):
+            for j in range(i + 1, natoms):
+                if fragments[i] == fragments[j] != -1:
+                    continue
+                if rij[i, j] <= scale * (rcov[i] + rcov[j]):
+                    assert nbonds[i] < _MAX_BONDS
+                    assert nbonds[j] < _MAX_BONDS
 
-                c10y[i, nbonds[i]] = j
-                nbonds[i] += 1
+                    # Make sure they aren't already bonded
+                    for k in range(nbonds[i]):
+                        if j == c10y[i, k]:
+                            break
+                    else:
+                        bonds[nbonds_tot, 0] = i
+                        bonds[nbonds_tot, 1] = j
 
-                c10y[j, nbonds[j]] = i
-                nbonds[j] += 1
-        max_bonds = max(max_bonds, nbonds[i])
+                        nbonds_tot += 1
+
+                        c10y[i, nbonds[i]] = j
+                        nbonds[i] += 1
+
+                        c10y[j, nbonds[j]] = i
+                        nbonds[j] += 1
+            max_bonds = max(max_bonds, nbonds[i])
+
+        # Traverse the graph to ensure it is fully connected
+        for i in range(natoms):
+            fragments[i] = -1
+
+        nfrag = 0
+        for i in range(natoms):
+            if fragments[i] == -1:
+                fragments[i] = nfrag
+                flood_fill(i, nbonds, c10y, fragments, nfrag)
+                nfrag += 1
+
+        scale *= 1.05
 
     bonds_np = np.resize(bonds_np, (nbonds_tot, 2))
     assert np.all(bonds_np >= 0)
@@ -128,7 +175,7 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
     if not (use_angles or use_dihedrals):
         return c10y_np, nbonds_np, bonds_np, angles_np, dihedrals_np
 
-    cdef size_t jj, k, kk, m, mm
+    cdef size_t jj, kk, m, mm
 
     for i in range(natoms):
         for jj in range(nbonds[i]):
@@ -158,7 +205,7 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
                     dihedrals[ndihedrals_tot, 2] = k
                     dihedrals[ndihedrals_tot, 3] = m
                     ndihedrals_tot += 1
-    
+
     angles_np = np.resize(angles_np, (nangles_tot, 3))
     assert np.all(angles_np >= 0)
 
@@ -170,37 +217,52 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True):
 
 #    if not use_angles:
 #        return c10y_np, nbonds_np, bonds_np, None, dihedrals_np
-    
+
     return c10y_np, nbonds_np, bonds_np, angles_np, dihedrals_np
 
 def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
                      np.ndarray[np.int32_t, ndim=2] bonds_np,
                      np.ndarray[np.int32_t, ndim=2] angles_np,
                      np.ndarray[np.int32_t, ndim=2] dihedrals_np,
+                     np.ndarray[np.uint8_t, ndim=1] mask_np,
                      bint gradient=False,
                      bint curvature=False):
     cdef double[:, :] pos = memoryview(pos_np)
     cdef int[:, :] bonds = memoryview(bonds_np)
     cdef int[:, :] angles = memoryview(angles_np)
     cdef int[:, :] dihedrals = memoryview(dihedrals_np)
+    cdef np.uint8_t[:] mask = memoryview(mask_np)
 
+    cdef size_t i
     cdef size_t natoms = len(pos_np)
     cdef size_t nbonds = len(bonds_np)
     cdef size_t nangles = len(angles_np)
     cdef size_t ndihedrals = len(dihedrals_np)
     cdef size_t ninternal = nbonds + nangles + ndihedrals
+    cdef size_t nmaskb = 0, nmaska = 0, nmaskd = 0, nmasktot = 0
+
+    for i in range(nbonds):
+        nmaskb += 1 - mask[i]
+
+    for i in range(nangles):
+        nmaska += 1 - mask[nbonds + i]
+
+    for i in range(ndihedrals):
+        nmaskd += 1 - mask[nbonds + nangles + i]
+
+    nmasktot = nmaskb + nmaska + nmaskd
 
     # Arrays for internal coordinates and their derivatives
-    q_np = np.zeros(ninternal, dtype=np.float64)
+    q_np = np.zeros(ninternal - nmasktot, dtype=np.float64)
     if gradient:
-        dq_np = np.zeros((ninternal, natoms, 3), dtype=np.float64)
+        dq_np = np.zeros((ninternal - nmasktot, natoms, 3), dtype=np.float64)
     else:
-        dq_np = np.zeros((ninternal, 0, 0), dtype=np.float64)
+        dq_np = np.zeros((ninternal - nmasktot, 0, 0), dtype=np.float64)
 
     if curvature:
-        d2q_np = np.zeros((ninternal, natoms, 3, natoms, 3), dtype=np.float64)
+        d2q_np = np.zeros((ninternal - nmasktot, natoms, 3, natoms, 3), dtype=np.float64)
     else:
-        d2q_np = np.zeros((ninternal, 0, 0, 0, 0), dtype=np.float64)
+        d2q_np = np.zeros((ninternal - nmasktot, 0, 0, 0, 0), dtype=np.float64)
 
     # Arrays for displacement vectors between bonded atoms
     dx_bonds_np = np.zeros((nbonds, 3), dtype=np.float64)
@@ -211,14 +273,17 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
     cdef double[:, :, :] dx_angles = memoryview(dx_angles_np)
     cdef double[:, :, :] dx_dihedrals = memoryview(dx_dihedrals_np)
 
-    cdef size_t i
 
     # Calculate displacement vectors
     for i in range(nbonds):
+        if not mask[i]:
+            continue
         dcopy(&THREE, &pos[bonds[i, 1], 0], &UNITY, &dx_bonds[i, 0], &UNITY)
         daxpy(&THREE, &DNUNITY, &pos[bonds[i, 0], 0], &UNITY, &dx_bonds[i, 0], &UNITY)
 
     for i in range(nangles):
+        if not mask[nbonds + i]:
+            continue
         dcopy(&THREE, &pos[angles[i, 1], 0], &UNITY, &dx_angles[i, 0, 0], &UNITY)
         dcopy(&THREE, &pos[angles[i, 2], 0], &UNITY, &dx_angles[i, 1, 0], &UNITY)
 
@@ -226,6 +291,8 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
         daxpy(&THREE, &DNUNITY, &pos[angles[i, 1], 0], &UNITY, &dx_angles[i, 1, 0], &UNITY)
 
     for i in range(ndihedrals):
+        if not mask[nbonds + nangles + i]:
+            continue
         dcopy(&THREE, &pos[dihedrals[i, 1], 0], &UNITY, &dx_dihedrals[i, 0, 0], &UNITY)
         dcopy(&THREE, &pos[dihedrals[i, 2], 0], &UNITY, &dx_dihedrals[i, 1, 0], &UNITY)
         dcopy(&THREE, &pos[dihedrals[i, 3], 0], &UNITY, &dx_dihedrals[i, 2, 0], &UNITY)
@@ -236,42 +303,51 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
 
     cdef size_t n = 0
 
-    cdef double[:] q = memoryview(q_np[n : n+nbonds])
-    cdef double[:, :, :] dq = memoryview(dq_np[n : n+nbonds])
-    cdef double[:, :, :, :, :] d2q = memoryview(d2q_np[n : n+nbonds])
+    cdef double[:] q = memoryview(q_np[n : n+nbonds-nmaskb])
+    cdef double[:, :, :] dq = memoryview(dq_np[n : n+nbonds-nmaskb])
+    cdef double[:, :, :, :, :] d2q = memoryview(d2q_np[n : n+nbonds-nmaskb])
 
-    cart_to_bond(bonds, dx_bonds, q, dq, d2q, gradient, curvature)
-    n += nbonds
+    d2q_bonds_np = np.zeros((nbonds-nmaskb, 2, 3, 2, 3), dtype=np.float64)
+    d2q_angles_np = np.zeros((nangles-nmaska, 3, 3, 3, 3), dtype=np.float64)
+    d2q_dihedrals_np = np.zeros((ndihedrals-nmaskd, 4, 3, 4, 3), dtype=np.float64)
 
-    q = memoryview(q_np[n : n+nangles])
-    dq = memoryview(dq_np[n : n+nangles])
-    d2q = memoryview(d2q_np[n : n+nangles])
+    cdef double[:, :, :, :, :] d2q_bonds = memoryview(d2q_bonds_np)
+    cdef double[:, :, :, :, :] d2q_angles = memoryview(d2q_angles_np)
+    cdef double[:, :, :, :, :] d2q_dihedrals = memoryview(d2q_dihedrals_np)
 
-    cart_to_angle(angles, dx_angles, q, dq, d2q, gradient, curvature)
-    n += nangles
+    cart_to_bond_sparse(bonds, dx_bonds, q, dq, d2q_bonds, mask[:nbonds], gradient, curvature)
+    n += nbonds - nmaskb
 
-    q = memoryview(q_np[n : n+ndihedrals])
-    dq = memoryview(dq_np[n : n+ndihedrals])
-    d2q = memoryview(d2q_np[n : n+ndihedrals])
+    q = memoryview(q_np[n : n+nangles-nmaska])
+    dq = memoryview(dq_np[n : n+nangles-nmaska])
 
-    cart_to_dihedral(dihedrals, dx_dihedrals, q, dq, d2q, gradient, curvature)
-    n += ndihedrals
+    cart_to_angle_sparse(angles, dx_angles, q, dq, d2q_angles, mask[nbonds:nbonds+nangles], gradient, curvature)
+    n += nangles - nmaska
 
-    return q_np, dq_np.reshape((-1, 3 * natoms)), d2q_np.reshape((-1, 3 * natoms, 3 * natoms))
+    q = memoryview(q_np[n : n+ndihedrals-nmaskd])
+    dq = memoryview(dq_np[n : n+ndihedrals-nmaskd])
+
+    cart_to_dihedral_sparse(dihedrals, dx_dihedrals, q, dq, d2q_dihedrals, mask[nbonds+nangles:], gradient, curvature)
+    n += ndihedrals - nmaskd
+
+    D = GradB(natoms, bonds, angles, dihedrals, d2q_bonds, d2q_angles, d2q_dihedrals, mask)
+
+    return q_np, dq_np.reshape((-1, 3 * natoms)), D
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-cdef void cart_to_bond(int[:, :] bonds,
-                       double[:, :] dx,
-                       double[:] q,
-                       double[:, :, :] dq,
-                       double[:, :, :, :, :] d2q,
-                       bint gradient=False,
-                       bint curvature=False):
+cdef void cart_to_bond_sparse(int[:, :] bonds,
+                              double[:, :] dx,
+                              double[:] q,
+                              double[:, :, :] dq,
+                              double[:, :, :, :, :] d2q,
+                              np.uint8_t[:] mask,
+                              bint gradient=False,
+                              bint curvature=False):
     cdef size_t nbonds = len(bonds)
 
-    cdef size_t i, a1, a2
+    cdef size_t i, a1, a2, n = 0
     cdef double tmp
     cdef int sd_dx = dx.strides[1] // 8    # == 1 normally
     cdef int sd_dq = dq.strides[2] // 8   # == 1 normally
@@ -279,45 +355,53 @@ cdef void cart_to_bond(int[:, :] bonds,
     cdef int info
 
     for i in range(nbonds):
+        if not mask[i]:
+            continue
         a1 = bonds[i, 0]
         a2 = bonds[i, 1]
-        
-        q[i] = dnrm2(&THREE, &dx[i, 0], &sd_dx)
+
+        q[n] = dnrm2(&THREE, &dx[i, 0], &sd_dx)
 
         if not (gradient or curvature):
+            n += 1
             continue
 
-        tmp = 1 / q[i]
-        daxpy(&THREE, &tmp, &dx[i, 0], &sd_dx, &dq[i, a2, 0], &sd_dq)
-        daxpy(&THREE, &DNUNITY, &dq[i, a2, 0], &sd_dq, &dq[i, a1, 0], &sd_dq)
+        tmp = 1 / q[n]
+        daxpy(&THREE, &tmp, &dx[i, 0], &sd_dx, &dq[n, a2, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq[n, a2, 0], &sd_dq, &dq[n, a1, 0], &sd_dq)
 
         if not curvature:
+            n += 1
             continue
 
-        dlaset('G', &THREE, &THREE, &DZERO, &tmp, &d2q[i, a1, 0, a1, 0], &sd_d2q)
+        dlaset('G', &THREE, &THREE, &DZERO, &tmp, &d2q[n, 0, 0, 0, 0], &sd_d2q)
 
         tmp /= -q[i] * q[i]
-        dger(&THREE, &THREE, &tmp, &dx[i, 0], &sd_dx, &dx[i, 0], &sd_dx, &d2q[i, a1, 0, a1, 0], &sd_d2q)
-        dlacpy('G', &THREE, &THREE, &d2q[i, a1, 0, a1, 0], &sd_d2q, &d2q[i, a2, 0, a2, 0], &sd_d2q)
+        dger(&THREE, &THREE, &tmp, &dx[i, 0], &sd_dx, &dx[i, 0], &sd_dx, &d2q[n, 0, 0, 0, 0], &sd_d2q)
+        dlacpy('G', &THREE, &THREE, &d2q[n, 0, 0, 0, 0], &sd_d2q, &d2q[n, 1, 0, 1, 0], &sd_d2q)
 
-        dlacpy('G', &THREE, &THREE, &d2q[i, a1, 0, a1, 0], &sd_d2q, &d2q[i, a1, 0, a2, 0], &sd_d2q)
-        dlascl('G', &UNITY, &UNITY, &DUNITY, &DNUNITY, &THREE, &THREE, &d2q[i, a1, 0, a2, 0], &sd_d2q, &info)
-        dlacpy('G', &THREE, &THREE, &d2q[i, a1, 0, a2, 0], &sd_d2q, &d2q[i, a2, 0, a1, 0], &sd_d2q)
+        dlacpy('G', &THREE, &THREE, &d2q[n, 0, 0, 0, 0], &sd_d2q, &d2q[n, 0, 0, 1, 0], &sd_d2q)
+        dlascl('G', &UNITY, &UNITY, &DUNITY, &DNUNITY, &THREE, &THREE, &d2q[n, 0, 0, 1, 0], &sd_d2q, &info)
+        dlacpy('G', &THREE, &THREE, &d2q[n, 0, 0, 1, 0], &sd_d2q, &d2q[n, 1, 0, 0, 0], &sd_d2q)
+        n += 1
 
-
-cdef void cart_to_angle(int[:, :] angles,
-                        double[:, :, :] dx,
-                        double[:] q,
-                        double[:, :, :] dq,
-                        double[:, :, :, :, :] d2q,
-                        bint gradient=False,
-                        bint curvature=False):
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef void cart_to_angle_sparse(int[:, :] angles,
+                               double[:, :, :] dx,
+                               double[:] q,
+                               double[:, :, :] dq,
+                               double[:, :, :, :, :] d2q,
+                               np.uint8_t[:] mask,
+                               bint gradient=False,
+                               bint curvature=False):
     cdef size_t nangles = len(angles)
 
     cdef double[:] x12, x23
     cdef double[:] x12_x23 = array(shape=(3,), itemsize=sizeof(double), format="d")
 
-    cdef size_t i, j, k
+    cdef size_t i, j, k, n
     cdef size_t a1, a2, a3
     cdef double tmp1, tmp2, tmp3, tmp4
     cdef double r12, r23, r122, r232, r12x23, r12d23
@@ -338,8 +422,11 @@ cdef void cart_to_angle(int[:, :] angles,
     # This is primarily because the curvature becomes easier to evaluate
     # (perhaps somewhat counterintuitively). arctan2 is also *somewhat*
     # more accurate than arccos, though this is probably negligable.
-
+    
+    n = 0
     for i in range(nangles):
+        if not mask[i]:
+            continue
         a1 = angles[i, 0]
         a2 = angles[i, 1]
         a3 = angles[i, 2]
@@ -352,9 +439,10 @@ cdef void cart_to_angle(int[:, :] angles,
         cross(x12, x23, x12_x23)
         r12x23 = dnrm2(&THREE, &x12_x23[0], &UNITY)
 
-        q[i] = atan2(r12x23, -r12d23)
+        q[n] = atan2(r12x23, -r12d23)
 
         if not (gradient or curvature):
+            n += 1
             continue
 
         r12 = dnrm2(&THREE, &x12[0], &sd_dx)
@@ -373,14 +461,15 @@ cdef void cart_to_angle(int[:, :] angles,
         daxpy(&THREE, &tmp1, &x23[0], &sd_dx, &dq_int[1, 0], &UNITY)
         daxpy(&THREE, &tmp2, &x12[0], &sd_dx, &dq_int[1, 0], &UNITY)
 
-        dcopy(&THREE, &dq_int[0, 0], &UNITY, &dq[i, a2, 0], &sd_dq)
-        dcopy(&THREE, &dq_int[1, 0], &UNITY, &dq[i, a3, 0], &sd_dq)
+        dcopy(&THREE, &dq_int[0, 0], &UNITY, &dq[n, a2, 0], &sd_dq)
+        dcopy(&THREE, &dq_int[1, 0], &UNITY, &dq[n, a3, 0], &sd_dq)
 
-        daxpy(&THREE, &DNUNITY, &dq_int[0, 0], &UNITY, &dq[i, a1, 0], &sd_dq)
-        daxpy(&THREE, &DNUNITY, &dq_int[1, 0], &UNITY, &dq[i, a2, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[0, 0], &UNITY, &dq[n, a1, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[1, 0], &UNITY, &dq[n, a2, 0], &sd_dq)
 
 
         if not curvature:
+            n += 1
             continue
         memset(&d2q_int[0, 0, 0, 0], 0, 36 * sizeof(double))
 
@@ -415,23 +504,27 @@ cdef void cart_to_angle(int[:, :] angles,
 
         for j in range(3):
             for k in range(j, 3):
-                d2q[i, a1, j, a1, k] = d2q[i, a1, k, a1, j] = d2q_int[0, j, 0, k]
-                d2q[i, a2, j, a2, k] = d2q[i, a2, k, a2, j] = d2q_int[1, j, 1, k] + d2q_int[0, j, 0, k] - d2q_int[0, k, 1, j] - d2q_int[0, j, 1, k]
-                d2q[i, a3, j, a3, k] = d2q[i, a3, k, a3, j] = d2q_int[1, j, 1, k]
+                d2q[n, 0, j, 0, k] = d2q[n, 0, k, 0, j] = d2q_int[0, j, 0, k]
+                d2q[n, 1, j, 1, k] = d2q[n, 1, k, 1, j] = d2q_int[1, j, 1, k] + d2q_int[0, j, 0, k] - d2q_int[0, k, 1, j] - d2q_int[0, j, 1, k]
+                d2q[n, 2, j, 2, k] = d2q[n, 2, k, 2, j] = d2q_int[1, j, 1, k]
             for k in range(3):
-                d2q[i, a1, j, a2, k] = d2q[i, a2, k, a1, j] = d2q_int[0, j, 1, k] - d2q_int[0, j, 0, k]
-                d2q[i, a1, j, a3, k] = d2q[i, a3, k, a1, j] = -d2q_int[0, j, 1, k]
+                d2q[n, 0, j, 1, k] = d2q[n, 1, k, 0, j] = d2q_int[0, j, 1, k] - d2q_int[0, j, 0, k]
+                d2q[n, 0, j, 2, k] = d2q[n, 2, k, 0, j] = -d2q_int[0, j, 1, k]
 
-                d2q[i, a2, j, a3, k] = d2q[i, a3, k, a2, j] = d2q_int[0, j, 1, k] - d2q_int[1, j, 1, k]
+                d2q[n, 1, j, 2, k] = d2q[n, 2, k, 1, j] = d2q_int[0, j, 1, k] - d2q_int[1, j, 1, k]
+        n += 1
 
-
-cdef void cart_to_dihedral(int[:, :] dihedrals,
-                           double[:, :, :] dx,
-                           double[:] q,
-                           double[:, :, :] dq,
-                           double[:, :, :, :, :] d2q,
-                           bint gradient=False,
-                           bint curvature=False):
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef void cart_to_dihedral_sparse(int[:, :] dihedrals,
+                                  double[:, :, :] dx,
+                                  double[:] q,
+                                  double[:, :, :] dq,
+                                  double[:, :, :, :, :] d2q,
+                                  np.uint8_t[:] mask,
+                                  bint gradient=False,
+                                  bint curvature=False):
     cdef size_t ndihedrals = len(dihedrals)
 
     cdef double[:] x12, x23, x34
@@ -471,7 +564,10 @@ cdef void cart_to_dihedral(int[:, :] dihedrals,
 
     cdef int sd_d2int = d2numer.strides[1] // 8
 
+    n = 0
     for i in range(ndihedrals):
+        if not mask[i]:
+            continue
         a1 = dihedrals[i, 0]
         a2 = dihedrals[i, 1]
         a3 = dihedrals[i, 2]
@@ -487,9 +583,10 @@ cdef void cart_to_dihedral(int[:, :] dihedrals,
         cross(x12_x23, x23_x34, tmpar1)
         numer = ddot(&THREE, &tmpar1[0], &UNITY, &x23[0], &sd_dx) / r23
         denom = ddot(&THREE, &x12_x23[0], &UNITY, &x23_x34[0], &UNITY)
-        q[i] = atan2(numer, denom)
+        q[n] = atan2(numer, denom)
 
         if not (gradient or curvature):
+            n += 1
             continue
 
         cross(x12, x34, x12_x34)
@@ -521,15 +618,16 @@ cdef void cart_to_dihedral(int[:, :] dihedrals,
             daxpy(&THREE, &tmp2, &dnumer[j, 0], &UNITY, &dq_int[j, 0], &UNITY)
             daxpy(&THREE, &tmp3, &ddenom[j, 0], &UNITY, &dq_int[j, 0], &UNITY)
 
-        dcopy(&THREE, &dq_int[0, 0], &UNITY, &dq[i, a1, 0], &sd_dq)
-        dcopy(&THREE, &dq_int[1, 0], &UNITY, &dq[i, a2, 0], &sd_dq)
-        dcopy(&THREE, &dq_int[2, 0], &UNITY, &dq[i, a3, 0], &sd_dq)
+        dcopy(&THREE, &dq_int[0, 0], &UNITY, &dq[n, a1, 0], &sd_dq)
+        dcopy(&THREE, &dq_int[1, 0], &UNITY, &dq[n, a2, 0], &sd_dq)
+        dcopy(&THREE, &dq_int[2, 0], &UNITY, &dq[n, a3, 0], &sd_dq)
 
-        daxpy(&THREE, &DNUNITY, &dq_int[0, 0], &UNITY, &dq[i, a2, 0], &sd_dq)
-        daxpy(&THREE, &DNUNITY, &dq_int[1, 0], &UNITY, &dq[i, a3, 0], &sd_dq)
-        daxpy(&THREE, &DNUNITY, &dq_int[2, 0], &UNITY, &dq[i, a4, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[0, 0], &UNITY, &dq[n, a2, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[1, 0], &UNITY, &dq[n, a3, 0], &sd_dq)
+        daxpy(&THREE, &DNUNITY, &dq_int[2, 0], &UNITY, &dq[n, a4, 0], &sd_dq)
 
         if not curvature:
+            n += 1
             continue
 
         # Second derivative of denominator
@@ -589,19 +687,155 @@ cdef void cart_to_dihedral(int[:, :] dihedrals,
 
         for j in range(3):
             for k in range(j, 3):
-                d2q[i, a1, j, a1, k] = d2q[i, a1, k, a1, j] = d2q_int[0, j, 0, k]
-                d2q[i, a2, j, a2, k] = d2q[i, a2, k, a2, j] = d2q_int[1, j, 1, k] + d2q_int[0, j, 0, k] - d2q_int[0, k, 1, j] - d2q_int[0, j, 1, k]
-                d2q[i, a3, j, a3, k] = d2q[i, a3, k, a3, j] = d2q_int[2, j, 2, k] + d2q_int[1, j, 1, k] - d2q_int[1, j, 2, k] - d2q_int[1, k, 2, j]
-                d2q[i, a4, j, a4, k] = d2q[i, a4, k, a4, j] = d2q_int[2, j, 2, k]
+                d2q[n, 0, j, 0, k] = d2q[n, 0, k, 0, j] = d2q_int[0, j, 0, k]
+                d2q[n, 1, j, 1, k] = d2q[n, 1, k, 1, j] = d2q_int[1, j, 1, k] + d2q_int[0, j, 0, k] - d2q_int[0, k, 1, j] - d2q_int[0, j, 1, k]
+                d2q[n, 2, j, 2, k] = d2q[n, 2, k, 2, j] = d2q_int[2, j, 2, k] + d2q_int[1, j, 1, k] - d2q_int[1, j, 2, k] - d2q_int[1, k, 2, j]
+                d2q[n, 3, j, 3, k] = d2q[n, 3, k, 3, j] = d2q_int[2, j, 2, k]
             for k in range(3):
-                d2q[i, a1, j, a2, k] = d2q[i, a2, k, a1, j] = d2q_int[0, j, 1, k] - d2q_int[0, j, 0, k]
-                d2q[i, a1, j, a3, k] = d2q[i, a3, k, a1, j] = d2q_int[0, j, 2, k] - d2q_int[0, j, 1, k]
-                d2q[i, a1, j, a4, k] = d2q[i, a4, k, a1, j] = -d2q_int[0, j, 2, k]
+                d2q[n, 0, j, 1, k] = d2q[n, 1, k, 0, j] = d2q_int[0, j, 1, k] - d2q_int[0, j, 0, k]
+                d2q[n, 0, j, 2, k] = d2q[n, 2, k, 0, j] = d2q_int[0, j, 2, k] - d2q_int[0, j, 1, k]
+                d2q[n, 0, j, 3, k] = d2q[n, 3, k, 0, j] = -d2q_int[0, j, 2, k]
 
-                d2q[i, a2, j, a3, k] = d2q[i, a3, k, a2, j] = d2q_int[1, j, 2, k] + d2q_int[0, j, 1, k] - d2q_int[1, j, 1, k] - d2q_int[0, j, 2, k]
-                d2q[i, a2, j, a4, k] = d2q[i, a4, k, a2, j] = d2q_int[0, j, 2, k] - d2q_int[1, j, 2, k]
+                d2q[n, 1, j, 2, k] = d2q[n, 2, k, 1, j] = d2q_int[1, j, 2, k] + d2q_int[0, j, 1, k] - d2q_int[1, j, 1, k] - d2q_int[0, j, 2, k]
+                d2q[n, 1, j, 3, k] = d2q[n, 3, k, 1, j] = d2q_int[0, j, 2, k] - d2q_int[1, j, 2, k]
 
-                d2q[i, a3, j, a4, k] = d2q[i, a4, k, a3, j] = d2q_int[1, j, 2, k] - d2q_int[2, j, 2, k]
+                d2q[n, 2, j, 3, k] = d2q[n, 3, k, 2, j] = d2q_int[1, j, 2, k] - d2q_int[2, j, 2, k]
+        n += 1
 
+cdef class GradB:
+    cdef size_t natoms, nbonds, nangles, ndihedrals, ninternal, nmasked
+    cdef np.uint8_t[:] mask
+    cdef int[:, :] bonds, angles, dihedrals
+    cdef double[:, :, :, :, :] Dbonds, Dangles, Ddihedrals
 
+    def __cinit__(self, size_t natoms, int[:, :] bonds, int[:, :] angles,
+                  int[:, :] dihedrals, double[:, :, :, :, :] Dbonds,
+                  double[:, :, :, :, :] Dangles,
+                  double[:, :, :, :, :] Ddihedrals, np.uint8_t[:] mask):
+        self.natoms = natoms
 
+        self.nbonds = len(bonds)
+        self.nangles = len(angles)
+        self.ndihedrals = len(dihedrals)
+        self.ninternal = self.nbonds + self.nangles + self.ndihedrals
+
+        self.bonds = bonds
+        self.angles = angles
+        self.dihedrals = dihedrals
+
+        self.Dbonds = Dbonds
+        self.Dangles = Dangles
+        self.Ddihedrals = Ddihedrals
+        self.mask = mask
+        cdef np.uint8_t i
+        self.nmasked = 0
+
+        for i in mask:
+            self.nmasked += 1 - i
+
+    def ddot(self, np.ndarray[np.float64_t, ndim=1] v1_np, np.ndarray[np.float64_t, ndim=1] v2_np):
+        cdef size_t i, j, k, a, b, ai, bi
+        cdef size_t start = 0
+        cdef size_t n = 0, m = 0
+        result_np = np.zeros(self.ninternal - self.nmasked, dtype=np.float64)
+        cdef double[:] result = memoryview(result_np)
+        cdef double[:] v1 = memoryview(v1_np)
+        cdef double[:] v2 = memoryview(v2_np)
+
+        for i in range(self.nbonds):
+            if not self.mask[i]:
+                continue
+            for a in range(2):
+                ai = self.bonds[i, a]
+                for b in range(2):
+                    bi = self.bonds[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[n] += self.Dbonds[m, a, j, b, k] * v1[3 * ai + j] * v2[3 * bi + k]
+            n += 1
+            m += 1
+
+        m = 0
+        start += self.nbonds
+        for i in range(self.nangles):
+            if not self.mask[start + i]:
+                continue
+            for a in range(3):
+                ai = self.angles[i, a]
+                for b in range(3):
+                    bi = self.angles[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[n] += self.Dangles[m, a, j, b, k] * v1[3 * ai + j] * v2[3 * bi + k]
+            n += 1
+            m += 1
+
+        m = 0
+        start += self.nangles
+        for i in range(self.ndihedrals):
+            if not self.mask[start + i]:
+                continue
+            for a in range(4):
+                ai = self.dihedrals[i, a]
+                for b in range(4):
+                    bi = self.dihedrals[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[n] += self.Ddihedrals[m, a, j, b, k] * v1[3 * ai + j] * v2[3 * bi + k]
+            n += 1
+            m += 1
+
+        return result_np
+
+    def ldot(self, np.ndarray[np.float64_t, ndim=1] v_np):
+        cdef size_t i, j, k, a, b, ai, bi
+        cdef size_t start = 0
+        cdef size_t n = 0, m = 0
+        result_np = np.zeros((3 * self.natoms, 3 * self.natoms), dtype=np.float64)
+        cdef double[:, :] result = memoryview(result_np)
+        cdef double[:] v = memoryview(v_np)
+
+        for i in range(self.nbonds):
+            if not self.mask[i]:
+                continue
+            for a in range(2):
+                ai = self.bonds[i, a]
+                for b in range(2):
+                    bi = self.bonds[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[3 * ai + j, 3 * bi + k] += v[n] * self.Dbonds[m, a, j, b, k]
+            n += 1
+            m += 1
+
+        m = 0
+        start += self.nbonds
+        for i in range(self.nangles):
+            if not self.mask[start + i]:
+                continue
+            for a in range(3):
+                ai = self.angles[i, a]
+                for b in range(3):
+                    bi = self.angles[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[3 * ai + j, 3 * bi + k] += v[n] * self.Dangles[m, a, j, b, k]
+            n += 1
+            m += 1
+
+        m = 0
+        start += self.nangles
+        for i in range(self.ndihedrals):
+            if not self.mask[start + i]:
+                continue
+            for a in range(4):
+                ai = self.dihedrals[i, a]
+                for b in range(4):
+                    bi = self.dihedrals[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[3 * ai + j, 3 * bi + k] += v[n] * self.Ddihedrals[m, a, j, b, k]
+            n += 1
+            m += 1
+
+        return result_np
