@@ -36,7 +36,7 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2):
         method = 'TS-BFGS'
         lams_B, vecs_B = eigh(B)
         if np.all(lams_B > 0):
-            lams_STY, vecs_STY = S.T @ Ytilde
+            lams_STY, vecs_STY = eigh(S.T @ Ytilde)
             if np.all(lams_STY > 0):
                 method = 'BFGS'
 
