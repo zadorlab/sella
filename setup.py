@@ -33,5 +33,5 @@ setup(name='Sella',
                    'Topic :: Scientific/Engineering :: Mathematics',
                    'Topic :: Scientific/Engineering :: Physics'],
       python_requires='>=3.5',
-      install_requires=['numpy', 'scipy>=1.1.0', 'cython', 'ase'],
+      install_requires=['numpy>=1.14.0', 'scipy>=1.1.0', 'cython', 'ase'],
       )
