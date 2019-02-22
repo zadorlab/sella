@@ -3,6 +3,7 @@
 import numpy as np
 from scipy.linalg import eigh, null_space
 from ase.io import Trajectory
+from ase.constraints import FixAtoms
 from .eigensolvers import NumericalHessian, ProjectedMatrix, atoms_tr_projection, davidson, project_translation, project_rotation
 from .hessian_update import update_H
 from .internal import Internal
@@ -116,8 +117,11 @@ class MinModeAtoms(MinMode):
         MinMode.__init__(self, self.eval_eg, d, minmode, H0, v0, trshift,
                          trshift_factor)
         self.atoms = atoms.copy()
+        self.x0 = self.atoms.positions.ravel().copy()
         self.atoms.set_calculator(calculator)
         self.d = 3 * len(self.atoms)
+        if self.atoms.constraints is not None:
+            self.d -= 3 * len(self.atoms.constraints[0].index)
 
         self.project_translations = project_translations
         self.project_rotations = project_rotations
@@ -128,13 +132,62 @@ class MinModeAtoms(MinMode):
             self.trajectory = None
 
     def eval_eg(self, x):
-        pos = x.reshape((-1, 3))
+        xin = x.reshape((-1, 3))
+        if self.atoms.constraints is not None:
+            pos = np.zeros_like(self.atoms.positions)
+            # Currently assume there is only one constraint, and it is FixAtoms
+            assert len(self.atoms.constraints) == 1
+            constr = self.atoms.constraints[0]
+            assert isinstance(constr, FixAtoms)
+            n = 0
+            for i, xi in enumerate(pos):
+                if i in constr.index:
+                    pos[i] = self.x0[i]
+                else:
+                    pos[i] = xin[n]
+                    n += 1
+        else:
+            pos = xin
+
         self.atoms.set_positions(pos)
         e = self.atoms.get_potential_energy()
-        f = -self.atoms.get_forces().ravel()
+        f = -self.atoms.get_forces()
+        if self.atoms.constraints is not None:
+            g = np.zeros_like(xin)
+            n = 0
+            for i, xi in enumerate(pos):
+                if i not in constr.index:
+                    g[n] = f[i]
+                    n += 1
+        else:
+            g = f
+
         if self.trajectory is not None:
             self.trajectory.write(self.atoms)
-        return e, f
+        return e, g.ravel()
+
+    def f_update(self, x):
+        if self.xlast is not None and np.all(x == self.xlast):
+            return self.flast, self.glast
+
+        self.calls += 1
+        f, g = self.eval_eg(x)
+
+        if self.flast is not None:
+            self.df = f - self.flast
+            dx = x - self.xlast
+            self.df_pred = self.glast.T @ dx + (dx.T @ self.H @ dx) / 2.
+            self.ratio = self.df_pred / self.df
+
+        if self.xlast is not None and self.glast is not None:
+            self.H = update_H(self.H, x - self.xlast, g - self.glast)
+            self.lams, self.vecs = eigh(self.H)
+
+        self.flast = f
+        self.xlast2 = self.xlast
+        self.xlast = x.copy()
+        self.glast = g.copy()
+        return f, g
 
     def f_minmode(self, x0, dxL=1e-5, maxres=5e-3, threepoint=False, **kwargs):
         d = len(x0)
@@ -150,6 +203,12 @@ class MinModeAtoms(MinMode):
         if self.project_rotations:
             T = np.hstack((T, project_rotation(x0)))
         _, ntr = T.shape
+
+        if ntr > 0:
+            Tnull = null_space(T.T)
+            Proj = Tnull @ Tnull.T
+        else:
+            Proj = np.eye(self.d)
 
         P = self.H
         if P is None:
