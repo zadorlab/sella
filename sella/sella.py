@@ -25,6 +25,7 @@ class MinMode(object):
         self.df = None
         self.df_pred = None
         self.ratio = None
+        self.v0 = v0
 
         self.H = H0
         if self.H is not None:
@@ -212,7 +213,11 @@ class MinModeAtoms(MinMode):
 
         P = self.H
         if P is None:
-            u = g0 / np.linalg.norm(g0)
+            if self.v0 is not None:
+                u = self.v0.copy()
+            else:
+                u = g0.copy()
+            u /= np.linalg.norm(u)
             P = I - 2 * np.outer(u, u)
         H = Htrue
 
