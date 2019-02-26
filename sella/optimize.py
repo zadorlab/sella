@@ -267,7 +267,7 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
             dx_mag = np.linalg.norm(dx)
             if abs(dx_mag - r_tr) < 1e-14 * r_tr:
                 break
-            
+
             if dx_mag > r_tr:
                 xilower = xi
             else:
@@ -417,7 +417,9 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
 
 def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
           r_trust=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
-          inc_lb=0.8, inc_ub=1.2, order=1, **kwargs):
+          inc_lb=0.8, inc_ub=1.2, order=1,
+          interpolations=('quartic', 'cubic', 'quadratic'),
+          **kwargs):
     d = len(x0)
 
     r_trust_min = kwargs.get('dxL', r_trust / 100.)
@@ -448,6 +450,9 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
     gnormlast = np.linalg.norm(g)
 
+    if interpolations is None:
+        interpolations = tuple()
+
     n = 1
     xi = 1.
     while True:
@@ -473,30 +478,34 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         # Rename minmode.xlast to minmode.x.
         dx_actual = minmode.dx(xlast)
 
-        try:
-            f, g, alpha = interpolate_quartic_constrained(f0, f1, g0, g1, dx_actual, r_trust)
-        except ValueError:
-            pass
+        for interp in interpolations:
+            if interp == 'quartic':
+                try:
+                    f, g, alpha = interpolate_quartic_constrained(f0, f1, g0, g1, dx_actual, r_trust)
+                except ValueError:
+                    pass
+                else:
+                    method = 'quartic'
+                    break
+            elif interp == 'cubic':
+                try:
+                    f, g, alpha = interpolate_cubic(f0, f1, g0, g1, dx_actual, r_trust)
+                except ValueError:
+                    pass
+                else:
+                    method = 'cubic'
+                    break
+            elif interp == 'quadratic':
+                try:
+                    f, g, alpha = interpolate_quadratic(f0, f1, g0, g1, dx_actual, r_trust)
+                except ValueError:
+                    pass
+                else:
+                    method = 'quadratic'
+                    break
         else:
-            method = 'quartic'
-
-        if method is None:
-            try:
-                f, g, alpha = interpolate_cubic(f0, f1, g0, g1, dx_actual, r_trust)
-            except ValueError:
-                pass
-            else:
-                method = 'cubic'
-
-        if method is None:
-            try:
-                f, g, alpha = interpolate_quadratic(f0, f1, g0, g1, dx_actual, r_trust)
-            except ValueError:
-                pass
-            else:
-                method = 'quadratic'
-
-        if method is None:
+            method = None
+            alpha = 1
             f, g = f1, g1
 
         if alpha < 0:
