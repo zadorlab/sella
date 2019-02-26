@@ -2,7 +2,8 @@ cimport cython
 from cython.view cimport array as cvarray
 
 from scipy.linalg.cython_blas cimport ddot, dgemv, dnrm2, dcopy, daxpy, dscal
-from scipy.linalg.cython_lapack cimport dgels
+from scipy.linalg.cython_lapack cimport dgels, dgesvd
+from scipy.linalg import null_space
 
 from libc.math cimport sqrt
 from libc.stdlib cimport malloc, free
@@ -14,6 +15,7 @@ import numpy as np
 
 cdef int ZERO = 0
 cdef int ONE = 1
+cdef int NONE = -1
 
 cdef double DZERO = 0.
 cdef double DONE = 1.
@@ -30,60 +32,6 @@ cdef double inner(double* M, double* x, double* y, double* Mx, int n, int xinc, 
 @cython.wraparound(False)
 @cython.cdivision(True)
 def ortho(X, Y, M=None, double eps=1e-15):
-    # Original Python code, in full:
-    # X = X.copy()
-    # Y = Y.copy()
-    #
-    # if len(X.shape) == 1:
-    #     X = np.array([X]).T
-    #
-    # n, nx = X.shape
-    # m, ny = Y.shape
-    # assert n == m
-    #
-    # if nx + ny > n:
-    #     raise RuntimeError
-    #
-    # if ny == m:
-    #     return np.empty((0, m))
-    #
-    # if M is None:
-    #     M = np.eye(n)
-    #
-    # X /= np.linalg.norm(X, axis=0)[np.newaxis, :]
-    #
-    # MY = M @ Y
-    # MX = M @ X
-    # if np.iscomplexobj(MY) or np.iscomplexobj(MX):
-    #     X = np.array(X, dtype=complex)
-    #
-    # Xout = np.zeros_like(X)
-    # nout = 0
-    #
-    # YTMY = Y.T @ MY
-    #
-    # for i in range(nx):
-    #     X[:, i] /= X[:, i].T @ MX[:, i]
-    #     while True:
-    #         for j in range(ny):
-    #             MXi = M @ X[:, i]
-    #             X[:, i] -= Y[:, j] * (Y[:, j].conj().T @ MXi) / np.sqrt(YTMY[j, j] * (X.T)[i] @ MXi)
-    #         for j in range(nout):
-    #             MXi = M @ X[:, i]
-    #             X[:, i] -= Xout[:, j] * (Xout[:, j].conj().T @ MXi) / np.sqrt((Xout.T)[j] @ M @ Xout[:, j] * (X.T)[i] @ MXi)
-    #         xinorm = np.sqrt(X[:, i].conj().T @ M @ X[:, i])
-    #         X[:, i] /= xinorm
-    #         MX[:, i] = M @ X[:, i]
-    #         if abs(1 - xinorm.real) < 1e-15 and abs(xinorm.imag) < 1e-15:
-    #             Xout[:, nout] = X[:, i]
-    #             nout += 1
-    #             break
-    #         elif abs(xinorm) < eps:
-    #             break
-    #     else:
-    #         raise RuntimeError
-    # return Xout[:, :nout]
-
     if len(X.shape) == 1:
         X_local = np.array(X[:, np.newaxis], order='C')
     else:
@@ -178,63 +126,123 @@ def simple_ortho(X, Y, double eps=1e-15):
     cdef int nx
     cdef int ny
 
-    n, nx = X_local.shape
-    _, ny = Y_local.shape
-    if nx + ny > n:
-        ny = n - nx
-        Y_local = Y_local[:, :ny]
-
-    if ny == n:
-        return np.empty((0, n))
-
-    YTY = np.sqrt(np.diag(Y_local.T @ Y))
-    Xout = np.zeros_like(X_local)
-    XoutTXout = np.sqrt(np.diag(np.zeros((nx, nx))))
-
-    cdef double[:, :] X_mv = memoryview(X_local)
-    cdef double[:, :] Y_mv = memoryview(Y_local)
-    cdef double[:] YTY_mv = memoryview(YTY)
-    cdef double[:, :] Xout_mv = memoryview(Xout)
-    cdef double[:] XoutTXout_mv = memoryview(XoutTXout)
-
     cdef int i
     cdef int j
     cdef int k
-    cdef int nout
+    cdef int nxout
+    cdef int nyout
 
-    cdef double XiTXi
-    cdef double YjTXi
-    cdef double XoutjTXi
+    n, nx = X_local.shape
+    _, ny = Y_local.shape
+
+    nxout = nx
+    nyout = ny
+
+    cdef double[:, :] X_mv = memoryview(X_local)
+    cdef double[:, :] Y_mv = memoryview(Y_local)
     cdef double scale
+    cdef double eps2 = sqrt(eps)
 
-    nout = 0
-    
-    for i in range(nx):
-        while True:
-            for j in range(ny):
-                scale = 1. / dnrm2(&n, &X_mv[0, i], &nx)
-                dscal(&n, &scale, &X_mv[0, i], &nx)
-                YjTXi = ddot(&n, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
-                scale = -YjTXi / YTY_mv[j]
+    # Initialize SVD
+    # Note: all of my matrices are C-ordered (row-major) for consistency,
+    # but this means the Fortran LAPACK routines see the matrices as their
+    # transpose. So, this code asks DGESVD for the right singular vectors,
+    # even though what we really want is the left singular vectors.
+    #
+    # It would not be unreasonable to make the arrays Fortran-ordered
+    # (column-major) to make the DGESVD calls clearer.
+
+    cdef int lwork = -1
+    cdef int info
+    cdef double* S = <double*> malloc(sizeof(double) * max(nx, ny))
+    cdef double* work = <double*> malloc(sizeof(double) * 1)
+    cdef double U
+    cdef double VT
+    if nx >= ny:
+        dgesvd('N', 'O', &nx, &n, &X_mv[0, 0], &nx, S, &U, &ONE, &VT, &ONE, work, &lwork, &info)
+    else:
+        dgesvd('N', 'O', &ny, &n, &Y_mv[0, 0], &ny, S, &U, &ONE, &VT, &ONE, work, &lwork, &info)
+    lwork = int(work[0])
+    free(work)
+    work = <double*> malloc(sizeof(double) * lwork)
+
+    if ny > 1:
+        dgesvd('N', 'O', &ny, &n, &Y_mv[0, 0], &ny, S, &U, &ONE, &VT, &ONE, work, &lwork, &info)
+        for i in range(ny):
+            if abs(S[i]) < eps2:
+                nyout -= 1
+
+    if nx + nyout >= n:
+        free(S)
+        free(work)
+        return null_space(Y_local.T)
+
+    cdef double err
+
+    while True:
+        # Modified Gram-Schmidt to orthogonalize X against Y,
+        # renormalizing the columns of X after every iteration
+        for i in range(nxout):
+            for j in range(nyout):
+                scale = -ddot(&n, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
                 daxpy(&n, &scale, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
-            for j in range(nout):
-                scale = 1. / dnrm2(&n, &X_mv[0, i], &nx)
-                dscal(&n, &scale, &X_mv[0, i], &nx)
-                XoutjTXi = ddot(&n, &Xout_mv[0, j], &nx, &X_mv[0, i], &nx)
-                scale = -XoutjTXi / XoutTXout_mv[j]
-                daxpy(&n, &scale, &Xout_mv[0, j], &nx, &X_mv[0, i], &nx)
-            XiTXi = dnrm2(&n, &X_mv[0, i], &nx)
-            scale = 1. / XiTXi
-            dscal(&n, &scale, &X_mv[0, i], &nx)
-            if abs(1 - XiTXi) < eps:
-                dcopy(&n, &X_mv[0, i], &nx, &Xout_mv[0, nout], &nx)
-                XoutTXout_mv[nout] = XiTXi
-                nout += 1
+                scale = dnrm2(&n, &X_mv[0, i], &nx)
+                for k in range(n):
+                    X_mv[k, i] /= scale
+        # Use SVD to make X orthonormal
+        dgesvd('N', 'O', &nxout, &n, &X_mv[0, 0], &nx, S, &U, &ONE, &VT, &ONE, work, &lwork, &info)
+        # Singular values are ranked greatest to least; truncate small singular
+        # values, because that means there is a high degree of linear dependence
+        for i in range(nxout):
+            if abs(S[i]) < eps2:
+                nxout -= 1
+        # Ensure columns of X are orthogonal to the columns of Y.
+        # This is a bit redundant with the first step of the next iteration.
+        for i in range(nxout):
+            for j in range(nyout):
+                err = ddot(&n, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
+                if err > eps:
+                    break
+            if err > eps:
                 break
-            elif abs(XiTXi) < eps:
-                break
+        else:
+            free(S)
+            free(work)
+            return X_local[:, :nxout]
 
-    return Xout[:, :nout]
+    # The old orthogonalization algorithm:
+#    nout = 0
+#
+#    for i in range(nx):
+#        while True:
+#            sctot = 1.
+#            for j in range(ny):
+#                YjTXi = ddot(&n, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
+#                scale = -YjTXi #/ (YTY_mv[j] * dnrm2(&n, &X_mv[0, i], &nx))
+#                daxpy(&n, &scale, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
+#                scale = 1. / dnrm2(&n, &X_mv[0, i], &nx)
+#                sctot *= scale
+#                dscal(&n, &scale, &X_mv[0, i], &nx)
+#            for j in range(nout):
+#                XoutjTXi = ddot(&n, &Xout_mv[0, j], &nx, &X_mv[0, i], &nx)
+#                scale = -XoutjTXi #/ (XoutTXout_mv[j] * dnrm2(&n, &X_mv[0, i], &nx))
+#                #scale = -XoutjTXi / dnrm2(&n, &X_mv[0, i], &nx)
+#                daxpy(&n, &scale, &Xout_mv[0, j], &nx, &X_mv[0, i], &nx)
+#                scale = 1. / dnrm2(&n, &X_mv[0, i], &nx)
+#                sctot *= scale
+#                dscal(&n, &scale, &X_mv[0, i], &nx)
+#            XiTXi = dnrm2(&n, &X_mv[0, i], &nx)
+#            scale = 1. / XiTXi
+#            dscal(&n, &scale, &X_mv[0, i], &nx)
+#            if abs(1 - 1/sctot) < eps:
+#                dcopy(&n, &X_mv[0, i], &nx, &Xout_mv[0, nout], &nx)
+#                XoutTXout_mv[nout] = XiTXi
+#                nout += 1
+#                break
+#            elif abs(1/sctot) < eps:
+#                break
+#
+#    return Xout[:, :nout]
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -313,4 +321,3 @@ def symmetrize_Y2(S, Y):
     free(dgels_A)
     free(work)
     return dY
-
