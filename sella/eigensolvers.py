@@ -2,11 +2,11 @@
 
 import numpy as np
 
-from scipy.linalg import eigh, null_space, lstsq
+from scipy.linalg import eigh, null_space, lstsq, solve
 from scipy.sparse.linalg import LinearOperator, bicg, lsqr
 
 from .cython_routines import ortho
-from .hessian_update import symmetrize_Y
+from .hessian_update import symmetrize_Y, update_H
 
 def Levi_Civita(n):
     LC = np.zeros((n, n, n))
@@ -459,7 +459,8 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     else:
         dA = shift * T @ T.T
         A_shift = A# + dA
-        P_shift = P# + dA
+        #P_shift = P# + dA
+        P_shift = P.copy()
 
 
     _, nt = T.shape
@@ -481,7 +482,6 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     # and the step direction.
     V_rand = 2 * np.random.random((n, nrandom)) - 1
     V = ortho(np.hstack((V0, P_vecs[:, :max(2, nneg)], V_rand)), T)
-    #V = ortho(P_vecs[:, :max(nev, nneg_P + 1)], T)
 
     AV = A_shift.dot(V)
     V = np.hstack((V, T))
@@ -489,21 +489,15 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
 
     method = 2
     Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-    #Atilde -= np.tril(Atilde - Atilde.T, -1)
     lams, vecs = eigh(Atilde)
     nneg = max(2, np.sum(lams < 0) + 1, nvecs)
     AV = AV @ vecs
     V = V @ vecs
-    #L = np.tril(V.T @ AV - AV.T @ V, -1)
-    #Ytilde = AV - V @ L
     Ytilde = symmetrize_Y(V, AV, symm=method)
-    #AV = Ytilde
-    #R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
     R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
     Rnorm = np.linalg.norm(R, axis=0)
 
     if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-#        print("Davidson converged in {} iterations".format(nneg))
         return lams, V, AV
     Rfit = np.vstack([R[:, i] for i in range(nneg) if Rnorm[i] > maxres * abs(lams[i])]).T
 
@@ -511,32 +505,26 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     _, nv = V.shape
     m = nt + nv
 
-
-    #for m in range(start, n):
     while m < n:
         for i in range(nneg):
             if Rnorm[i] >= maxres * np.abs(lams[i]):
                 r = R[:, i]
                 break
 
-        #Proj = I - V @ V.T #- T @ T.T
         Vnull = null_space(V.T)
-        Proj = Vnull @ Vnull.T
-        #if Rnorm[i] < 0.1 * abs(lams[i]):
         if True:
-            #PProj = Proj @ (P_shift - lams[i] * I) @ Proj
-            PProj = Proj @ P_shift - lams[i] * Proj
+            PProj = Vnull.T @ P_shift @ Vnull - lams[i] * np.eye(Vnull.shape[1])
         else:
-            #PProj = Proj @ (P_shift - 1.15 * P_lams[0] * I) @ Proj
-            PProj = Proj @ P_shift - 1.15 * P_lams[0] * Proj
-        #t, _, _, _ = np.linalg.lstsq(PProj, -Proj @ Rfit, rcond=None)
-        t, _, _, _ = lstsq(PProj, -Proj @ Rfit)
+            PProj = Vnull.T @ P_shift @ Vnull - 1.15 * P_lams[0] * np.eye(Vnull.shape[1])
+        t = Vnull @ solve(PProj, -Vnull.T @ Rfit, assume_a='sym')
         t = ortho(t, V)
-        if t.shape[0] == 0:
-#            print("Davidson failed, using Lanczos step")
+        # Davidson failed to find a new search direction
+        if t.shape[1] == 0:
+            # Do Lanczos instead
             t = ortho(AV[:, -1], V)
-            if t.shape[0] == 0:
-#                print("Warning: Davidson did not converge!")
+            # If Lanczos also fails to find a new search direction,
+            # just give up and return the current Ritz pairs
+            if t.shape[1] == 0:
                 return lams, V, AV
         _, nt = t.shape
         m += nt
@@ -546,25 +534,19 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
         V = np.hstack([V, t])
         AV = np.hstack([AV, At])
         Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-        #Atilde = V.T @ AV
-        #Atilde -= np.tril(Atilde - Atilde.T, -1)  # symmetrize approximation to A
         lams, vecs = eigh(Atilde)
         nneg = max(2, np.sum(lams < 0) + 1, nvecs)
         AV = AV @ vecs
         V = V @ vecs
         
         Ytilde = symmetrize_Y(V, AV, symm=method)
-        #AV = Ytilde
-        #R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
         R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
         Rnorm = np.linalg.norm(R, axis=0)
         print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], i)
         if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-#            print("Davidson converged in {} iterations".format(m))
             return lams, V, AV
         Rfit = np.vstack([R[:, i] for i in range(nneg) if Rnorm[i] > maxres * abs(lams[i])]).T
     else:
-#        print("Warning: Davidson did not converge!")
         return lams, V, AV
 
 def lanczos2(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nrandom=0, nvecs=0, nlan=0):
