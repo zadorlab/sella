@@ -467,6 +467,8 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         n += 1
         if ev:
             n = 1
+        if minmode.calls >= maxiter:
+            return minmode.xlast
 
         if np.linalg.norm(g1) < ftol:
             return minmode.xlast
@@ -521,8 +523,9 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
             r_trust /= inc_factr
 
         if reeval:
-            f, g, v1 = minmode.kick((1 - alpha) * dx1)
             x = minmode.xlast.copy()
+            f, g = f0, g0
+            x = xlast
         else:
             x = minmode.xpolate(alpha)
 
