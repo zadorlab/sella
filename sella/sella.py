@@ -121,7 +121,7 @@ class MinModeAtoms(MinMode):
         self.x0 = self.atoms.positions.ravel().copy()
         self.atoms.set_calculator(calculator)
         self.d = 3 * len(self.atoms)
-        if self.atoms.constraints is not None:
+        if self.atoms.constraints:
             self.d -= 3 * len(self.atoms.constraints[0].index)
 
         self.project_translations = project_translations
@@ -134,7 +134,7 @@ class MinModeAtoms(MinMode):
 
     def eval_eg(self, x):
         xin = x.reshape((-1, 3))
-        if self.atoms.constraints is not None:
+        if self.atoms.constraints:
             pos = np.zeros_like(self.atoms.positions)
             # Currently assume there is only one constraint, and it is FixAtoms
             assert len(self.atoms.constraints) == 1
@@ -153,7 +153,7 @@ class MinModeAtoms(MinMode):
         self.atoms.set_positions(pos)
         e = self.atoms.get_potential_energy()
         f = -self.atoms.get_forces()
-        if self.atoms.constraints is not None:
+        if self.atoms.constraints:
             g = np.zeros_like(xin)
             n = 0
             for i, xi in enumerate(pos):
