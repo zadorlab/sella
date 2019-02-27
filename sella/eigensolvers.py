@@ -505,7 +505,7 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     _, nv = V.shape
     m = nt + nv
 
-    while m < n:
+    while True:
         for i in range(nneg):
             if Rnorm[i] >= maxres * np.abs(lams[i]):
                 r = R[:, i]
