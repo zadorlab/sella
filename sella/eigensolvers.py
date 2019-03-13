@@ -511,13 +511,16 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
                 r = R[:, i]
                 break
 
-        Vnull = null_space(V.T)
-        if True:
-            PProj = Vnull.T @ P_shift @ Vnull - lams[i] * np.eye(Vnull.shape[1])
-        else:
-            PProj = Vnull.T @ P_shift @ Vnull - 1.15 * P_lams[0] * np.eye(Vnull.shape[1])
-        t = Vnull @ solve(PProj, -Vnull.T @ Rfit, assume_a='sym')
-        t = ortho(t, V)
+        ts = []
+        for i in range(nneg):
+            if Rnorm[i] < maxres * abs(lams[i]):
+                continue
+            Proj = I - np.outer(V[:, i], V[:, i])
+            PProj = Proj @ (P_shift - lams[i] * I) @ Proj
+            ti, _, _, _ = lstsq(PProj, R[:, i])
+            ts.append(ti)
+        t = ortho(np.vstack(ts).T, V)
+
         # Davidson failed to find a new search direction
         if t.shape[1] == 0:
             # Do Lanczos instead
