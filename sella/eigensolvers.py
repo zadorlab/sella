@@ -488,38 +488,40 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
     AV = np.hstack((AV, AT))
 
     method = 2
-    Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-    lams, vecs = eigh(Atilde)
-    nneg = max(2, np.sum(lams < 0) + 1, nvecs)
-    AV = AV @ vecs
-    V = V @ vecs
-    Ytilde = symmetrize_Y(V, AV, symm=method)
-    R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
-    Rnorm = np.linalg.norm(R, axis=0)
-
-    if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-        return lams, V, AV
-    Rfit = np.vstack([R[:, i] for i in range(nneg) if Rnorm[i] > maxres * abs(lams[i])]).T
-
-    _, nt = T.shape
-    _, nv = V.shape
-    m = nt + nv
-
+    seeking = 0
     while True:
-        for i in range(nneg):
-            if Rnorm[i] >= maxres * np.abs(lams[i]):
-                r = R[:, i]
-                break
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
+        lams, vecs = eigh(Atilde)
+        nneg = max(2, np.sum(lams < 0) + 1, nvecs)
+        # Rotate our subspace V to be diagonal in A.
+        # This is not strictly necessary but it makes our lives easier later
+        AV = AV @ vecs
+        V = V @ vecs
+        
+        Ytilde = symmetrize_Y(V, AV, symm=method)
+        R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
+        Rnorm = np.linalg.norm(R, axis=0)
+        print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
 
-        ts = []
-        for i in range(nneg):
-            if Rnorm[i] < maxres * abs(lams[i]):
-                continue
-            Proj = I - np.outer(V[:, i], V[:, i])
-            PProj = Proj @ (P_shift - lams[i] * I) @ Proj
-            ti, _, _, _ = lstsq(PProj, R[:, i])
-            ts.append(ti)
-        t = ortho(np.vstack(ts).T, V)
+        # Loop over all Ritz values of interest
+        for seeking, (rinorm, thetai) in enumerate(zip(Rnorm, lams)):
+            # Take the first Ritz value that is not converged, and use it
+            # to extend V
+            if rinorm >= maxres * np.abs(thetai):
+                ri = R[:, seeking]
+                ui = V[:, seeking]
+                break
+        # If they all seem converged, then we are done
+        else:
+            return lams, V, AV
+
+        # Find t such that (I - u u^T) (P - theta *I)^-1 t = -r, and t is orthogonal to u,
+        # where u is the Ritz vector (not the entire subspace spanned by V!)
+        Pproj = P_shift - thetai * I
+        Pprojr = solve(Pproj, ri)
+        Pproju = solve(Pproj, ui)
+        ti = Pproju * (ui @ Pprojr) / (ui @ Pproju) - Pprojr
+        t = ortho(ti, V)
 
         # Davidson failed to find a new search direction
         if t.shape[1] == 0:
@@ -529,147 +531,8 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
             # just give up and return the current Ritz pairs
             if t.shape[1] == 0:
                 return lams, V, AV
-        _, nt = t.shape
-        m += nt
 
-        At = A_shift.dot(t)
-        
         V = np.hstack([V, t])
-        AV = np.hstack([AV, At])
-        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-        lams, vecs = eigh(Atilde)
-        nneg = max(2, np.sum(lams < 0) + 1, nvecs)
-        AV = AV @ vecs
-        V = V @ vecs
-        
-        Ytilde = symmetrize_Y(V, AV, symm=method)
-        R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
-        Rnorm = np.linalg.norm(R, axis=0)
-        print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], i)
-        if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-            return lams, V, AV
-        Rfit = np.vstack([R[:, i] for i in range(nneg) if Rnorm[i] > maxres * abs(lams[i])]).T
+        AV = np.hstack([AV, A_shift.dot(t)])
     else:
-        return lams, V, AV
-
-def lanczos2(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nrandom=0, nvecs=0, nlan=0):
-    n, _ = A.shape
-
-    if niter is None:
-        niter = n
-    
-    if maxres <= 0:
-        return exact(A, maxres, P)
-
-    I = np.eye(n)
-
-    if P is None:
-        P = np.eye(n)
-
-    if V0 is None:
-        V0 = np.empty((n, 0))
-
-    if shift is None:
-        shift = 1000
-
-    if T is None:
-        T = np.empty((n, 0))
-        dA = np.zeros((n, n))
-        A_shift = A
-        P_shift = P
-    else:
-        dA = shift * T @ T.T
-        A_shift = A# + dA
-        P_shift = P# + dA
-
-    _, nt = T.shape
-
-    AT = shift * T
-
-    P_lams, P_vecs, _ = exact(P_shift, 0)
-    nneg = max(2, np.sum(P_lams < 0) + 1, nvecs)
-
-    # Adding random vector to search space improves stability
-    # of the optimization code by improving the approximate Hessian
-    # in directions that are orthogonal to the minimum eigenvector
-    # and the step direction.
-    V_rand = 2 * np.random.random((n, nrandom)) - 1
-    V = ortho(np.hstack((V0, P_vecs[:, :max(2, nneg)], V_rand)), T)
-    #V = ortho(P_vecs[:, :max(nev, nneg_P + 1)], T)
-
-    AV = A_shift.dot(V)
-    V = np.hstack((V, T))
-    AV = np.hstack((AV, AT))
-
-    method = 2
-    Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-    #Atilde -= np.tril(Atilde - Atilde.T, -1)
-    lams, vecs = eigh(Atilde)
-    nneg = max(2, np.sum(lams < 0) + 1, nvecs)
-    AV = AV @ vecs
-    V = V @ vecs
-    #L = np.tril(V.T @ AV - AV.T @ V, -1)
-    #Ytilde = AV - V @ L
-    Ytilde = symmetrize_Y(V, AV, symm=method)
-    #AV = Ytilde
-    R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
-    Rnorm = np.linalg.norm(R, axis=0)
-
-    if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-#        print("Davidson converged in {} iterations".format(nneg))
-        return lams, V, AV
-    Rfit = np.vstack([R[:, i] for i in range(nneg) if Rnorm[i] > maxres * abs(lams[i])]).T
-
-    _, nt = T.shape
-    _, nv = V.shape
-    m = nt + nv
-
-
-    #for m in range(start, n):
-    while m < n:
-        for i in range(nneg):
-            if Rnorm[i] >= maxres * np.abs(lams[i]):
-                r = R[:, i]
-                break
-
-        t = ortho(Rfit, V)
-#        Proj = I - V @ V.T - T @ T.T
-#        if Rnorm[i] < 0.1 * abs(lams[i]):
-#            PProj = Proj @ (P_shift - lams[i] * I) @ Proj
-#        else:
-#            PProj = Proj @ (P_shift - 1.15 * P_lams[0] * I) @ Proj
-#        t, _, _, _ = np.linalg.lstsq(PProj, -Proj @ Rfit, rcond=None)
-#        t = ortho(t, V)
-#        if t.shape[0] == 0:
-##            print("Davidson failed, using Lanczos step")
-#            t = ortho(AV[:, -1], V)
-#            if t.shape[0] == 0:
-##                print("Warning: Davidson did not converge!")
-#                return lams, V, AV
-        _, nt = t.shape
-        m += nt
-
-        At = A_shift.dot(t)
-        
-        V = np.hstack([V, t])
-        AV = np.hstack([AV, At])
-        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-        #Atilde = V.T @ AV
-        #Atilde -= np.tril(Atilde - Atilde.T, -1)  # symmetrize approximation to A
-        lams, vecs = eigh(Atilde)
-        nneg = max(2, np.sum(lams < 0) + 1, nvecs)
-        AV = AV @ vecs
-        V = V @ vecs
-        
-        Ytilde = symmetrize_Y(V, AV, symm=method)
-        #AV = Ytilde
-        R = Ytilde[:, :nneg] - V[:, :nneg] @ np.diag(lams[:nneg])
-        Rnorm = np.linalg.norm(R, axis=0)
-        print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], i)
-        if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-#            print("Davidson converged in {} iterations".format(m))
-            return lams, V, AV
-        Rfit = np.vstack([R[:, i] for i in range(nneg) if Rnorm[i] > maxres * abs(lams[i])]).T
-    else:
-#        print("Warning: Davidson did not converge!")
         return lams, V, AV
