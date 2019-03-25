@@ -241,13 +241,18 @@ def rs_prfo(minmode, g, r_tr, order=1, xi=1.):
 def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     """Perform a trust-radius Newton step towards an
     arbitrary-order saddle point (use order=0 to seek a minimum)"""
-    lams = minmode.lams
-    vecs = minmode.vecs
+    res, drdx, Tc, Tm = minmode.get_basis_constr(minmode.xlast)
+    Hproj = Tm.T @ minmode.H @ Tm
+    lams, vecs = eigh(Hproj)
+    g_red = Tm.T @ (g - minmode.H @ Tc @ res)
+    #lams = minmode.lams
+    #vecs = minmode.vecs
     L = np.abs(lams)
     L[:order] *= -1
-    Vg = vecs.T @ g
-    dx = -vecs @ (Vg / L)
-    dx_mag = np.linalg.norm(dx)
+    #Vg = vecs.T @ g
+    Vg = vecs.T @ g_red
+    dx_m = -vecs @ (Vg / L)
+    dx_mag = np.linalg.norm(dx_m)
     bound_clip = False
     if dx_mag > r_tr:
         bound_clip = True
@@ -261,10 +266,10 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
             else:
                 xi = (xilower + xiupper) / 2.
             if order == 0:
-                dx = -vecs @ (Vg / (L + xi))
+                dx_m = -vecs @ (Vg / (L + xi))
             else:
-                dx = -vecs @ (Vg * (L / (LL + xi)))
-            dx_mag = np.linalg.norm(dx)
+                dx_m = -vecs @ (Vg * (L / (LL + xi)))
+            dx_mag = np.linalg.norm(dx_m)
             if abs(dx_mag - r_tr) < 1e-14 * r_tr:
                 break
 
@@ -272,6 +277,11 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
                 xilower = xi
             else:
                 xiupper = xi
+
+    dx = Tm @ dx_m - Tc @ res
+    #dx_m = Tm @ dx
+    #dx_c = -Tc @ res
+    #dx = dx_m + dx_c
 
     de_pred = g.T @ dx + (dx.T @ minmode.H @ dx) / 2.
     return dx, dx_mag, xi, bound_clip, de_pred
@@ -463,6 +473,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         H0 = minmode.H.copy()
         xlast = x.copy()
         ev = (minmode.lams[0] > 0 and order > 0) or evnext or (nqn > 0 and n % nqn == 0)
+        #ev = evnext or (nqn > 0 and n % nqn == 0)
         f1, g1, dx1 = minmode.kick(dx, ev, **kwargs)
         n += 1
         if ev:
@@ -470,7 +481,10 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         if minmode.calls >= maxiter:
             return minmode.xlast
 
-        if np.linalg.norm(g1) < ftol:
+        res, drdx, Tc, Tm = minmode.get_basis_constr(minmode.xlast)
+        g_red = Tm.T @ (g1 - minmode.H @ Tc @ res)
+
+        if np.linalg.norm(g_red) < ftol:
             return minmode.xlast
     
         method = None
