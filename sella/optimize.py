@@ -472,7 +472,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         if minmode.calls >= maxiter:
             return minmode.last['x']
 
-        if np.linalg.norm(g1) < ftol:
+        if minmode.converged(ftol):
             return minmode.last['x']
     
         method = None

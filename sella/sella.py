@@ -9,7 +9,6 @@ from scipy.linalg import null_space, eigh
 
 from ase.io import Trajectory
 
-#from .cython_routines import simple_ortho
 from .cython_routines import modified_gram_schmidt
 from .internal_cython import cart_to_internal
 from .eigensolvers import davidson, NumericalHessian, ProjectedMatrix, project_rotation
@@ -179,7 +178,7 @@ class MinModeAtoms(object):
 
     def xpolate(self, alpha):
         if alpha != 1.:
-            raise RuntimeError
+            raise NotImplementedError
         return self.last['x']
 
     def _calc_constr_basis(self):
