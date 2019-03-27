@@ -234,25 +234,19 @@ def rs_prfo(minmode, g, r_tr, order=1, xi=1.):
             B1[r1, r1] = xi
             B2[r2, r2] = xi
 
-    de_pred = (l1[-1] / v1[0, -1]**2 + l2[0] / v2[0, 0]**2) / 2.
-    return dx, dx_mag, xi, bound_clip, de_pred
+    return dx, dx_mag, xi, bound_clip
         
 
 def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     """Perform a trust-radius Newton step towards an
     arbitrary-order saddle point (use order=0 to seek a minimum)"""
-    res, drdx, Tc, Tm = minmode.get_basis_constr(minmode.xlast)
-    Hproj = Tm.T @ minmode.H @ Tm
-    lams, vecs = eigh(Hproj)
-    g_red = Tm.T @ (g - minmode.H @ Tc @ res)
-    #lams = minmode.lams
-    #vecs = minmode.vecs
+    lams = minmode.lams
+    vecs = minmode.vecs
     L = np.abs(lams)
     L[:order] *= -1
-    #Vg = vecs.T @ g
-    Vg = vecs.T @ g_red
-    dx_m = -vecs @ (Vg / L)
-    dx_mag = np.linalg.norm(dx_m)
+    Vg = vecs.T @ g
+    dx = -vecs @ (Vg / L)
+    dx_mag = np.linalg.norm(dx)
     bound_clip = False
     if dx_mag > r_tr:
         bound_clip = True
@@ -266,10 +260,10 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
             else:
                 xi = (xilower + xiupper) / 2.
             if order == 0:
-                dx_m = -vecs @ (Vg / (L + xi))
+                dx = -vecs @ (Vg / (L + xi))
             else:
-                dx_m = -vecs @ (Vg * (L / (LL + xi)))
-            dx_mag = np.linalg.norm(dx_m)
+                dx = -vecs @ (Vg * (L / (LL + xi)))
+            dx_mag = np.linalg.norm(dx)
             if abs(dx_mag - r_tr) < 1e-14 * r_tr:
                 break
 
@@ -278,13 +272,7 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
             else:
                 xiupper = xi
 
-    dx = Tm @ dx_m - Tc @ res
-    #dx_m = Tm @ dx
-    #dx_c = -Tc @ res
-    #dx = dx_m + dx_c
-
-    de_pred = g.T @ dx + (dx.T @ minmode.H @ dx) / 2.
-    return dx, dx_mag, xi, bound_clip, de_pred
+    return dx, dx_mag, xi, bound_clip
 
 def interpolate_quartic_constrained(f0, f1, g0, g1, dx, rmax=np.infty):
     """Constructs a 1-D quartic interpolation between two points given
@@ -434,7 +422,8 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
     r_trust_min = kwargs.get('dxL', r_trust / 100.)
 
-    x = x0.copy()
+    x = minmode.x_m.copy()
+    #x = x0.copy()
     f1, g1 = minmode.f_minmode(x, **kwargs)
     xlast = x.copy()
 
@@ -466,8 +455,8 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
     n = 1
     xi = 1.
     while True:
-        dx, dx_mag, xi, bound_clip, df_pred = rs_newton(minmode, g, r_trust, order, xi)
-        #dx, dx_mag, xi, bound_clip, df_pred =  rs_prfo(minmode, g, r_trust, order, xi)
+        dx, dx_mag, xi, bound_clip = rs_newton(minmode, g, r_trust, order, xi)
+        #dx, dx_mag, xi, bound_clip =  rs_prfo(minmode, g, r_trust, order, xi)
 
         f0, g0 = f, g
         H0 = minmode.H.copy()
@@ -479,20 +468,18 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         if ev:
             n = 1
         if minmode.calls >= maxiter:
-            return minmode.xlast
+            return minmode.last['x']
 
-        res, drdx, Tc, Tm = minmode.get_basis_constr(minmode.xlast)
-        g_red = Tm.T @ (g1 - minmode.H @ Tc @ res)
-
-        if np.linalg.norm(g_red) < ftol:
-            return minmode.xlast
+        if np.linalg.norm(g1) < ftol:
+            return minmode.last['x']
     
         method = None
         alpha = 1.
 
-        # FIXME: this looks like it's wrong because of poor naming conventions.
-        # Rename minmode.xlast to minmode.x.
-        dx_actual = minmode.dx(xlast)
+        dx_actual = dx
+        ## FIXME: this looks like it's wrong because of poor naming conventions.
+        ## Rename minmode.xlast to minmode.x.
+        #dx_actual = minmode.dx(xlast)
 
         for interp in interpolations:
             if interp == 'quartic':
@@ -538,13 +525,13 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
         if reeval:
             f, g, v1 = minmode.kick((1 - alpha) * dx1)
-            x = minmode.xlast.copy()
+            x = minmode.last['x'].copy()
         else:
             x = minmode.xpolate(alpha)
 
         gnorm = np.linalg.norm(g)
         gnormlast = gnorm
-        
+
         print(f1, np.linalg.norm(g1), ratio, minmode.ratio, alpha, dx_mag / r_trust, r_trust, method, minmode.lams[0])
 
 class GDIIS(object):

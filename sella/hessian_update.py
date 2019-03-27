@@ -30,6 +30,14 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2):
 
     Ytilde = symmetrize_Y(S, Y, symm)
 
+    if B is None:
+        # Approximate B as a scaled identity matrix, where the
+        # scalar is the average Ritz value from S.T @ Y
+        thetas, _ = eigh(S.T @ Ytilde)
+        lam0 = np.average(np.abs(thetas))
+        d, _ = S.shape
+        B = lam0 * np.eye(d)
+
     if method == 'BFGS_auto':
         # Default to TS-BFGS, and only use BFGS if B and S.T @ Y are
         # both positive definite

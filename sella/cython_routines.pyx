@@ -31,18 +31,25 @@ cdef double inner(double* M, double* x, double* y, double* Mx, int n, int xinc, 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-def ortho(X, Y, M=None, double eps=1e-15):
+def ortho(X, Y=None, M=None, double eps=1e-15):
+    if M is None:
+        return simple_ortho(X, Y, eps)
+
     if len(X.shape) == 1:
         X_local = np.array(X[:, np.newaxis], order='C')
     else:
         X_local = np.array(X, order='C')
-    Y_local = np.array(Y, order='C')
 
     cdef int n
     cdef int nx
     cdef int ny
 
     n, nx = X_local.shape
+    if Y is None:
+        Y_local = np.empty((n, 0), dtype=X.dtype, order='C')
+    else:
+        Y_local = np.array(Y, order='C')
+
     _, ny = Y_local.shape
     if nx + ny > n:
         ny = n - nx
@@ -51,9 +58,6 @@ def ortho(X, Y, M=None, double eps=1e-15):
 
     if ny == n:
         return np.empty((0, n))
-
-    if M is None:
-        return simple_ortho(X, Y, eps)
 
     MX = M @ X_local
     MY = M @ Y_local
@@ -113,14 +117,13 @@ def ortho(X, Y, M=None, double eps=1e-15):
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-def simple_ortho(X, Y, double eps=1e-15):
+def simple_ortho(X, Y=None, double eps=1e-15):
     # A lot of code overlap with ortho. Can these be rolled into a
     # single function without using a lot of conditionals?
     if len(X.shape) == 1:
         X_local = np.array(X[:, np.newaxis], order='C')
     else:
         X_local = np.array(X, order='C')
-    Y_local = np.array(Y, order='C')
 
     cdef int n
     cdef int nx
@@ -133,6 +136,11 @@ def simple_ortho(X, Y, double eps=1e-15):
     cdef int nyout
 
     n, nx = X_local.shape
+
+    if Y is None:
+        Y_local = np.empty((n, 0), dtype=X.dtype, order='C')
+    else:
+        Y_local = np.array(Y, order='C')
     _, ny = Y_local.shape
 
     nxout = nx

@@ -126,8 +126,8 @@ class NumericalHessian(MatrixWrapper):
 
     def __init__(self, func, x0, g0, dxL, threepoint):
         self.func = func
-        self.x0 = x0
-        self.g0 = g0
+        self.x0 = x0.copy()
+        self.g0 = g0.copy()
         self.dxL = dxL
         self.threepoint = threepoint
         self.calls = 0
@@ -137,11 +137,12 @@ class NumericalHessian(MatrixWrapper):
 
     def _matvec(self, v):
         self.calls += 1
-        fplus, gplus = self.func(self.x0 + self.dxL * v.ravel())
+        vnorm = np.linalg.norm(v)
+        _, gplus = self.func(self.x0 + self.dxL * v.ravel() / vnorm)
         if self.threepoint:
-            fminus, gminus = self.func(self.x0 - self.dxL * v.ravel())
-            return (gplus - gminus) / (2 * self.dxL)
-        return ((gplus - self.g0) / self.dxL).reshape(v.shape)
+            fminus, gminus = self.func(self.x0 - self.dxL * v.ravel() / vnorm)
+            return vnorm * (gplus - gminus) / (2 * self.dxL)
+        return vnorm * ((gplus - self.g0) / self.dxL).reshape(v.shape)
 
     def _matmat(self, V):
         W = np.zeros_like(V)
@@ -158,47 +159,24 @@ class NumericalHessian(MatrixWrapper):
     def _adjoint(self):
         return self
 
-
 class ProjectedMatrix(MatrixWrapper):
-    dtype = np.dtype('float64')
-
-    def __new__(cls, A, basis, trvecs):
-        self = super(ProjectedMatrix, cls).__new__(cls)
+    def __init__(self, A, Tm):
         self.A = A
-        self.basis = basis
-        self.trvecs = trvecs
+        self.dtype = A.dtype
+        self.Tm = Tm.copy()
 
-        if isinstance(A, np.ndarray):
-            return basis.T @ A @ basis
+        self.dtrue, self.dproj = Tm.shape
+        self.shape = (self.dproj, self.dproj)
+        self.Vs = np.empty((self.dtrue, 0), dtype=A.dtype)
+        self.AVs = np.empty((self.dtrue, 0), dtype=A.dtype)
+
+    def dot(self, v_m):
+        v = self.Tm @ v_m
+        self.Vs = np.hstack((self.Vs, v.reshape((self.dtrue, -1))))
+        w = self.A.dot(v)
+        self.AVs = np.hstack((self.AVs, w.reshape((self.dtrue, -1))))
+        return self.Tm.T @ w
         
-        return self
-
-    def __init__(self, A, basis, trvecs):
-        self.A = A
-        self.basis = basis
-        self.trvecs = trvecs
-
-        _, self.n = self.basis.shape
-        _, self.ntr = self.trvecs.shape
-        self.nall = self.n + self.ntr
-
-        self.shape = (self.n, self.n)
-
-    def _matvec(self, v):
-        return (self.basis.T @ self.A.dot(self.basis @ v.ravel())).reshape(v.shape)
-
-    def _matmat(self, V):
-        if isinstance(V, MatrixSum):
-            raise ValueError
-        return (self.basis.T @ self.A.dot(self.basis @ V))
-
-    def _adjoint(self):
-        return self
-
-    def _transpose(self):
-        return self
-
-
 class MatrixSum(LinearOperator):
     def __init__(self, *args):
         matrices = []
@@ -431,73 +409,32 @@ def lobpcg(A, v0, maxres, P=None):
     print('Warning: LOBPCG may not have converged')
     return thetas, S @ Y, AS @ Y
 
-def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0, nrandom=0, nvecs=0):
+def davidson(A, maxres, P):
     n, _ = A.shape
 
-    if niter is None:
-        niter = n
-    
     if maxres <= 0:
         return exact(A, maxres, P)
 
     I = np.eye(n)
 
-    if P is None:
-        P = np.eye(n)
+    P_lams, P_vecs, _ = exact(P, 0)
+    nneg = max(2, np.sum(P_lams < 0) + 1)
 
-    if V0 is None:
-        V0 = np.empty((n, 0))
+    V = ortho(P_vecs[:, :nneg])
 
-    if shift is None:
-        shift = 1000
-
-    if T is None:
-        T = np.empty((n, 0))
-        dA = np.zeros((n, n))
-        A_shift = A
-        P_shift = P
-    else:
-        dA = shift * T @ T.T
-        A_shift = A# + dA
-        #P_shift = P# + dA
-        P_shift = P.copy()
-
-
-    _, nt = T.shape
-
-    AT = shift * T
-
-    P_lams, P_vecs, _ = exact(P_shift, 0)
-    nneg = max(2, np.sum(P_lams < 0) + 1, nvecs)
-
-    if nlan <= 0:
-        V_lan = np.empty((n, 0))
-        AV_lan = np.empty((n, 0))
-    else:
-        lams, T, AT = lanczos(A_shift, P_vecs[:, -(nt + 1)], maxres=maxres, P=P_shift, rightmost=True, niter=nlan, T=T, shift=shift)
-    
-    # Adding random vector to search space improves stability
-    # of the optimization code by improving the approximate Hessian
-    # in directions that are orthogonal to the minimum eigenvector
-    # and the step direction.
-    V_rand = 2 * np.random.random((n, nrandom)) - 1
-    V = ortho(np.hstack((V0, P_vecs[:, :max(2, nneg)], V_rand)), T)
-
-    AV = A_shift.dot(V)
-    V = np.hstack((V, T))
-    AV = np.hstack((AV, AT))
+    AV = A.dot(V)
 
     method = 2
     seeking = 0
     while True:
         Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
         lams, vecs = eigh(Atilde)
-        nneg = max(2, np.sum(lams < 0) + 1, nvecs)
+        nneg = max(2, np.sum(lams < 0) + 1)
         # Rotate our subspace V to be diagonal in A.
         # This is not strictly necessary but it makes our lives easier later
         AV = AV @ vecs
         V = V @ vecs
-        
+
         Ytilde = symmetrize_Y(V, AV, symm=method)
         R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
         Rnorm = np.linalg.norm(R, axis=0)
@@ -515,12 +452,20 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
         else:
             return lams, V, AV
 
-        # Find t such that (I - u u^T) (P - theta *I)^-1 t = -r, and t is orthogonal to u,
-        # where u is the Ritz vector (not the entire subspace spanned by V!)
-        Pproj = P_shift - thetai * I
+        ## Find t such that (I - u u^T) (P - theta *I)^-1 t = -r, and t is orthogonal to u,
+        ## where u is the Ritz vector (not the entire subspace spanned by V!)
+        #Pproj = P - thetai * I
+        #Pprojr = solve(Pproj, ri)
+        #Pproju = solve(Pproj, ui)
+        #alpha = (ui @ Pprojr) / (ui @ Pproju)
+        #ti = solve(Pproj, (alpha * ui - ri))
+
+        Pproj = P - thetai * I
         Pprojr = solve(Pproj, ri)
-        Pproju = solve(Pproj, ui)
-        ti = Pproju * (ui @ Pprojr) / (ui @ Pproju) - Pprojr
+        PprojV = solve(Pproj, V)
+        alpha = solve(V.T @ PprojV, V.T @ Pprojr)
+        ti = solve(Pproj, (V @ alpha - ri))
+
         t = ortho(ti, V)
 
         # Davidson failed to find a new search direction
@@ -533,6 +478,6 @@ def davidson(A, maxres, P=None, T=None, V0=None, niter=None, shift=None, nlan=0,
                 return lams, V, AV
 
         V = np.hstack([V, t])
-        AV = np.hstack([AV, A_shift.dot(t)])
+        AV = np.hstack([AV, A.dot(t)])
     else:
         return lams, V, AV
