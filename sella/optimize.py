@@ -424,7 +424,9 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
 
     x = minmode.x_m.copy()
     #x = x0.copy()
-    f1, g1 = minmode.f_minmode(x, **kwargs)
+    #f1, g1 = minmode.f_minmode(x, **kwargs)
+    f1, g1, _ = minmode.kick(np.zeros_like(x))
+    minmode.f_minmode(**kwargs)
     xlast = x.copy()
 
     ## Detect if x0 lies on a ridge; if it is, push it off

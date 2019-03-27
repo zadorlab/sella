@@ -9,7 +9,8 @@ from scipy.linalg import null_space, eigh
 
 from ase.io import Trajectory
 
-from .cython_routines import simple_ortho
+#from .cython_routines import simple_ortho
+from .cython_routines import modified_gram_schmidt
 from .internal_cython import cart_to_internal
 from .eigensolvers import davidson, NumericalHessian, ProjectedMatrix, project_rotation
 from .hessian_update import update_H, symmetrize_Y
@@ -23,7 +24,7 @@ class MinModeAtoms(object):
     def __init__(self, atoms, calc, eigensolver=davidson,
                  project_translations=True, project_rotations=None,
                  constraints=None, trajectory=None, shift=1000,
-                 v0=None):
+                 v0=None, maxres=1e-5):
         self.atoms = atoms.copy()
         if self.atoms.constraints:
             warnings.warn('ASE Atoms object has attached constraints, '
@@ -37,6 +38,7 @@ class MinModeAtoms(object):
         self.eigensolver = eigensolver
         self.shift = shift
         self.v0 = v0
+        self.maxres = maxres
         
         # Default to projecting out rotations for aperiodic systems, but
         # not for periodic systems.
@@ -118,12 +120,6 @@ class MinModeAtoms(object):
         # any constraints.
         return self.Tm.T @ self.x
 
-    @x_m.setter
-    def x_m(self, target):
-        dx_m = target - self.Tm.T @ self.x
-        dx = self.Tm @ dx_m - self.Tc @ self.res
-        self.x += dx
-
     @property
     def res(self):
         # The vector of residuals, indicating how much our current
@@ -169,19 +165,17 @@ class MinModeAtoms(object):
             self._calc_constr_basis()
             self._basis_xlast = self.x.copy()
 
-    def kick(self, dx, minmode=False, **kwargs):
-        if np.linalg.norm(dx) == 0:
-            return self.last['f'], self.last['g_m'], dx
-        x_mlast = self.x_m.copy()
-        xlast = self.x.copy()
-        x1_m = x_mlast + dx
+    def kick(self, dx_m, minmode=False, **kwargs):
+        if np.linalg.norm(dx_m) == 0 and self.last['f'] is not None:
+            return self.last['f'], self.last['g_m'], dx_m
+
+        dx = self.Tm @ dx_m - self.Tc @ self.res
+        f1, g1 = self.f_update(self.x + dx)
+        #f1, g_m = self.f_update(self.x_m + dx_m)
         if minmode:
-            f1, g1 = self.f_minmode(x1_m, **kwargs)
-        else:
-            f1, g1 = self.f_update(x1_m)
-        dx_mactual = self.x_m - x_mlast
-        dx_actual = self.x - xlast
-        return f1, g1, dx
+            self.f_minmode(**kwargs)
+
+        return f1, self.last['g_m'], dx_m
 
     def xpolate(self, alpha):
         if alpha != 1.:
@@ -223,18 +217,21 @@ class MinModeAtoms(object):
 
         # Now consider translation
         tvec = np.zeros_like(self.atoms.positions)
-        tvec[:, 0] = 1.
-        for i, dim in enumerate(self.constraints.get('translations', [False, False, False])):
-            if dim:
-                # self._res[n] = 0  # <-- not necessary to state explicitly
-                self._drdx[:, n] = np.roll(tvec, i, axis=1).ravel()
-                n += 1
+        tvec[:, 0] = 1. / len(self.atoms)
+        for dim, target in self.constraints.get('translations', dict()).items():
+            self._res[n] = np.average(self.atoms.positions[:, dim]) - target
+            self._drdx[:, n] = np.roll(tvec, dim, axis=1).ravel()
+            n += 1
 
         # And rotations
         if self.constraints.get('rotations', False):
             drdx_rot = project_rotation(self.x)
             _, nrot = drdx_rot.shape
-            # self._res[n : n+nrot] = 0  # <-- not necessary to state explicitly
+            # TODO: Figure out how to use these constraints to push the
+            # structure into a consistent orientation in space. That
+            # might involve reworking how rotational constraints are
+            # enforced completely.
+            # self._res[n : n+nrot] = ???
             self._drdx[:, n : n+nrot] = drdx_rot
             n += nrot
 
@@ -255,16 +252,33 @@ class MinModeAtoms(object):
                                               d_indices,
                                               mask,
                                               gradient=True)
+
+        m = 0
+        for indices in b_indices:
+            r_int[m] -= self.constraints['bonds'][tuple(indices)]
+            m += 1
+
+        for indices in a_indices:
+            r_int[m] -= self.constraints['angles'][tuple(indices)]
+            m += 1
+
+        for indices in d_indices:
+            val = r_int[m]
+            target = self.constraints['dihedrals'][tuple(indices)]
+            r_int[m] = (val - target + np.pi) % (2 * np.pi) - np.pi
+            m += 1
+
         self._res[n:] = r_int
         self._drdx[:, n:] = drdx_int.T
 
         # If we've made it this far and there's only one constraint,
         # we don't need to work any harder to get a good orthonormal basis.
-        if self.nconstraints == 1:
-            self._Tc = self._drdx / np.linalg.norm(self._drdx[:, 0])
+        if self._drdx.shape[1] == 1:
+            self._Tc = self._drdx / np.linalg.norm(self._drdx)
         # Otherwise, we need to orthonormalize everything
         else:
-            self._Tc = simple_ortho(self._drdx)
+            self._Tc = modified_gram_schmidt(self._drdx)
+
         self._Tm = null_space(self._Tc.T)
 
     def _initialize_constraints(self, constraints, p_t, p_r):
@@ -309,7 +323,11 @@ class MinModeAtoms(object):
         self.nconstraints += len(fix)
 
         # Second, we consider translational/rotational motion.
-        self.constraints['translations'] = fixed_dims
+        self.constraints['translations'] = dict()
+        for dim, fixed in enumerate(fixed_dims):
+            if fixed:
+                self.constraints['translations'][dim] = np.average(self.atoms.positions[:, dim])
+        #self.constraints['translations'] = fixed_dims
         self.constraints['rotations'] = p_r
         self.nconstraints += np.sum(fixed_dims) + 3 * p_r
 
@@ -377,28 +395,28 @@ class MinModeAtoms(object):
             self.trajectory.write(self.atoms)
         return e, g
 
-    def f_update(self, x_m):
-        if self.last['f'] is not None and np.all(x_m == self.x_m):
-            return self.last['f'], self.last['g_m']
+    def f_update(self, x):
+        if self.last['f'] is not None and np.all(x == self.x):
+            return self.last['f'], self.last['g']
 
-        self.x_m = x_m
-        f, g = self.calc_eg(self.x)
-        xlast = self.last['x']
+        f, g = self.calc_eg(x)
+        #xlast = self.last['x']
         h = g - self.drdx @ self.Tc.T @ g
 
         if self.last['f'] is not None and self.H is not None:
             # Calculate predicted vs actual change in energy
             self.df = f - self.last['f']
             dx = self.x - self.last['x']
+
             dx_free = self.Tfree.T @ dx
             self.df_pred = self.last['g'].T @ dx + (dx_free.T @ self.H @ dx_free) / 2.
             self.ratio = self.df_pred / self.df
 
             # Update Hessian matrix
-            dh_free = self.Tfree.T @ (h - self.last['h'])
-            self.H = update_H(self.H, dx_free, dh_free)
-            #dg_free = self.Tfree.T @ (g - self.last['g'])
-            #self.H = update_H(self.H, dx_free, dg_free)
+            #dh_free = self.Tfree.T @ (h - self.last['h'])
+            #self.H = update_H(self.H, dx_free, dh_free)
+            dg_free = self.Tfree.T @ (g - self.last['g'])
+            self.H = update_H(self.H, dx_free, dg_free)
 
         g_m = self.Tm.T @ g
         if self.H is not None:
@@ -411,10 +429,12 @@ class MinModeAtoms(object):
                          x_m=self.x_m.copy(),
                          g_m=g_m.copy())
 
-        return f, g_m
+        return f, g
 
-    def f_minmode(self, x_m, dxL, maxres, threepoint=False, **kwargs):
-        f, g_m = self.f_update(x_m)
+    def f_minmode(self, dxL, maxres, threepoint=False, **kwargs):
+        if self.last['g'] is None:
+            self.f_update(self.x)
+
         x = self.last['x']
         g = self.last['g']
         #Htrue = NumericalHessian(self.calc_eg, x, g, dxL, threepoint)
@@ -437,7 +457,10 @@ class MinModeAtoms(object):
         Hproj = ProjectedMatrix(Htrue, self.Tm)
 
         Pproj = (self.Tm.T @ self.Tfree) @ H @ (self.Tfree.T @ self.Tm)
+
+        x_orig = self.x.copy()
         lams, Vs, AVs = self.eigensolver(Hproj, maxres, Pproj)
+        self.x = x_orig
 
         Vs = Hproj.Vs
         AVs = Hproj.AVs
@@ -446,9 +469,11 @@ class MinModeAtoms(object):
 
         Vs = Vs @ vecs
         AVs = AVs @ vecs
-        AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
-        #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
+        #AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
+        #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
+        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
 
+    def converged(self, ftol):
+        return ((np.linalg.norm(self.last['g_m']) < ftol)
+                and np.all(np.abs(self.res) < self.maxres))
 
-        return f, g_m
