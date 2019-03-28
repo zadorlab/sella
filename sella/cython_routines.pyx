@@ -249,40 +249,6 @@ def simple_ortho(X, Y=None, double eps=1e-15):
             free(work)
             return X_local[:, :nxout]
 
-    # The old orthogonalization algorithm:
-#    nout = 0
-#
-#    for i in range(nx):
-#        while True:
-#            sctot = 1.
-#            for j in range(ny):
-#                YjTXi = ddot(&n, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
-#                scale = -YjTXi #/ (YTY_mv[j] * dnrm2(&n, &X_mv[0, i], &nx))
-#                daxpy(&n, &scale, &Y_mv[0, j], &ny, &X_mv[0, i], &nx)
-#                scale = 1. / dnrm2(&n, &X_mv[0, i], &nx)
-#                sctot *= scale
-#                dscal(&n, &scale, &X_mv[0, i], &nx)
-#            for j in range(nout):
-#                XoutjTXi = ddot(&n, &Xout_mv[0, j], &nx, &X_mv[0, i], &nx)
-#                scale = -XoutjTXi #/ (XoutTXout_mv[j] * dnrm2(&n, &X_mv[0, i], &nx))
-#                #scale = -XoutjTXi / dnrm2(&n, &X_mv[0, i], &nx)
-#                daxpy(&n, &scale, &Xout_mv[0, j], &nx, &X_mv[0, i], &nx)
-#                scale = 1. / dnrm2(&n, &X_mv[0, i], &nx)
-#                sctot *= scale
-#                dscal(&n, &scale, &X_mv[0, i], &nx)
-#            XiTXi = dnrm2(&n, &X_mv[0, i], &nx)
-#            scale = 1. / XiTXi
-#            dscal(&n, &scale, &X_mv[0, i], &nx)
-#            if abs(1 - 1/sctot) < eps:
-#                dcopy(&n, &X_mv[0, i], &nx, &Xout_mv[0, nout], &nx)
-#                XoutTXout_mv[nout] = XiTXi
-#                nout += 1
-#                break
-#            elif abs(1/sctot) < eps:
-#                break
-#
-#    return Xout[:, :nout]
-
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
@@ -336,8 +302,6 @@ def symmetrize_Y2(S, Y):
     lwork = int(work_tmp[0])
     free(work_tmp)
     cdef double* work = <double*> malloc(sizeof(double) * lwork)
-
-    # Original Python code, in full:
 
     for i in range(1, nvecs):
         # RHS = YTS[i, :i].T - YTS[:i, i] - dYTS[:i, i]
