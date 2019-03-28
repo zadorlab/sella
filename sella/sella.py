@@ -9,7 +9,7 @@ from scipy.linalg import null_space, eigh, lstsq
 
 from ase.io import Trajectory
 
-from .cython_routines import modified_gram_schmidt
+from .cython_routines import simple_ortho, modified_gram_schmidt
 from .internal_cython import cart_to_internal
 from .eigensolvers import davidson, NumericalHessian, ProjectedMatrix, project_rotation
 from .hessian_update import update_H, symmetrize_Y
@@ -71,6 +71,10 @@ class MinModeAtoms(object):
         self.H = None
         self.calls = 0
         self._basis_xlast = None
+
+    def set_constraints(self, constraints, project_translations, project_rotations):
+        self.constraints = dict()
+        self._initialize_constraints(constraints, project_translations, project_rotations)
 
     @property
     def H(self):
@@ -282,6 +286,7 @@ class MinModeAtoms(object):
         # Otherwise, we need to orthonormalize everything
         else:
             self._Tc = modified_gram_schmidt(self._drdx)
+            #self._Tc = simple_ortho(self._drdx)
 
         self._Tm = null_space(self._Tc.T)
 
@@ -404,8 +409,8 @@ class MinModeAtoms(object):
             return self.last['f'], self.last['g']
 
         f, g = self.calc_eg(x)
-        #xlast = self.last['x']
         h = g - self.drdx @ self.Tc.T @ g
+        #h = g - self.drdx @ self.drdx.T @ g
 
         if self.last['f'] is not None and self.H is not None:
             # Calculate predicted vs actual change in energy
@@ -480,6 +485,7 @@ class MinModeAtoms(object):
         Vs = Vs @ vecs
         AVs = AVs @ vecs
         AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
+        #AVstilde = AVs - self.drdx @ self.drdx.T @ AVs
         self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
         #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
 
