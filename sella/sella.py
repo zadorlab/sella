@@ -5,7 +5,7 @@
 import warnings
 
 import numpy as np
-from scipy.linalg import null_space, eigh
+from scipy.linalg import null_space, eigh, lstsq
 
 from ase.io import Trajectory
 
@@ -168,9 +168,14 @@ class MinModeAtoms(object):
         if np.linalg.norm(dx_m) == 0 and self.last['f'] is not None:
             return self.last['f'], self.last['g_m'], dx_m
 
-        dx = self.Tm @ dx_m - self.Tc @ self.res
+        res_orig = self.res.copy()
+
+        #dx_c = -self.Tc @ self.res
+        dx_c, _, _, _ = lstsq(-self.drdx.T, self.res)
+
+        dx = self.Tm @ dx_m + dx_c
         f1, g1 = self.f_update(self.x + dx)
-        #f1, g_m = self.f_update(self.x_m + dx_m)
+
         if minmode:
             self.f_minmode(**kwargs)
 
@@ -412,10 +417,10 @@ class MinModeAtoms(object):
             self.ratio = self.df_pred / self.df
 
             # Update Hessian matrix
-            #dh_free = self.Tfree.T @ (h - self.last['h'])
-            #self.H = update_H(self.H, dx_free, dh_free)
-            dg_free = self.Tfree.T @ (g - self.last['g'])
-            self.H = update_H(self.H, dx_free, dg_free)
+            dh_free = self.Tfree.T @ (h - self.last['h'])
+            self.H = update_H(self.H, dx_free, dh_free)
+            #dg_free = self.Tfree.T @ (g - self.last['g'])
+            #self.H = update_H(self.H, dx_free, dg_free)
 
         g_m = self.Tm.T @ g
         if self.H is not None:
@@ -468,9 +473,9 @@ class MinModeAtoms(object):
 
         Vs = Vs @ vecs
         AVs = AVs @ vecs
-        #AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
-        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
+        AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
+        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
+        #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.last['g_m']) < ftol)
