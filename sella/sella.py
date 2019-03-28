@@ -413,7 +413,13 @@ class MinModeAtoms(object):
             dx = self.x - self.last['x']
 
             dx_free = self.Tfree.T @ dx
-            self.df_pred = self.last['g'].T @ dx + (dx_free.T @ self.H @ dx_free) / 2.
+            #self.df_pred = self.last['g'].T @ dx + (dx_free.T @ self.H @ dx_free) / 2.
+
+            dx_m = self.Tfree.T @ self.Tm @ self.Tm.T @ dx
+            dx_c = self.Tfree.T @ self.Tc @ self.Tc.T @ dx
+            self.df_pred = (self.last['g'].T @ dx - (dx_m @ self.H @ dx_c)
+                    + (dx_m @ self.H @ dx_m) / 2. + (dx_c @ self.H @ dx_c) / 2.)
+
             self.ratio = self.df_pred / self.df
 
             # Update Hessian matrix
