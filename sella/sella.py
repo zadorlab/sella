@@ -8,6 +8,7 @@ import numpy as np
 from scipy.linalg import null_space, eigh, lstsq
 
 from ase.io import Trajectory
+from ase.calculators.singlepoint import SinglePointCalculator
 
 from .cython_routines import simple_ortho, modified_gram_schmidt
 from .internal_cython import cart_to_internal
@@ -25,6 +26,7 @@ class MinModeAtoms(object):
                  constraints=None, trajectory=None, shift=1000,
                  v0=None, maxres=1e-5):
         self.atoms = atoms.copy()
+
         if self.atoms.constraints:
             warnings.warn('ASE Atoms object has attached constraints, '
                           'but these will be ignored! Please provide '
@@ -32,7 +34,18 @@ class MinModeAtoms(object):
                           'initializer instead!')
             self.atoms.set_constraint()
 
-        self.atoms.set_calculator(calc)
+        # We don't want to pass the dummy atoms onto the calculator,
+        # which might not know what to do with them, so we have a
+        # second Atoms object with dummy atoms removed, and attach
+        # the calculator to *that*
+        self._atoms_nodummy = self.atoms
+        self.dummy_indices = [atom.index for atom in self.atoms if atom.symbol == 'X']
+        if self.dummy_indices:
+            self._atoms_nodummy = self.atoms.copy()
+        self.dummy_pos = self.atoms.positions[self.dummy_indices]
+        del self._atoms_nodummy[self.dummy_indices]
+
+        self._atoms_nodummy.set_calculator(calc)
 
         self.eigensolver = eigensolver
         self.shift = shift
@@ -111,11 +124,35 @@ class MinModeAtoms(object):
     def x(self):
         # The current atomic positions in a flattened array.
         # Full dimensional.
-        return self.atoms.positions.ravel().copy()
+        xout = np.zeros(self.d).reshape((-1, 3))
+        x_real = self._atoms_nodummy.positions
+        x_dummy = self.dummy_pos
+        nreal = 0
+        ndummy = 0
+        for i, row in enumerate(xout):
+            if i in self.dummy_indices:
+                row[:] = x_dummy[ndummy]
+                ndummy += 1
+            else:
+                row[:] = x_real[nreal]
+                nreal += 1
+        return xout.ravel()
 
     @x.setter
     def x(self, target):
-        self.atoms.set_positions(target.reshape((-1, 3)))
+        xin = target.reshape((-1, 3))
+        xreal = self.atoms.positions.copy()
+        nreal = 0
+        ndummy = 0
+        for i, row in enumerate(xin):
+            if i in self.dummy_indices:
+                self.dummy_pos[ndummy] = row
+                ndummy += 1
+            else:
+                xreal[nreal] = row
+                nreal += 1
+        self.atoms.set_positions(xin)
+        self._atoms_nodummy.set_positions(xreal)
 
     @property
     def x_m(self):
@@ -396,11 +433,20 @@ class MinModeAtoms(object):
         if x is not None:
             self.x = x
 
-        e = self.atoms.get_potential_energy()
-        g = -self.atoms.get_forces().ravel()
+        e = self._atoms_nodummy.get_potential_energy()
+        gin = self._atoms_nodummy.get_forces()
+        gout = np.zeros(self.d).reshape((-1, 3))
+        nreal = 0
+        for i, row in enumerate(gout):
+            if i not in self.dummy_indices:
+                row[:] = gin[nreal]
+                nreal += 1
+        g = -gout.ravel()
         self.calls += 1
 
         if self.trajectory is not None:
+            if self.dummy_indices:
+                self.atoms.set_calculator(SinglePointCalculator(self.atoms, energy=e, forces=gout))
             self.trajectory.write(self.atoms)
         return e, g
 
