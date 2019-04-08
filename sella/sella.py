@@ -26,6 +26,7 @@ class MinModeAtoms(object):
                  constraints=None, trajectory=None, shift=1000,
                  v0=None, maxres=1e-5):
         self.atoms = atoms.copy()
+        self.H = None
 
         if self.atoms.constraints:
             warnings.warn('ASE Atoms object has attached constraints, '
@@ -81,7 +82,6 @@ class MinModeAtoms(object):
                          h=None,
                          x_m=None,
                          g_m=None)
-        self.H = None
         self.calls = 0
         self._basis_xlast = None
 
@@ -207,7 +207,7 @@ class MinModeAtoms(object):
 
     def kick(self, dx_m, minmode=False, **kwargs):
         if np.linalg.norm(dx_m) == 0 and self.last['f'] is not None:
-            return self.last['f'], self.last['g_m'], dx_m
+            return self.last['f'], self.Tm.T @ self.last['g'], dx_m
 
         res_orig = self.res.copy()
 
@@ -220,7 +220,7 @@ class MinModeAtoms(object):
         if minmode:
             self.f_minmode(**kwargs)
 
-        return f1, self.last['g_m'], dx_m
+        return f1, self.Tm.T @ self.last['g'], dx_m
 
     def xpolate(self, alpha):
         if alpha != 1.:
@@ -330,6 +330,12 @@ class MinModeAtoms(object):
     def _initialize_constraints(self, constraints, p_t, p_r):
         self.nconstraints = 0
 
+        if self.H is not None:
+            assert self.Tfree is not None
+            Hfull = self.Tfree @ self.H @ self.Tfree.T
+        else:
+            Hfull = None
+
         # Make a copy, because we are going to be popping entries
         # off the object to ensure that we've parsed everything,
         # and we don't want to modify the user-provided object,
@@ -428,6 +434,11 @@ class MinModeAtoms(object):
         # the user-provided constraints, so throw an error.
         if con:
             raise ValueError("Don't know what to do with constraint types: {}".format(con.keys()))
+
+        if Hfull is not None:
+            # Project into new basis
+            self._calc_constr_basis()
+            self.H = self.Tfree.T @ Hfull @ self.Tfree
 
     def calc_eg(self, x=None):
         if x is not None:
@@ -536,6 +547,6 @@ class MinModeAtoms(object):
         #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
 
     def converged(self, ftol):
-        return ((np.linalg.norm(self.last['g_m']) < ftol)
+        return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)
                 and np.all(np.abs(self.res) < self.maxres))
 
