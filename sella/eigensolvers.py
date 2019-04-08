@@ -8,85 +8,6 @@ from scipy.sparse.linalg import LinearOperator, bicg, lsqr
 from .cython_routines import ortho
 from .hessian_update import symmetrize_Y, update_H
 
-def Levi_Civita(n):
-    LC = np.zeros((n, n, n))
-    for i in range(n):
-        even = np.roll(range(n), i)
-        LC[tuple(even)] = 1.
-        LC[tuple(even[::-1])] = -1.
-    return LC
-
-def project_translation(x0):
-    d = len(x0)
-    if d % 3 != 0:
-        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
-
-    natoms = d // 3
-    tvecs = np.zeros((3, d))
-    tvec = np.array([[1., 0., 0.] for i in range(natoms)]).ravel()
-    tvec /= np.linalg.norm(tvec)
-    for i in range(3):
-        tvecs[i] = np.roll(tvec, i)
-
-    return tvecs.T
-
-LC = Levi_Civita(3)
-
-def project_rotation(x0):
-    d = len(x0)
-    if d % 3 != 0:
-        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
-
-    natoms = d // 3
-    rvecs = np.zeros((3, d))
-    nrot = 0
-
-    x0_mat = x0.reshape((-1, 3))
-    com = np.average(x0_mat, axis=0)
-    x0_com = x0_mat - com
-    _, I = eigh(np.sum(x0_com**2) * np.eye(3) - x0_com.T @ x0_com)
-    rvecs_guess = np.einsum('ij,jk,klm,nm->lin', x0_com, I, LC, I).reshape((3, d))
-    for rvec in rvecs_guess:
-        rvec_norm = np.linalg.norm(rvec)
-        if rvec_norm > 1e-8:
-            rvecs[nrot] = rvec / rvec_norm
-            nrot += 1
-
-    return rvecs[:nrot].T
-
-def atoms_tr_projection(x0):
-    d = len(x0)
-    if d % 3 != 0:
-        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
-
-    natoms = d // 3
-    trvecs = np.zeros((6, d))
-    tvec = np.array([[1., 0., 0.] for i in range(natoms)]).ravel()
-    tvec /= np.linalg.norm(tvec)
-    for i in range(3):
-        trvecs[i] = np.roll(tvec, i)
-    n_tr = 3
-    
-    # transform coordinates back into N,3 matrix
-    x0_mat = x0.reshape((natoms, 3))
-    # Find center of mass in *cartesian* coordinates
-    com = np.average(x0_mat, axis=0)
-    # offset positions in *mass-weighted cartesian* coordinates
-    x0_com = x0_mat - com
-    # eigenvectors of the inertia tensor
-    _, I = eigh(np.sum(x0_com**2) * np.eye(3) - np.dot(x0_com.T, x0_com))
-    # Rotation vectors in mass-weighted cartesian coordinates. It's complicated.
-    #rvecs = np.dot(np.dot(x0_com, I), np.dot(LC, I.T)).swapaxes(0, 1).reshape((3, d))
-    rvecs = np.einsum('ij,jk,klm,nm->lin', x0_com, I, LC, I).reshape((3, d))
-    for rvec in rvecs:
-        rvec_norm = np.linalg.norm(rvec)
-        # while rvec_norm could be anything, a very small value indicates that the
-        # mode may not correspond to a true rotation, e.g. for a linear molecule
-        if rvec_norm > 1e-8:
-            trvecs[n_tr] = rvec / rvec_norm
-            n_tr += 1
-
-    return trvecs[:n_tr].T
 
 class MatrixWrapper(LinearOperator):
     def __init__(self, A):
@@ -100,7 +21,6 @@ class MatrixWrapper(LinearOperator):
     def _rmatvec(self, v):
         return v.dot(self.A)
 
-
     def __add__(self, other):
         return MatrixSum(self, other)
 
@@ -108,7 +28,7 @@ class MatrixWrapper(LinearOperator):
         if isinstance(other, MatrixSum):
             raise ValueError
         return MatrixWrapper(self.A.dot(other))
-    
+
     def _rmatmat(self, other):
         if isinstance(other, MatrixSum):
             raise ValueError
@@ -159,6 +79,7 @@ class NumericalHessian(MatrixWrapper):
     def _adjoint(self):
         return self
 
+
 class ProjectedMatrix(MatrixWrapper):
     def __init__(self, A, Tm):
         self.A = A
@@ -176,7 +97,8 @@ class ProjectedMatrix(MatrixWrapper):
         w = self.A.dot(v)
         self.AVs = np.hstack((self.AVs, w.reshape((self.dtrue, -1))))
         return self.Tm.T @ w
-        
+
+
 class MatrixSum(LinearOperator):
     def __init__(self, *args):
         matrices = []
@@ -186,9 +108,9 @@ class MatrixSum(LinearOperator):
             else:
                 matrices.append(arg)
 
-        self.dtype = sorted([matrix.dtype for matrix in matrices], reverse=True)[0]
+        self.dtype = sorted([mat.dtype for mat in matrices], reverse=True)[0]
         self.shape = matrices[0].shape
-        
+
         mnum = None
         self.matrices = []
         for matrix in matrices:
@@ -208,7 +130,7 @@ class MatrixSum(LinearOperator):
         for matrix in self.matrices:
             w += matrix.dot(v)
         return w
-    
+
     def _rmatvec(self, v):
         w = np.zeros_like(v, dtype=self.dtype)
         for matrix in self.matrices:
@@ -233,7 +155,7 @@ class MatrixSum(LinearOperator):
         return MatrixSum(self, other)
 
 
-def exact(A, maxres=None, P=None, T=None, shift=None, nlan=None):
+def exact(A, maxres=None, P=None):
     if isinstance(A, np.ndarray):
         lams, vecs = eigh(A)
     else:
@@ -253,62 +175,6 @@ def exact(A, maxres=None, P=None, T=None, shift=None, nlan=None):
         B = 0.5 * (B + B.T)
         lams, vecs = eigh(B)
     return lams, vecs, lams[np.newaxis, :] * vecs
-
-def lanczos(A, v0, maxres, P=None, T=None, rightmost=False, niter=None, shift=None):
-    d = len(v0)
-
-    if niter is None:
-        niter = d
-
-    if maxres <= 0:
-        return exact(A, maxres, P)
-
-
-    if shift is None:
-        shift = 1000
-
-    if T is None:
-        T = np.empty((d, 0))
-        U = np.empty((d, 0))
-        W = np.empty((d, 0))
-    else:
-        U = T.copy()
-        W = shift * T.copy()
-
-    _, nt = T.shape
-
-    if rightmost:
-        ind = -1 - nt
-    else:
-        ind = 0
-
-    u0 = ortho(np.array([v0]).T / np.linalg.norm(v0), T)
-    U = np.hstack((U, u0))
-    W = np.hstack((W, A.dot(u0)))
-    Atilde = U.T @ W
-    lams, vecs = eigh(Atilde)
-    r = W @ vecs[:, ind] - lams[ind] * U @ vecs[:, ind]
-
-    for i in range(1, niter):
-        u = ortho(W[:, -1], U)
-        w = A @ u
-        U = np.hstack([U, u])
-        W = np.hstack([W, w])
-
-        L = np.tril(U.T @ W - W.T @ U, -1)
-        Wtilde = W + U @ L.T
-
-        Atilde = U.T @ Wtilde
-        lams, vecs = eigh(Atilde)
-        r = W @ vecs[:, ind] - lams[ind] * U @ vecs[:, ind]
-        rnorm = np.linalg.norm(r)
-        print(rnorm, lams[ind], rnorm / lams[ind])
-        if np.linalg.norm(r) < maxres * abs(lams[ind]):
-            print("Lanczos took {} iterations".format(i))
-            return lams, U @ vecs, Wtilde @ vecs
-    else:
-        print("Warning: Lanczos did not converge!")
-        return lams, U @ vecs, Wtilde @ vecs
 
 
 def lobpcg(A, v0, maxres, P=None):
@@ -335,7 +201,6 @@ def lobpcg(A, v0, maxres, P=None):
     if maxres is None:
         maxres = np.sqrt(1e-15) * n
 
-
     # Orthogonalize initial guess vectors
     X = ortho(X0, np.empty((n, 0)))
     U = X.copy()
@@ -361,7 +226,7 @@ def lobpcg(A, v0, maxres, P=None):
     AP = np.empty((n, 0))
     for k in range(n):
         # Find new search directions and orthogonalize
-        Htilde, _, _, _ = np.linalg.lstsq(N - 1.15 * N_theta * I, RI, rcond=None)
+        Htilde, _, _, _ = lstsq(N - 1.15 * N_theta * I, RI)
 #        Htilde, _ = bicg(N - 1.15 * N_theta * I, RI)
         H = ortho(Htilde, np.hstack((X, P)))
         U = np.hstack((U, H))
@@ -409,6 +274,7 @@ def lobpcg(A, v0, maxres, P=None):
     print('Warning: LOBPCG may not have converged')
     return thetas, S @ Y, AS @ Y
 
+
 def davidson(A, maxres, P):
     n, _ = A.shape
 
@@ -452,14 +318,6 @@ def davidson(A, maxres, P):
         else:
             return lams, V, AV
 
-        ## Find t such that (I - u u^T) (P - theta *I)^-1 t = -r, and t is orthogonal to u,
-        ## where u is the Ritz vector (not the entire subspace spanned by V!)
-        #Pproj = P - thetai * I
-        #Pprojr = solve(Pproj, ri)
-        #Pproju = solve(Pproj, ui)
-        #alpha = (ui @ Pprojr) / (ui @ Pproju)
-        #ti = solve(Pproj, (alpha * ui - ri))
-
         Pproj = P - thetai * I
         Pprojr = solve(Pproj, ri)
         PprojV = solve(Pproj, V)
@@ -476,6 +334,60 @@ def davidson(A, maxres, P):
             # just give up and return the current Ritz pairs
             if t.shape[1] == 0:
                 return lams, V, AV
+
+        V = np.hstack([V, t])
+        AV = np.hstack([AV, A.dot(t)])
+    else:
+        return lams, V, AV
+
+
+def lanczos(A, maxres, P):
+    n, _ = A.shape
+
+    if maxres <= 0:
+        return exact(A, maxres, P)
+
+    I = np.eye(n)
+
+    P_lams, P_vecs, _ = exact(P, 0)
+    nneg = max(2, np.sum(P_lams < 0) + 1)
+
+    V = ortho(P_vecs[:, :nneg])
+
+    AV = A.dot(V)
+
+    method = 2
+    seeking = 0
+    while True:
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
+        lams, vecs = eigh(Atilde)
+        nneg = max(2, np.sum(lams < 0) + 1)
+        # Rotate our subspace V to be diagonal in A.
+        # This is not strictly necessary but it makes our lives easier later
+        AV = AV @ vecs
+        V = V @ vecs
+
+        Ytilde = symmetrize_Y(V, AV, symm=method)
+        R = Ytilde[:, :nneg] - V[:, :nneg] * lams[np.newaxis, :nneg]
+        Rnorm = np.linalg.norm(R, axis=0)
+        print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
+
+        # Loop over all Ritz values of interest
+        for seeking, (rinorm, thetai) in enumerate(zip(Rnorm, lams)):
+            # Take the first Ritz value that is not converged, and use it
+            # to extend V
+            if rinorm >= maxres * np.abs(thetai):
+                break
+        # If they all seem converged, then we are done
+        else:
+            return lams, V, AV
+
+        t = ortho(AV[:, seeking], V)
+
+        # If Lanczos also fails to find a new search direction,
+        # just give up and return the current Ritz pairs
+        if t.shape[1] == 0:
+            return lams, V, AV
 
         V = np.hstack([V, t])
         AV = np.hstack([AV, A.dot(t)])

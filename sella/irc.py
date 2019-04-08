@@ -8,6 +8,7 @@ import numpy as np
 
 from ase.calculators.singlepoint import SinglePointCalculator
 
+
 def rs_newton_irc(minmode, g, d1, dx, xi=1.):
     lams = minmode.lams
     vecs = minmode.vecs
@@ -32,7 +33,6 @@ def rs_newton_irc(minmode, g, d1, dx, xi=1.):
         eps = -vecs @ ((Vg + xi * Vd1) / (L + xi))
         d2 = d1 + eps
         d2mag = np.linalg.norm(d2)
-        #if d2mag < dx:
         if abs(d2mag - dx) < 1e-14 * dx:
             break
 
@@ -43,6 +43,7 @@ def rs_newton_irc(minmode, g, d1, dx, xi=1.):
 
     return eps, xi
 
+
 def irc(minmode, maxiter, ftol, dx=0.01, direction='both', **kwargs):
     d = minmode.d
 
@@ -51,7 +52,8 @@ def irc(minmode, maxiter, ftol, dx=0.01, direction='both', **kwargs):
 
     x = minmode.x_m.copy()
     conf = minmode.atoms.copy()
-    conf.set_calculator(SinglePointCalculator(conf, **minmode.atoms.calc.results))
+    calc = SinglePointCalculator(conf, **minmode.atoms.calc.results)
+    conf.set_calculator(conf)
     path = [conf]
     f1, g1, _ = minmode.kick(np.zeros_like(x))
     minmode.f_minmode(**kwargs)
@@ -92,7 +94,8 @@ def irc(minmode, maxiter, ftol, dx=0.01, direction='both', **kwargs):
             d1 += eps
 
         conf = minmode.atoms.copy()
-        conf.set_calculator(SinglePointCalculator(conf, **minmode.atoms.calc.results))
+        calc = SinglePointCalculator(conf, **minmode.atoms.calc.results)
+        conf.set_calculator(calc)
         path.append(conf)
         if np.all(minmode.lams > 0) and minmode.converged(ftol):
             return path

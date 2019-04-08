@@ -12,13 +12,15 @@ from ase.calculators.singlepoint import SinglePointCalculator
 
 from .cython_routines import simple_ortho, modified_gram_schmidt
 from .internal_cython import cart_to_internal
-from .eigensolvers import davidson, NumericalHessian, ProjectedMatrix, project_rotation
+from .eigensolvers import davidson, NumericalHessian, ProjectedMatrix
 from .hessian_update import update_H, symmetrize_Y
+
 
 def _sort_indices(indices):
     if indices[0] > indices[-1]:
         indices = tuple(reversed(indices))
     return indices
+
 
 class MinModeAtoms(object):
     def __init__(self, atoms, calc, eigensolver=davidson,
@@ -40,7 +42,7 @@ class MinModeAtoms(object):
         # second Atoms object with dummy atoms removed, and attach
         # the calculator to *that*
         self._atoms_nodummy = self.atoms
-        self.dummy_indices = [atom.index for atom in self.atoms if atom.symbol == 'X']
+        self.dummy_indices = [x.index for x in self.atoms if x.symbol == 'X']
         if self.dummy_indices:
             self._atoms_nodummy = self.atoms.copy()
         self.dummy_pos = self.atoms.positions[self.dummy_indices]
@@ -52,7 +54,7 @@ class MinModeAtoms(object):
         self.shift = shift
         self.v0 = v0
         self.maxres = maxres
-        
+
         # Default to projecting out rotations for aperiodic systems, but
         # not for periodic systems.
         if project_rotations is None:
@@ -60,7 +62,9 @@ class MinModeAtoms(object):
         # Extract the initial positions for use in fixed atom constraints
         self.pos0 = self.atoms.get_positions().copy()
         self.constraints = dict()
-        self._initialize_constraints(constraints, project_translations, project_rotations)
+        self._initialize_constraints(constraints,
+                                     project_translations,
+                                     project_rotations)
 
         # The true dimensionality of the problem
         self.d = 3 * len(self.atoms)
@@ -85,9 +89,14 @@ class MinModeAtoms(object):
         self.calls = 0
         self._basis_xlast = None
 
-    def set_constraints(self, constraints, project_translations, project_rotations):
+    def set_constraints(self,
+                        constraints,
+                        project_translations,
+                        project_rotations):
         self.constraints = dict()
-        self._initialize_constraints(constraints, project_translations, project_rotations)
+        self._initialize_constraints(constraints,
+                                     project_translations,
+                                     project_rotations)
 
     @property
     def H(self):
@@ -102,7 +111,8 @@ class MinModeAtoms(object):
             self._vecs = None
             return
         self._H = target
-        self._Hred = (self.Tm.T @ self.Tfree) @ target @ (self.Tfree.T @ self.Tm)
+        Tproj = self.Tm.T @ self.Tfree
+        self._Hred = Tproj @ target @ Tproj.T
         lams, vecs = eigh(self._Hred)
         indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
         self._lams = lams[indices]
@@ -211,7 +221,6 @@ class MinModeAtoms(object):
 
         res_orig = self.res.copy()
 
-        #dx_c = -self.Tc @ self.res
         dx_c, _, _, _ = lstsq(-self.drdx.T, self.res)
 
         dx = self.Tm @ dx_m + dx_c
@@ -240,7 +249,7 @@ class MinModeAtoms(object):
         # Calculate Tc and Tm (see above)
         self._res = np.zeros(self.nconstraints)  # The constraint residuals
         self._drdx = np.zeros((self.d, self.nconstraints))
-        
+
         n = 0
         # For now we ignore the target value contained in the "fix"
         # constraints dict.
@@ -263,8 +272,8 @@ class MinModeAtoms(object):
         # Now consider translation
         tvec = np.zeros_like(self.atoms.positions)
         tvec[:, 0] = 1. / len(self.atoms)
-        for dim, target in self.constraints.get('translations', dict()).items():
-            self._res[n] = np.average(self.atoms.positions[:, dim]) - target
+        for dim, val in self.constraints.get('translations', dict()).items():
+            self._res[n] = np.average(self.atoms.positions[:, dim]) - val
             self._drdx[:, n] = np.roll(tvec, dim, axis=1).ravel()
             n += 1
 
@@ -280,15 +289,16 @@ class MinModeAtoms(object):
             self._drdx[:, n : n+nrot] = drdx_rot
             n += nrot
 
+        con = self.constraints
         # Bonds
-        b_indices = np.array(list(self.constraints.get('bonds',
-                dict()).keys()), dtype=np.int32).reshape((-1, 2))
+        b_indices = np.array(list(con.get('bonds', dict()).keys()),
+                             dtype=np.int32).reshape((-1, 2))
         # Angles
-        a_indices = np.array(list(self.constraints.get('angles',
-                dict()).keys()), dtype=np.int32).reshape((-1, 3))
+        a_indices = np.array(list(con.get('angles', dict()).keys()),
+                             dtype=np.int32).reshape((-1, 3))
         # Dihedrals
-        d_indices = np.array(list(self.constraints.get('dihedrals',
-                dict()).keys()), dtype=np.int32).reshape((-1, 4))
+        d_indices = np.array(list(con.get('dihedrals', dict()).keys()),
+                             dtype=np.int32).reshape((-1, 4))
 
         mask = np.ones(self.nconstraints - n, dtype=np.uint8)
         r_int, drdx_int, _ = cart_to_internal(self.atoms.positions,
@@ -323,7 +333,6 @@ class MinModeAtoms(object):
         # Otherwise, we need to orthonormalize everything
         else:
             self._Tc = modified_gram_schmidt(self._drdx)
-            #self._Tc = simple_ortho(self._drdx)
 
         self._Tm = null_space(self._Tc.T)
 
@@ -378,8 +387,8 @@ class MinModeAtoms(object):
         self.constraints['translations'] = dict()
         for dim, fixed in enumerate(fixed_dims):
             if fixed:
-                self.constraints['translations'][dim] = np.average(self.atoms.positions[:, dim])
-        #self.constraints['translations'] = fixed_dims
+                avgpos = np.average(self.atoms.positions[:, dim])
+                self.constraints['translations'][dim] = avgpos
         self.constraints['rotations'] = p_r
         self.nconstraints += np.sum(fixed_dims) + 3 * p_r
 
@@ -433,7 +442,8 @@ class MinModeAtoms(object):
         # If con is still non-empty, then we didn't process all of
         # the user-provided constraints, so throw an error.
         if con:
-            raise ValueError("Don't know what to do with constraint types: {}".format(con.keys()))
+            raise ValueError("Don't know what to do with constraint types: {}"
+                             "".format(con.keys()))
 
         if Hfull is not None:
             # Project into new basis
@@ -457,7 +467,8 @@ class MinModeAtoms(object):
 
         if self.trajectory is not None:
             if self.dummy_indices:
-                self.atoms.set_calculator(SinglePointCalculator(self.atoms, energy=e, forces=gout))
+                calc = SinglePointCalculator(self.atoms, energy=e, forces=gout)
+                self.atoms.set_calculator(calc)
             self.trajectory.write(self.atoms)
         return e, g
 
@@ -467,7 +478,6 @@ class MinModeAtoms(object):
 
         f, g = self.calc_eg(x)
         h = g - self.drdx @ self.Tc.T @ g
-        #h = g - self.drdx @ self.drdx.T @ g
 
         if self.last['f'] is not None and self.H is not None:
             # Calculate predicted vs actual change in energy
@@ -475,24 +485,23 @@ class MinModeAtoms(object):
             dx = self.x - self.last['x']
 
             dx_free = self.Tfree.T @ dx
-            #self.df_pred = self.last['g'].T @ dx + (dx_free.T @ self.H @ dx_free) / 2.
 
             dx_m = self.Tfree.T @ self.Tm @ self.Tm.T @ dx
             dx_c = self.Tfree.T @ self.Tc @ self.Tc.T @ dx
             self.df_pred = (self.last['g'].T @ dx - (dx_m @ self.H @ dx_c)
-                    + (dx_m @ self.H @ dx_m) / 2. + (dx_c @ self.H @ dx_c) / 2.)
+                            + (dx_m @ self.H @ dx_m) / 2.
+                            + (dx_c @ self.H @ dx_c) / 2.)
 
             self.ratio = self.df_pred / self.df
 
             # Update Hessian matrix
             dh_free = self.Tfree.T @ (h - self.last['h'])
             self.H = update_H(self.H, dx_free, dh_free)
-            #dg_free = self.Tfree.T @ (g - self.last['g'])
-            #self.H = update_H(self.H, dx_free, dg_free)
 
         g_m = self.Tm.T @ g
         if self.H is not None:
-            g_m -= (self.Tm.T @ self.Tfree) @ self.H @ (self.Tfree.T @ (self.Tc @ self.res))
+            Tproj = self.Tm.T @ self.Tfree
+            g_m -= Tproj @ self.H @ (self.Tfree.T @ (self.Tc @ self.res))
 
         self.last = dict(x=self.x.copy(),
                          f=f,
@@ -509,7 +518,6 @@ class MinModeAtoms(object):
 
         x = self.last['x']
         g = self.last['g']
-        #Htrue = NumericalHessian(self.calc_eg, x, g, dxL, threepoint)
 
         # If we don't have an approximate Hessian yet, then
         H = self.H
@@ -542,11 +550,43 @@ class MinModeAtoms(object):
         Vs = Vs @ vecs
         AVs = AVs @ vecs
         AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        #AVstilde = AVs - self.drdx @ self.drdx.T @ AVs
         self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
-        #self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVs)
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)
                 and np.all(np.abs(self.res) < self.maxres))
 
+
+def Levi_Civita(n):
+    LC = np.zeros((n, n, n))
+    for i in range(n):
+        even = np.roll(range(n), i)
+        LC[tuple(even)] = 1.
+        LC[tuple(even[::-1])] = -1.
+    return LC
+
+
+LC = Levi_Civita(3)
+
+
+def project_rotation(x0):
+    d = len(x0)
+    if d % 3 != 0:
+        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
+
+    natoms = d // 3
+    rvecs = np.zeros((3, d))
+    nrot = 0
+
+    x0_mat = x0.reshape((-1, 3))
+    com = np.average(x0_mat, axis=0)
+    x0_com = x0_mat - com
+    _, M = eigh(np.sum(x0_com**2) * np.eye(3) - x0_com.T @ x0_com)
+    rvecs_guess = (x0_com @ M @ LC @ M.T).reshape((3, d))
+    for rvec in rvecs_guess:
+        rvec_norm = np.linalg.norm(rvec)
+        if rvec_norm > 1e-8:
+            rvecs[nrot] = rvec / rvec_norm
+            nrot += 1
+
+    return rvecs[:nrot].T

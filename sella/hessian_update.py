@@ -8,6 +8,7 @@ from scipy.linalg import eigh, lstsq
 
 from .cython_routines import symmetrize_Y2
 
+
 def symmetrize_Y(S, Y, symm):
     if symm is None or S.shape[1] == 1:
         return Y
@@ -19,6 +20,7 @@ def symmetrize_Y(S, Y, symm):
         return Y + symmetrize_Y2(S, Y)
     else:
         raise ValueError("Unknown symmetrization method {}".format(symm))
+
 
 def update_H(B, S, Y, method='BFGS_auto', symm=2):
     if len(S.shape) == 1:
@@ -58,14 +60,16 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2):
         Bplus = _MS_SR1(B, S, Ytilde)
     else:
         raise ValueError('Unknown update method {}'.format(method))
-    
+
     Bplus += B
     Bplus -= np.tril(Bplus.T - Bplus, -1).T
 
     return Bplus
 
+
 def _MS_BFGS(B, S, Y):
     return Y @ lstsq(Y.T @ S, Y.T)[0] - B @ S @ lstsq(S.T @ B @ S, S.T @ B)[0]
+
 
 def _MS_TS_BFGS(B, S, Y):
     lams_B, vecs_B = eigh(B)
@@ -77,15 +81,18 @@ def _MS_TS_BFGS(B, S, Y):
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
+
 def _MS_PSB(B, S, Y):
     J = Y - B @ S
     U = lstsq(S.T @ S, S.T)[0].T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ J.T
 
+
 def _MS_SR1(B, S, Y):
     YBS = Y - B @ S
     return YBS @ lstsq(YBS.T @ S, YBS.T)[0]
+
 
 # Not a symmetric update, so not available my default
 def _MS_Powell(B, S, Y):
