@@ -185,10 +185,8 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
     return ft, gt, t
 
 
-def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
-          r_trust=0.2, inc_factr=0.8, dec_factr=0.8, dec_lb=0., dec_ub=5.,
-          inc_lb=0.8, inc_ub=1.2, order=1,
-          interpolations=('quartic', 'cubic', 'quadratic'),
+def berny(minmode, x0, maxiter, ftol, r_trust, inc_factr=1.1, dec_factr=0.9,
+          dec_ratio=5.0, inc_ratio=1.01, order=1, interpolations=None,
           **kwargs):
     d = len(x0)
 
@@ -217,9 +215,7 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         H0 = minmode.H.copy()
         xlast = x.copy()
 
-        ev = ((minmode.lams[0] > 0 and order > 0)
-              or evnext
-              or (nqn > 0 and n % nqn == 0))
+        ev = (minmode.lams[0] > 0 and order > 0) or evnext
 
         f1, g1, dx1 = minmode.kick(dx, ev, **kwargs)
         n += 1
@@ -280,11 +276,11 @@ def berny(minmode, x0, maxiter, ftol, nqn=0, qntol=0.05,
         evnext = False
         reeval = False
         ratio = minmode.ratio
-        if ratio < dec_lb or ratio > dec_ub:
+        if ratio < 1/dec_ratio or ratio > dec_ratio:
             r_trust = max(dx_mag * dec_factr, r_trust_min)
             reeval = True
-        elif bound_clip and inc_lb < ratio < inc_ub:
-            r_trust /= inc_factr
+        elif bound_clip and 1/inc_ratio < ratio < inc_ratio:
+            r_trust *= inc_factr
 
         if reeval:
             f, g, v1 = minmode.kick((1 - alpha) * dx1)
