@@ -278,7 +278,9 @@ class MinModeAtoms(object):
 
         # And rotations
         if self.constraints.get('rotations', False):
-            drdx_rot = project_rotation(self.x)
+            drdx_rot = project_rotation(self.x,
+                                        self.rot_center,
+                                        self.rot_axes)
             _, nrot = drdx_rot.shape
             # TODO: Figure out how to use these constraints to push the
             # structure into a consistent orientation in space. That
@@ -360,6 +362,10 @@ class MinModeAtoms(object):
         # value, they must manually move the atoms first.
         con_f = con.pop('fix', tuple())
         fix = dict()
+        # If there are any fixed atoms, this will affect how we project
+        # rotations.
+        self.rot_center = None
+        self.rot_axes = None
         # We also keep track of which dimensions any atom has been
         # fixed in for projecting out translations. E.g. if any atom
         # has been fixed in the X direction, then we do not project
@@ -371,10 +377,38 @@ class MinModeAtoms(object):
         for arg in con_f:
             if isinstance(arg, int):
                 index = arg
-                for dim, ipos in enumerate(self.pos0[index]):
+                target = self.pos0[index]
+                if self.rot_center is None:
+                    self.rot_center = target
+                elif self.rot_axes is None:
+                    self.rot_axes = target - self.rot_center
+                    self.rot_axes /= np.linalg.norm(self.rot_axes)
+                elif p_r:
+                    # If at least three atoms have been specified as
+                    # fixed, but the user asked for projected rotations,
+                    # verify that all atoms are collinear. If they
+                    # aren't, disable projection of rotations and warn
+                    # the user.
+                    axis = target - self.rot_center
+                    axis /= np.linalg.norm(axis)
+                    if 1 - np.abs(axis @ self.rot_axes) > 1e-2:
+                        warnings.warn("At least 3 non-collinear atoms are "
+                                      "fixed, but projection of rotational "
+                                      "modes has been requested. This is "
+                                      "not correct! Disabling projection of "
+                                      "rotational modes.")
+                        p_r = False
+
+                for dim, ipos in enumerate(target):
                     fix[(index, dim)] = ipos
                 fixed_dims = [False, False, False]
             else:
+                if p_t or p_r:
+                    warnings.warn("Fixing atoms in some but not all "
+                                  "directions while also projecting out "
+                                  "translational or rotational motion has "
+                                  "not been tested!\n "
+                                  "Proceed at your own risk.")
                 index, dim = arg
                 fix[(index, dim)] = ipos
                 fixed_dim[dim] = False
@@ -556,37 +590,21 @@ class MinModeAtoms(object):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)
                 and np.all(np.abs(self.res) < self.maxres))
 
+def project_rotation(x0, center=None, axes=None):
+    x = x0.reshape((-1, 3))
+    if center is None:
+        center = np.average(x, axis=0)
+    dx = x - center
 
-def Levi_Civita(n):
-    LC = np.zeros((n, n, n))
-    for i in range(n):
-        even = np.roll(range(n), i)
-        LC[tuple(even)] = 1.
-        LC[tuple(even[::-1])] = -1.
-    return LC
+    if axes is None:
+        axes = np.eye(3)
+    else:
+        axes = axes.reshape((-1, 3))
 
+    rots = np.zeros((len(x0), axes.shape[0]))
+    for i, axis in enumerate(axes):
+        rots[:, i] = np.cross(axis, dx).ravel()
 
-LC = Levi_Civita(3)
-
-
-def project_rotation(x0):
-    d = len(x0)
-    if d % 3 != 0:
-        raise RuntimeError("Number of degrees of freedom not divisible by 3!")
-
-    natoms = d // 3
-    rvecs = np.zeros((3, d))
-    nrot = 0
-
-    x0_mat = x0.reshape((-1, 3))
-    com = np.average(x0_mat, axis=0)
-    x0_com = x0_mat - com
-    _, M = eigh(np.sum(x0_com**2) * np.eye(3) - x0_com.T @ x0_com)
-    rvecs_guess = (x0_com @ M @ LC @ M.T).reshape((3, d))
-    for rvec in rvecs_guess:
-        rvec_norm = np.linalg.norm(rvec)
-        if rvec_norm > 1e-8:
-            rvecs[nrot] = rvec / rvec_norm
-            nrot += 1
-
-    return rvecs[:nrot].T
+    vecs, lams, _ = np.linalg.svd(rots)
+    indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
+    return vecs[:, indices]
