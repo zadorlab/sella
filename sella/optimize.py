@@ -2,6 +2,8 @@
 
 from __future__ import division
 
+import warnings
+
 import numpy as np
 import scipy
 from scipy.linalg import eigh, lstsq
@@ -12,6 +14,19 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     arbitrary-order saddle point (use order=0 to seek a minimum)"""
     lams = minmode.lams
     vecs = minmode.vecs
+
+    # If we don't have any curvature information yet, just do steepest
+    # descent.
+    if lams is None:
+        dx = -g
+        dx_mag = np.linalg.norm(dx)
+        bound_clip = False
+        if dx_mag > r_tr:
+            dx *= r_tr / dx_mag
+            dx_mag = r_tr
+            bound_clip = True
+        return dx, dx_mag, xi, bound_clip
+
     L = np.abs(lams)
     L[:order] *= -1
     Vg = vecs.T @ g
@@ -45,6 +60,8 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     return dx, dx_mag, xi, bound_clip
 
 
+# These interpolators are not currently being used, but we'll keep them
+# in case we find a use for them later.
 def interpolate_quartic_constrained(f0, f1, g0, g1, dx, rmax=np.infty):
     """Constructs a 1-D quartic interpolation between two points given
     the function value and directional gradient at the endpoints, and
@@ -186,111 +203,45 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
 
 
 def optimize(minmode, maxiter, ftol, r_trust, inc_factr=1.1, dec_factr=0.9,
-             dec_ratio=5.0, inc_ratio=1.01, order=1, interpolations=None,
-             **kwargs):
+             dec_ratio=5.0, inc_ratio=1.01, order=1, eig=True, **kwargs):
+
+    if order != 0 and not eig:
+        warnings.warn("Saddle point optimizations with eig=False will "
+                      "most likely fail!\n Proceeding anyway, but you "
+                      "shouldn't be optimistic.")
 
     r_trust_min = kwargs.get('dxL', r_trust / 100.)
 
-    x = minmode.x_m.copy()
-    f1, g1, _ = minmode.kick(np.zeros_like(x))
-    minmode.f_minmode(**kwargs)
-    xlast = x.copy()
+    f, g, _ = minmode.kick(np.zeros_like(minmode.x_m))
 
-    f, g = f1, g1
+    if eig:
+        minmode.f_minmode(**kwargs)
 
-    evnext = False
-
-    gnormlast = np.linalg.norm(g)
-
-    if interpolations is None:
-        interpolations = tuple()
-
-    n = 1
     xi = 1.
     while True:
+        # Find new search step
         dx, dx_mag, xi, bound_clip = rs_newton(minmode, g, r_trust, order, xi)
 
-        f0, g0 = f, g
-        H0 = minmode.H.copy()
-        xlast = x.copy()
+        # Determine if we need to call the eigensolver, then step
+        ev = (eig and minmode.lams is not None
+                  and np.any(minmode.lams[:order] > 0))
+        f, g, dx = minmode.kick(dx, ev, **kwargs)
 
-        ev = (minmode.lams[0] > 0 and order > 0) or evnext
-
-        f1, g1, dx1 = minmode.kick(dx, ev, **kwargs)
-        n += 1
-        if ev:
-            n = 1
-        if minmode.calls >= maxiter:
+        # Loop exit criterion: convergence or maxiter reached
+        if minmode.converged(ftol) or minmode.calls >= maxiter:
             return minmode.last['x']
 
-        if minmode.converged(ftol):
-            return minmode.last['x']
-
-        method = None
-        alpha = 1.
-
-        dx_actual = dx
-
-        for interp in interpolations:
-            if interp == 'quartic':
-                try:
-                    f, g, alpha = interpolate_quartic_constrained(f0,
-                                                                  f1,
-                                                                  g0,
-                                                                  g1,
-                                                                  dx_actual,
-                                                                  r_trust)
-                except ValueError:
-                    pass
-                else:
-                    method = 'quartic'
-                    break
-            elif interp == 'cubic':
-                try:
-                    f, g, alpha = interpolate_cubic(f0, f1, g0, g1,
-                                                    dx_actual, r_trust)
-                except ValueError:
-                    pass
-                else:
-                    method = 'cubic'
-                    break
-            elif interp == 'quadratic':
-                try:
-                    f, g, alpha = interpolate_quadratic(f0, f1, g0, g1,
-                                                        dx_actual, r_trust)
-                except ValueError:
-                    pass
-                else:
-                    method = 'quadratic'
-                    break
-        else:
-            method = None
-            alpha = 1
-            f, g = f1, g1
-
-        if alpha < 0:
-            raise RuntimeError("Extrapolation wants to go backwards! "
-                               "This should never happen.")
-
-        evnext = False
-        reeval = False
+        # Update trust radius
         ratio = minmode.ratio
+        if ratio is None:
+            ratio = 1.
         if ratio < 1/dec_ratio or ratio > dec_ratio:
             r_trust = max(dx_mag * dec_factr, r_trust_min)
-            reeval = True
         elif bound_clip and 1/inc_ratio < ratio < inc_ratio:
             r_trust *= inc_factr
 
-        if reeval:
-            f, g, v1 = minmode.kick((1 - alpha) * dx1)
-            x = minmode.last['x'].copy()
-        else:
-            x = minmode.xpolate(alpha)
-
-        gnorm = np.linalg.norm(g)
-        gnormlast = gnorm
-
-        print(f1, np.linalg.norm(g1), ratio, minmode.ratio, alpha, dx_mag / r_trust, r_trust, method, minmode.lams[0])
+        # Debug print statement
+        print(f, np.linalg.norm(g), ratio, dx_mag / r_trust, r_trust, minmode.lams[0])
 
 
 class GDIIS(object):
