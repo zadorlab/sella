@@ -84,6 +84,8 @@ class MinModeAtoms(object):
         self._basis_xlast = None
         self.ratio = None
 
+        self._basis_update()
+
     @property
     def H(self):
         return self._H
@@ -92,29 +94,17 @@ class MinModeAtoms(object):
     def H(self, target):
         if target is None:
             self._H = None
-            self._Hred = None
-            self._lams = None
-            self._vecs = None
+            self.Hred = None
+            self.lams = None
+            self.vecs = None
             return
         self._H = target
         Tproj = self.Tm.T @ self.Tfree
-        self._Hred = Tproj @ target @ Tproj.T
-        lams, vecs = eigh(self._Hred)
+        self.Hred = Tproj @ target @ Tproj.T
+        lams, vecs = eigh(self.Hred)
         indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
-        self._lams = lams[indices]
-        self._vecs = vecs[:, indices]
-
-    @property
-    def Hred(self):
-        return self._Hred
-
-    @property
-    def lams(self):
-        return self._lams
-
-    @property
-    def vecs(self):
-        return self._vecs
+        self.lams = lams[indices]
+        self.vecs = vecs[:, indices]
 
     @property
     def x(self):
@@ -149,6 +139,7 @@ class MinModeAtoms(object):
                 nreal += 1
         self.atoms.set_positions(xin)
         self._atoms_nodummy.set_positions(xreal)
+        self._basis_update()
 
     @property
     def x_m(self):
@@ -156,51 +147,11 @@ class MinModeAtoms(object):
         # any constraints.
         return self.Tm.T @ self.x
 
-    @property
-    def res(self):
-        # The vector of residuals, indicating how much our current
-        # coordinate deviates from the constraint targets
-        self._basis_update()
-        return self._res
-
-    @property
-    def drdx(self):
-        self._basis_update()
-        return self._drdx
-
-    @property
-    def Tc(self):
-        # An orthonormal basis of vectors spanning the subspace of the
-        # constraints.
-        self._basis_update()
-        return self._Tc
-
-    @property
-    def Tm(self):
-        # The null space of Tc, or an orthonormal basis of vectors
-        # spanning the subspace orthogonal to the constraints.
-        self._basis_update()
-        return self._Tm
-
-    @property
-    def Tfree(self):
-        # The subspace orthogonal to any fixed Atoms constraints.
-        # This is the subspace in which self.H is stored.
-        # Not orthogonal to all constraints (use Tm if this is what
-        # you are looking for)
-        self._basis_update()
-        return self._Tfree
-
-    @property
-    def d_free(self):
-        self._basis_update()
-        return self._Tfree.shape[1]
-
     def _basis_update(self):
         if self._basis_xlast is None or np.any(self.x != self._basis_xlast):
             out = calc_constr_basis(self.x, self.constraints, self.nconstraints,
                                     self.rot_center, self.rot_axes)
-            self._res, self._drdx, self._Tm, self._Tfree, self._Tc = out
+            self.res, self.drdx, self.Tm, self.Tfree, self.Tc = out
             self._basis_xlast = self.x.copy()
 
     def kick(self, dx_m, minmode=False, **kwargs):
@@ -219,9 +170,6 @@ class MinModeAtoms(object):
 
         return f1, self.Tm.T @ self.last['g'], dx_m
 
-    def xpolate(self, alpha, dx):
-        return self.last['x_m'] + alpha * dx
-
     def set_constraints(self, constraints, p_t, p_r):
         if self.H is not None:
             assert self.Tfree is not None
@@ -238,7 +186,7 @@ class MinModeAtoms(object):
 
         if Hfull is not None:
             # Project into new basis
-            self._calc_constr_basis()
+            self._basis_update()
             self.H = self.Tfree.T @ Hfull @ self.Tfree
 
     def calc_eg(self, x=None):
@@ -318,7 +266,7 @@ class MinModeAtoms(object):
             if v is None:
                 v = self.last['g']
             v = self.Tfree.T @ v
-            H = np.eye(self.d_free) - 2 * np.outer(v, v) / (v @ v)
+            H = np.eye(len(v)) - 2 * np.outer(v, v) / (v @ v)
 
         # Htrue is a representation of the *true* Hessian matrix, which
         # can be probed only through Hessian-vector products that are
