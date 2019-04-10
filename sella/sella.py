@@ -12,7 +12,8 @@ from ase.calculators.singlepoint import SinglePointCalculator
 
 from .cython_routines import simple_ortho, modified_gram_schmidt
 from .internal_cython import cart_to_internal
-from .eigensolvers import davidson, NumericalHessian, ProjectedMatrix
+from .eigensolvers import davidson
+from .linalg import NumericalHessian, ProjectedMatrix
 from .hessian_update import update_H, symmetrize_Y
 
 
