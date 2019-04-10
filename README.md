@@ -29,11 +29,7 @@ myminmode = MinModeAtoms(slab,  # Your Atoms object
                          trajectory='test_emt.traj',  # Optional trajectory
                          )
 
-# Initial position vector is the flattened positions array
-x0 = myminmode.atoms.get_positions().ravel()
-
 x1 = berny(myminmode,    # Your MinMode object
-           x0,           # Your initial position
            maxiter=500,  # Maximum number of force evaluations
            ftol=1e-3,    # Norm of the force vector, convergence threshold
            r_trust=0.1,  # Initial trust radius (Angstrom)

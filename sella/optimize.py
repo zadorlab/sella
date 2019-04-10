@@ -185,10 +185,9 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
     return ft, gt, t
 
 
-def berny(minmode, x0, maxiter, ftol, r_trust, inc_factr=1.1, dec_factr=0.9,
+def berny(minmode, maxiter, ftol, r_trust, inc_factr=1.1, dec_factr=0.9,
           dec_ratio=5.0, inc_ratio=1.01, order=1, interpolations=None,
           **kwargs):
-    d = len(x0)
 
     r_trust_min = kwargs.get('dxL', r_trust / 100.)
 
