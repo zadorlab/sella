@@ -88,6 +88,7 @@ class MinModeAtoms(object):
                          g_m=None)
         self.calls = 0
         self._basis_xlast = None
+        self.ratio = None
 
     def set_constraints(self,
                         constraints,
@@ -231,10 +232,8 @@ class MinModeAtoms(object):
 
         return f1, self.Tm.T @ self.last['g'], dx_m
 
-    def xpolate(self, alpha):
-        if alpha != 1.:
-            raise NotImplementedError
-        return self.last['x']
+    def xpolate(self, alpha, dx):
+        return self.last['x_m'] + alpha * dx
 
     def _calc_constr_basis(self):
         # If we don't have any constraints, then this is a very
@@ -479,21 +478,22 @@ class MinModeAtoms(object):
         f, g = self.calc_eg(x)
         h = g - self.drdx @ self.Tc.T @ g
 
-        if self.last['f'] is not None and self.H is not None:
-            # Calculate predicted vs actual change in energy
+        if self.last['f'] is not None:
             self.df = f - self.last['f']
             dx = self.x - self.last['x']
-
             dx_free = self.Tfree.T @ dx
-
             dx_m = self.Tfree.T @ self.Tm @ self.Tm.T @ dx
             dx_c = self.Tfree.T @ self.Tc @ self.Tc.T @ dx
+
+        if self.last['f'] is not None and self.H is not None:
+            # Calculate predicted vs actual change in energy
             self.df_pred = (self.last['g'].T @ dx - (dx_m @ self.H @ dx_c)
                             + (dx_m @ self.H @ dx_m) / 2.
                             + (dx_c @ self.H @ dx_c) / 2.)
 
             self.ratio = self.df_pred / self.df
 
+        if self.last['h'] is not None:
             # Update Hessian matrix
             dh_free = self.Tfree.T @ (h - self.last['h'])
             self.H = update_H(self.H, dx_free, dh_free)
