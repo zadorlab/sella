@@ -257,6 +257,7 @@ def calc_constr_basis(x, con, ncon, rot_center, rot_axes):
 
     return res, drdx, Tm, Tfree, Tc
 
+
 def project_rotation(x0, center=None, axes=None):
     x = x0.reshape((-1, 3))
     if center is None:

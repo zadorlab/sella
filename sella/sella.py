@@ -56,9 +56,9 @@ class MinModeAtoms(object):
         # Extract the initial positions for use in fixed atom constraints
         self.pos0 = self.atoms.get_positions().copy()
         self.constraints = dict()
-        self._initialize_constraints(constraints,
-                                     project_translations,
-                                     project_rotations)
+        self.set_constraints(constraints,
+                             project_translations,
+                             project_rotations)
 
         # The true dimensionality of the problem
         self.d = 3 * len(self.atoms)
@@ -83,14 +83,6 @@ class MinModeAtoms(object):
         self.calls = 0
         self._basis_xlast = None
         self.ratio = None
-
-    def set_constraints(self,
-                        constraints,
-                        project_translations,
-                        project_rotations):
-        self._initialize_constraints(constraints,
-                                     project_translations,
-                                     project_rotations)
 
     @property
     def H(self):
@@ -206,7 +198,9 @@ class MinModeAtoms(object):
 
     def _basis_update(self):
         if self._basis_xlast is None or np.any(self.x != self._basis_xlast):
-            self._calc_constr_basis()
+            out = calc_constr_basis(self.x, self.constraints, self.nconstraints,
+                                    self.rot_center, self.rot_axes)
+            self._res, self._drdx, self._Tm, self._Tfree, self._Tc = out
             self._basis_xlast = self.x.copy()
 
     def kick(self, dx_m, minmode=False, **kwargs):
@@ -228,7 +222,7 @@ class MinModeAtoms(object):
     def xpolate(self, alpha, dx):
         return self.last['x_m'] + alpha * dx
 
-    def _initialize_constraints(self, constraints, p_t, p_r):
+    def set_constraints(self, constraints, p_t, p_r):
         if self.H is not None:
             assert self.Tfree is not None
             Hfull = self.Tfree @ self.H @ self.Tfree.T
@@ -246,12 +240,6 @@ class MinModeAtoms(object):
             # Project into new basis
             self._calc_constr_basis()
             self.H = self.Tfree.T @ Hfull @ self.Tfree
-
-    def _calc_constr_basis(self):
-        out = calc_constr_basis(self.x, self.constraints, self.nconstraints,
-                                self.rot_center, self.rot_axes)
-
-        self._res, self._drdx, self._Tm, self._Tfree, self._Tc = out
 
     def calc_eg(self, x=None):
         if x is not None:
