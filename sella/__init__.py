@@ -1,3 +1,3 @@
 from .sella import MinModeAtoms
-from .optimize import berny
+from .optimize import optimize
 from .irc import irc
