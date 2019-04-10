@@ -13,7 +13,7 @@ def _sort_indices(indices):
     return indices
 
 
-def initialize_constraints(atoms, conin, p_t, p_r):
+def initialize_constraints(atoms, pos0, conin, p_t, p_r):
     constraints = dict()
     nconstraints = 0
     # Make a copy, because we are going to be popping entries
@@ -47,7 +47,7 @@ def initialize_constraints(atoms, conin, p_t, p_r):
     for arg in con_f:
         if isinstance(arg, int):
             index = arg
-            target = self.pos0[index]
+            target = pos0[index]
             if rot_center is None:
                 rot_center = target
             elif rot_axes is None:

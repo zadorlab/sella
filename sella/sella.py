@@ -177,8 +177,8 @@ class MinModeAtoms(object):
         else:
             Hfull = None
 
-        con, ncon, rc, ra = initialize_constraints(self.atoms, constraints,
-                                                   p_t, p_r)
+        con, ncon, rc, ra = initialize_constraints(self.atoms, self.pos0,
+                                                   constraints, p_t, p_r)
         self.constraints = con
         self.nconstraints = ncon
         self.rot_center = rc
