@@ -81,7 +81,7 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
                               "Proceed at your own risk.")
             index, dim = arg
             fix[(index, dim)] = ipos
-            fixed_dim[dim] = False
+            fixed_dims[dim] = False
 
     constraints['fix'] = fix
     nconstraints += len(fix)
