@@ -216,7 +216,10 @@ def simple_ortho(X, Y=None, double eps=1e-15):
     if nx + nyout >= n:
         free(S)
         free(work)
-        return null_space(Y_local.T)
+        if nyout == 0:
+            return np.eye(n)
+        else:
+            return null_space(Y_local.T)
 
     cdef double err
 
