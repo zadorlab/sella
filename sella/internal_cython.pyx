@@ -1,3 +1,5 @@
+# cython: language_level=3
+
 import numpy as np
 from ase import Atoms
 from ase.data import covalent_radii, vdw_radii
