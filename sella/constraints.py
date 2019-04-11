@@ -45,7 +45,7 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
     # list of atom indices, or as a list of (index, dimension)
     # tuples, or they can mix the two approaches.
     for arg in con_f:
-        if isinstance(arg, int):
+        if isinstance(arg, (int, np.int, np.int64)):
             index = arg
             target = pos0[index]
             if rot_center is None:
@@ -183,9 +183,17 @@ def calc_constr_basis(x, con, ncon, rot_center, rot_axes):
         drdx[idx_flat, n] = 1.
         n += 1
 
-    free_indices = [i for i in range(d) if i not in del_indices]
+    free_indices = list(range(d))
+    for idx in sorted(del_indices, reverse=True):
+        del free_indices[idx]
 
     Tfree = np.eye(d)[:, free_indices]
+
+    # Early exit shortcut: if there are no other constraints, exit now
+    if n == ncon:
+        Tc = np.eye(d)[:, del_indices]
+        Tm = Tfree.copy()
+        return res, drdx, Tm, Tfree, Tc
 
     # Now consider translation
     tvec = np.zeros_like(pos)

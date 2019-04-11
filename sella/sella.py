@@ -222,8 +222,8 @@ class MinModeAtoms(object):
             self.df = f - self.last['f']
             dx = self.x - self.last['x']
             dx_free = self.Tfree.T @ dx
-            dx_m = self.Tfree.T @ self.Tm @ self.Tm.T @ dx
-            dx_c = self.Tfree.T @ self.Tc @ self.Tc.T @ dx
+            dx_m = (self.Tfree.T @ (self.Tm @ self.Tm.T)) @ dx
+            dx_c = (self.Tfree.T @ (self.Tc @ self.Tc.T)) @ dx
 
         if self.last['f'] is not None and self.H is not None:
             # Calculate predicted vs actual change in energy
@@ -236,7 +236,7 @@ class MinModeAtoms(object):
         if self.last['h'] is not None:
             # Update Hessian matrix
             dh_free = self.Tfree.T @ (h - self.last['h'])
-            self.H = update_H(self.H, dx_free, dh_free)
+            self.H = update_H(self.H, dx_free, dh_free, lams=self.lams, vecs=self.vecs)
 
         g_m = self.Tm.T @ g
         if self.H is not None:
@@ -290,7 +290,7 @@ class MinModeAtoms(object):
         Vs = Vs @ vecs
         AVs = AVs @ vecs
         AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
+        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde, lams=self.lams, vecs=self.vecs)
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)
