@@ -137,6 +137,7 @@ class MinModeAtoms(object):
             else:
                 xreal[nreal] = row
                 nreal += 1
+        #print('POSITIONS:', xin)
         self.atoms.set_positions(xin)
         self._atoms_nodummy.set_positions(xreal)
         self._basis_update()
@@ -236,7 +237,7 @@ class MinModeAtoms(object):
         if self.last['h'] is not None:
             # Update Hessian matrix
             dh_free = self.Tfree.T @ (h - self.last['h'])
-            self.H = update_H(self.H, dx_free, dh_free, lams=self.lams, vecs=self.vecs)
+            self.H = update_H(self.H, dx_free, dh_free)
 
         g_m = self.Tm.T @ g
         if self.H is not None:
@@ -290,7 +291,7 @@ class MinModeAtoms(object):
         Vs = Vs @ vecs
         AVs = AVs @ vecs
         AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde, lams=self.lams, vecs=self.vecs)
+        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)
