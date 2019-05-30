@@ -202,13 +202,15 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
     return ft, gt, t
 
 
-def optimize(minmode, maxiter, ftol, r_trust, inc_factr=1.1, dec_factr=0.9,
-             dec_ratio=5.0, inc_ratio=1.01, order=1, eig=True, **kwargs):
+def optimize(minmode, maxiter, ftol, r_trust=5e-4, inc_factr=1.1,
+             dec_factr=0.9, dec_ratio=5.0, inc_ratio=1.01, order=1, eig=True,
+             **kwargs):
 
     if order != 0 and not eig:
         warnings.warn("Saddle point optimizations with eig=False will "
                       "most likely fail!\n Proceeding anyway, but you "
                       "shouldn't be optimistic.")
+    r_trust *= len(minmode.x_m)
 
     r_trust_min = kwargs.get('dxL', r_trust / 100.)
 
