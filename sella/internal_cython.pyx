@@ -24,7 +24,7 @@ cdef double DNTWO = -2.
 
 # 12 is number of contacts in dense packed solids (FCC, HCP).
 # For molecules, this could probably be reduced to 4.
-cdef size_t _MAX_BONDS = 12
+cdef size_t _MAX_BONDS = 20
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
