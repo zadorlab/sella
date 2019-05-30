@@ -32,7 +32,7 @@ myminmode = MinModeAtoms(slab,  # Your Atoms object
 x1 = optimize(myminmode,    # Your MinMode object
               maxiter=500,  # Maximum number of force evaluations
               ftol=1e-3,    # Norm of the force vector, convergence threshold
-              r_trust=0.1,  # Initial trust radius (Angstrom)
+              r_trust=5e-4, # Initial trust radius (Angstrom per d.o.f.)
               order=1,      # Order of saddle point to find (set to 0 for minimization)
               dxL=1e-4,     # Finite difference displacement magnitude (Angstrom)
               maxres=0.1,   # Maximum residual for eigensolver convergence (should be <= 1)
