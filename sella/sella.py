@@ -206,10 +206,7 @@ class MinModeAtoms(object):
         self.calls += 1
 
         if self.trajectory is not None:
-            if self.dummy_indices:
-                calc = SinglePointCalculator(self.atoms, energy=e, forces=gout)
-                self.atoms.set_calculator(calc)
-            self.trajectory.write(self.atoms)
+            self.trajectory.write(self.atoms, energy=e, forces=gout)
         return e, g
 
     def f_update(self, x):
@@ -253,7 +250,7 @@ class MinModeAtoms(object):
 
         return f, g
 
-    def f_minmode(self, dxL, maxres, threepoint=False, **kwargs):
+    def f_minmode(self, dxL, maxres=0.5, threepoint=False, **kwargs):
         if self.last['g'] is None:
             self.f_update(self.x)
 
@@ -280,13 +277,16 @@ class MinModeAtoms(object):
         Pproj = (self.Tm.T @ self.Tfree) @ H @ (self.Tfree.T @ self.Tm)
 
         x_orig = self.x.copy()
-        lams, Vs, AVs = self.eigensolver(Hproj, maxres, Pproj)
+        vref = kwargs.pop('vref', None)
+        if vref is not None:
+            vref = self.Tm.T @ vref
+        lams, Vs, AVs = self.eigensolver(Hproj, maxres, Pproj, vref=vref)
         self.x = x_orig
 
         Vs = Hproj.Vs
         AVs = Hproj.AVs
         Atilde = Vs.T @ symmetrize_Y(Vs, AVs, symm=2)
-        lams, vecs = eigh(Atilde)
+        lams, vecs = eigh(Atilde, Vs.T @ Vs)
 
         Vs = Vs @ vecs
         AVs = AVs @ vecs

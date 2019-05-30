@@ -35,7 +35,7 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
     if B is None:
         # Approximate B as a scaled identity matrix, where the
         # scalar is the average Ritz value from S.T @ Y
-        thetas, _ = eigh(S.T @ Ytilde)
+        thetas, _ = eigh(S.T @ Ytilde, S.T @ S)
         lam0 = np.average(np.abs(thetas))
         d, _ = S.shape
         B = lam0 * np.eye(d)
@@ -48,7 +48,7 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
         # both positive definite
         method = 'TS-BFGS'
         if np.all(lams > 0):
-            lams_STY, vecs_STY = eigh(S.T @ Ytilde)
+            lams_STY, vecs_STY = eigh(S.T @ Ytilde, S.T @ S)
             if np.all(lams_STY > 0):
                 method = 'BFGS'
 
