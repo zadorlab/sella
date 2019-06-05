@@ -52,7 +52,28 @@ class NumericalHessian(MatrixWrapper):
 
     def _matvec(self, v):
         self.calls += 1
-        vnorm = np.linalg.norm(v)
+        # Since the sign of v is arbitrary, we choose a "canonical" direction
+        # for the finite displacement. Essentially, we always displace in a
+        # descent direction, unless the displacement vector is orthogonal
+        # to the gradient. In that case, we choose a displacement in the
+        # direction which brings the current coordinates projected onto
+        # the displacement vector closer to "0". If the displacement
+        # vector is orthogonal to both the gradient and the coordinate
+        # vector then... well... just use the sign of v as provided.
+        # We can't possibly enumerate a comprehensive and consistent
+        # set of criteria for choosing a sign in all possible circumstances.
+        #
+        # Note that these are completely arbitrary criteria for choosing
+        # displacement direction. We are just trying to be as consistent
+        # as possible for numerical stability and reproducibility reasons.
+
+        vdotg = v.ravel() @ self.g0
+        if abs(vdotg) > 1e-4:
+            sign = 2. * (vdotg < 0) - 1.
+        else:
+            sign = 2. * (v.ravel() @ self.x0 <= 0.) - 1.
+
+        vnorm = np.linalg.norm(v) * sign
         _, gplus = self.func(self.x0 + self.dxL * v.ravel() / vnorm)
         if self.threepoint:
             fminus, gminus = self.func(self.x0 - self.dxL * v.ravel() / vnorm)
