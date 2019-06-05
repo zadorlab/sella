@@ -8,16 +8,56 @@ import numpy as np
 import scipy
 from scipy.linalg import eigh, lstsq
 
+def _trmag(xi, num, denom):
+    """Helper used to find Lagrange multiplier for trust radius methods"""
+    s = -num / (denom + xi)
+    smag = np.linalg.norm(s)
+    dsmag = -(s**2 / (denom + xi)).sum() / smag
+    return smag, dsmag
+
+def _root(fun,
+          x0,
+          target=0.,
+          args=tuple(),
+          bounds=None,
+          tol=1e-15,
+          maxiter=100):
+    """Finds x > 0 such that fun(x, *args) == target"""
+    f, df = fun(x0, *args)
+    err = f - target
+    x = x0
+    if bounds is None:
+        bounds = [-np.infty, np.infty]
+    else:
+        bounds = list(bounds)
+
+    if bounds[0] is None:
+        bounds[0] = -np.infty
+    if bounds[1] is None:
+        bounds[1] = np.infty
+
+    niter = 0
+    while abs(err) > tol and niter < maxiter:
+        x1 = x - err / df
+        if x1 <= bounds[0]:
+            x = (x - bounds[0]) / 2.
+        elif x1 >= bounds[1]:
+            x = (bounds[1] - x) / 2.
+        else:
+            x = x1
+        f, df = fun(x, *args)
+        err = f - target
+        niter += 1
+    if abs(err) > tol:
+        raise RuntimeError("Rootfinder failed!")
+    return x
 
 def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     """Perform a trust-radius Newton step towards an
     arbitrary-order saddle point (use order=0 to seek a minimum)"""
-    lams = minmode.lams
-    vecs = minmode.vecs
-
     # If we don't have any curvature information yet, just do steepest
     # descent.
-    if lams is None:
+    if minmode.lams is None:
         dx = -g
         dx_mag = np.linalg.norm(dx)
         bound_clip = False
@@ -27,38 +67,35 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
             bound_clip = True
         return dx, dx_mag, xi, bound_clip
 
-    L = np.abs(lams)
+    L = np.abs(minmode.lams)
     L[:order] *= -1
-    Vg = vecs.T @ g
-    dx = -vecs @ (Vg / L)
+    V = minmode.vecs
+
+    # Standard trust radius
+    num = V.T @ g
+    denom = L
+
+    # First try with xi=0
+    dx = -V @ (num / denom)
     dx_mag = np.linalg.norm(dx)
-    bound_clip = False
-    if dx_mag > r_tr:
-        bound_clip = True
-        rfo_counter = 0
-        xilower = 0
-        xiupper = None
-        LL = L * L
-        while True:
-            if xiupper is None:
-                xi *= 2
-            else:
-                xi = (xilower + xiupper) / 2.
-            if order == 0:
-                dx = -vecs @ (Vg / (L + xi))
-            else:
-                dx = -vecs @ (Vg * (L / (LL + xi)))
-            dx_mag = np.linalg.norm(dx)
-            if abs(dx_mag - r_tr) < 1e-14 * r_tr:
-                break
+    # If dx lies within the trust radius, we're done
+    if dx_mag <= r_tr:
+        return dx, dx_mag, xi, False
 
-            if dx_mag > r_tr:
-                xilower = xi
-            else:
-                xiupper = xi
+    # Gradient minimization trust radius
+    # Note: we do this *after* checking the xi=0 case, since then the extra
+    # L terms in the numerator and denominator would cancel anyway.
+    if order > 0:
+        num *= L
+        denom *= L
 
-    return dx, dx_mag, xi, bound_clip
-
+    # scipy.optimize.root_scalar doesn't let us provide one-sided bounds,
+    # so we rolled our own!
+    xi = _root(_trmag, xi, r_tr, args=(num, denom), bounds=[0., None])
+    dx = -V @ (num / (denom + xi))
+    dx_mag = np.linalg.norm(dx)
+    assert abs(dx_mag - r_tr) < 1e-12
+    return dx, dx_mag, xi, True
 
 # These interpolators are not currently being used, but we'll keep them
 # in case we find a use for them later.
