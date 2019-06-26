@@ -40,9 +40,9 @@ def _root(fun,
     while abs(err) > tol and niter < maxiter:
         x1 = x - err / df
         if x1 <= bounds[0]:
-            x = (x - bounds[0]) / 2.
+            x = (x + bounds[0]) / 2.
         elif x1 >= bounds[1]:
-            x = (bounds[1] - x) / 2.
+            x = (bounds[1] + x) / 2.
         else:
             x = x1
         f, df = fun(x, *args)
@@ -274,10 +274,10 @@ def optimize(minmode, maxiter, ftol, r_trust=5e-4, inc_factr=1.1,
         ratio = minmode.ratio
         if ratio is None:
             ratio = 1.
-        if ratio < 1/dec_ratio or ratio > dec_ratio:
+        if ratio < 1./dec_ratio or ratio > dec_ratio:
             r_trust = max(dx_mag * dec_factr, r_trust_min)
-        elif bound_clip and 1/inc_ratio < ratio < inc_ratio:
-            r_trust *= inc_factr
+        elif 1./inc_ratio < ratio < inc_ratio:
+            r_trust = max(inc_factr * dx_mag, r_trust)
 
         # Debug print statement
         print(f, np.linalg.norm(g), ratio, dx_mag / r_trust, r_trust, minmode.lams[0])
