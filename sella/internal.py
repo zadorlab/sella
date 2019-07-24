@@ -70,20 +70,6 @@ class Internal(object):
                 ind2 = min(tmp)
                 break
 
-        # Translate ind0 to origin
-        self._atoms.positions -= self._atoms.get_positions()[ind0]
-        
-        # Rotate ind1 into X axis
-        pos = self._atoms.get_positions()
-        axis = np.cross([1., 0., 0.], pos[ind1])
-        angle = -np.arccos(pos[ind1, 0] / np.linalg.norm(pos[ind1])) * 180. / np.pi
-        self._atoms.rotate(angle, axis)
-        
-        # Rotate ind2 into X-Y plane
-        pos = self._atoms.get_positions()
-        angle = -np.arccos(pos[ind2, 1] /  np.linalg.norm(pos[ind2, 1:])) * 180. / np.pi
-        self._atoms.rotate(angle, 'x')
-
     def _calc_internal(self, gradient=False, curvature=False):
         mask = np.ones(self.ninternal, dtype=np.uint8)
         self._p, _, _ = cart_to_internal(self.atoms.positions,
@@ -271,3 +257,50 @@ class Internal(object):
             return self._D
         self._calc_internal(gradient=True, curvature=True)
         return self._D
+
+    def guess_hessian(self, g0):
+        D = self.D
+        B = self.B
+        rcov = np.zeros(len(self.atoms))
+        for i, atom in enumerate(self.atoms):
+            rcov[i] = covalent_radii[atom.number]
+
+        rho = {}
+        for i, (a, b) in enumerate(self.bonds):
+            rho[tuple(sorted((a, b)))] = np.exp(-self.atoms.get_distance(a, b) / (rcov[a] + rcov[b]) + 1.)
+
+        H0 = np.zeros(self.nb + self.na + self.nd)
+
+        n = 0
+        start = 0
+        for i, (a, b) in enumerate(self.bonds):
+            if not self._mask[i]:
+                continue
+            H0[n] = 45 * rho[tuple(sorted((a, b)))]
+            n += 1
+
+        start += self.nb
+        for i, (a, b, c) in enumerate(self.angles):
+            if not self._mask[start + i]:
+                continue
+            rhoab = rho[tuple(sorted((a, b)))]
+            rhobc = rho[tuple(sorted((b, c)))]
+            H0[n] = 4 * rhoab * rhobc
+            n += 1
+
+        start += self.na
+        for i, (a, b, c, d) in enumerate(self.dihedrals):
+            if not self._mask[start + i]:
+                continue
+            rhoab = rho[tuple(sorted((a, b)))]
+            rhobc = rho[tuple(sorted((b, c)))]
+            rhocd = rho[tuple(sorted((c, d)))]
+            H0[n] = 0.15 * rhoab * rhobc * rhocd
+            n += 1
+
+        H = np.diag(H0[:n])
+        lvecs, lams, rvecs = np.linalg.svd(B, full_matrices=False)
+        indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
+        Binv = rvecs[indices, :].T @ (lvecs[:, indices].T / lams[indices, np.newaxis])
+        Hcart = B.T @ H @ B + D.ldot(Binv.T @ g0)
+        return Hcart
