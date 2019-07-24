@@ -841,3 +841,56 @@ cdef class GradB:
             m += 1
 
         return result_np
+
+    def rdot(self, np.ndarray[np.float64_t, ndim=1] v_np):
+        cdef size_t i, j, k, a, b, ai, bi
+        cdef size_t start = 0
+        cdef size_t n = 0, m = 0
+        result_np = np.zeros((self.ninternal - self.nmasked, 3 * self.natoms), dtype=np.float64)
+        cdef double[:, :] result = memoryview(result_np)
+        cdef double[:] v = memoryview(v_np)
+
+        for i in range(self.nbonds):
+            if not self.mask[i]:
+                continue
+            for a in range(2):
+                ai = self.bonds[i, a]
+                for b in range(2):
+                    bi = self.bonds[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[n, 3 * ai + j] += v[3 * bi + k] * self.Dbonds[m, a, j, b, k]
+            n += 1
+            m += 1
+
+        m = 0
+        start += self.nbonds
+        for i in range(self.nangles):
+            if not self.mask[start + i]:
+                continue
+            for a in range(3):
+                ai = self.angles[i, a]
+                for b in range(3):
+                    bi = self.angles[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[n, 3 * ai + j] += v[3 * bi + k] * self.Dangles[m, a, j, b, k]
+            n += 1
+            m += 1
+
+        m = 0
+        start += self.nangles
+        for i in range(self.ndihedrals):
+            if not self.mask[start + i]:
+                continue
+            for a in range(4):
+                ai = self.dihedrals[i, a]
+                for b in range(4):
+                    bi = self.dihedrals[i, b]
+                    for j in range(3):
+                        for k in range(3):
+                            result[n, 3 * ai + j] += v[3 * bi + k] * self.Ddihedrals[m, a, j, b, k]
+            n += 1
+            m += 1
+
+        return result_np
