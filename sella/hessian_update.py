@@ -4,7 +4,7 @@ from __future__ import division
 
 import numpy as np
 
-from scipy.linalg import eigh, lstsq
+from scipy.linalg import eigh, lstsq, expm
 
 from .cython_routines import symmetrize_Y2
 
@@ -58,8 +58,16 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
         Bplus = _MS_TS_BFGS(B, S, Ytilde, lams, vecs)
     elif method == 'PSB':
         Bplus = _MS_PSB(B, S, Ytilde)
+    elif method == 'DFP':
+        Bplus = _MS_DFP(B, S, Ytilde)
+    elif method == 'TS-DFP':
+        Bplus = _MS_TS_DFP(B, S, Ytilde, lams, vecs)
     elif method == 'SR1':
         Bplus = _MS_SR1(B, S, Ytilde)
+    elif method == 'Greenstadt':
+        Bplus = _MS_Greenstadt(B, S, Ytilde)
+    elif method == 'TS-Greenstadt':
+        Bplus = _MS_TS_Greenstadt(B, S, Ytilde)
     else:
         raise ValueError('Unknown update method {}'.format(method))
 
@@ -72,7 +80,6 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
 def _MS_BFGS(B, S, Y):
     return Y @ lstsq(Y.T @ S, Y.T)[0] - B @ S @ lstsq(S.T @ B @ S, S.T @ B)[0]
 
-
 def _MS_TS_BFGS(B, S, Y, lams, vecs):
     J = Y - B @ S
     X1 = S.T @ Y @ Y.T
@@ -82,18 +89,50 @@ def _MS_TS_BFGS(B, S, Y, lams, vecs):
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
-
 def _MS_PSB(B, S, Y):
     J = Y - B @ S
     U = lstsq(S.T @ S, S.T)[0].T
     UJT = U @ J.T
-    return (UJT + UJT.T) - U @ (J.T @ S) @ J.T
+    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
+def _MS_DFP(B, S, Y):
+    J = Y - B @ S
+    U = lstsq(S.T @ Y, Y.T)[0].T
+    UJT = U @ J.T
+    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
+def _MS_TS_DFP(B, S, Y, lams, vecs):
+    J = Y - B @ S
+    MS = Y @ Y.T @ S
+    U = lstsq(S.T @ MS, MS.T)[0].T
+    UJT = U @ J.T
+    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
 def _MS_SR1(B, S, Y):
     YBS = Y - B @ S
     return YBS @ lstsq(YBS.T @ S, YBS.T)[0]
 
+def _MS_Greenstadt(B, S, Y):
+    J = Y - B @ S
+    MS = B @ S
+    U = lstsq(S.T @ MS, MS.T)[0].T
+    UJT = U @ J.T
+    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
+def _MS_TS_Greenstadt(B, S, Y):
+    J = Y - B @ S
+    lams, vecs = eigh(B)
+    MS = vecs @ (np.abs(lams)[:, np.newaxis] * vecs.T @ S)
+    U = lstsq(S.T @ MS, MS.T)[0].T
+    UJT = U @ J.T
+    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
+def _MS_test(B, S, Y, lams, vecs):
+    J = Y - B @ S
+    M = expm(-Y @ Y.T - B @ S @ S.T @ B)
+    U = lstsq(S.T @ M @ S, S.T @ M)[0].T
+    UJT = U @ J.T
+    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
 # Not a symmetric update, so not available my default
 def _MS_Powell(B, S, Y):
