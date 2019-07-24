@@ -150,7 +150,7 @@ class MinModeAtoms(object):
 
     def _basis_update(self):
         if self._basis_xlast is None or np.any(self.x != self._basis_xlast):
-            out = calc_constr_basis(self.x, self.constraints, self.nconstraints,
+            out = calc_constr_basis(self.atoms, self.constraints, self.nconstraints,
                                     self.rot_center, self.rot_axes)
             self.res, self.drdx, self.Tm, self.Tfree, self.Tc = out
             self._basis_xlast = self.x.copy()
@@ -250,7 +250,7 @@ class MinModeAtoms(object):
 
         return f, g
 
-    def f_minmode(self, dxL, maxres=0.5, threepoint=False, **kwargs):
+    def f_minmode(self, dxL, maxres=0.5, threepoint=False, bad=False, **kwargs):
         if self.last['g'] is None:
             self.f_update(self.x)
 
@@ -291,7 +291,10 @@ class MinModeAtoms(object):
         Vs = Vs @ vecs
         AVs = AVs @ vecs
         AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
+        if bad:
+            self.H = update_H(self.H, self.Tfree.T @ Vs[:, 0], self.Tfree.T @ AVstilde[:, 0])
+        else:
+            self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)

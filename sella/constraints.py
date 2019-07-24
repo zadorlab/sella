@@ -88,12 +88,16 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
 
     # Second, we consider translational/rotational motion.
     constraints['translations'] = dict()
+    center = np.average(atoms.positions, axis=0)
     for dim, fixed in enumerate(fixed_dims):
         if fixed:
-            avgpos = np.average(atoms.positions[:, dim])
-            constraints['translations'][dim] = avgpos
+            constraints['translations'][dim] = center[dim]
     constraints['rotations'] = p_r
     nconstraints += np.sum(fixed_dims) + 3 * p_r
+
+    if rot_center is None:
+        rot_center = center
+    print(center)
 
     # Next we look at the bonds
     con_b = con.pop('bonds', tuple())
@@ -150,12 +154,13 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
     return constraints, nconstraints, rot_center, rot_axes
 
 
-def calc_constr_basis(x, con, ncon, rot_center, rot_axes):
+def calc_constr_basis(atoms, con, ncon, rot_center, rot_axes):
+    d = 3 * len(atoms)
+    pos = atoms.get_positions()
+    #pos = x.reshape((-1, 3))
+
     # If we don't have any constraints, then this is a very
     # easy task.
-    d = len(x)
-    pos = x.reshape((-1, 3))
-
     if ncon == 0:
         res = np.empty(0)
         drdx = np.empty((d, 0))
@@ -197,15 +202,16 @@ def calc_constr_basis(x, con, ncon, rot_center, rot_axes):
 
     # Now consider translation
     tvec = np.zeros_like(pos)
-    tvec[:, 0] = 1. / tvec.shape[1]
+    tvec[:, 0] = 1. / tvec.shape[0]
+    center = np.average(pos, axis=0)
     for dim, val in con.get('translations', dict()).items():
-        res[n] = np.average(pos[:, dim]) - val
+        res[n] = center[dim] - val
         drdx[:, n] = np.roll(tvec, dim, axis=1).ravel()
         n += 1
 
     # And rotations
     if con.get('rotations', False):
-        drdx_rot = project_rotation(x,
+        drdx_rot = project_rotation(pos.ravel(),
                                     rot_center,
                                     rot_axes)
         _, nrot = drdx_rot.shape
