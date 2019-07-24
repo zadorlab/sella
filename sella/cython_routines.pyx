@@ -15,6 +15,9 @@ cimport numpy as np
 
 import numpy as np
 
+cdef extern from "math.h":
+    double INFINITY
+
 cdef int ZERO = 0
 cdef int ONE = 1
 cdef int NONE = -1
@@ -329,3 +332,100 @@ def symmetrize_Y2(S, Y):
     free(dgels_A)
     free(work)
     return dY
+
+cdef double ahbisect(double[:] d, double[:] z, double alpha, double lower, double upper, double middle, double eps=1e-15) nogil:
+    cdef int n = len(d)
+
+    if (upper - middle)**2 < eps or (middle - lower)**2 < eps:
+        return middle
+
+    cdef double f, df, mid1, dmid1
+
+    cdef int k = 0
+
+    cdef int i
+
+    while k < 100:
+        k += 1
+        f = 0.
+        df = 0.
+        for i in range(n):
+            f -= z[i]**2 / (d[i] - middle)
+            df -= z[i]**2 / (d[i] - middle)**2
+        f += alpha - middle
+        df -= 1
+
+        if fabs(f) < eps or (lower > -INFINITY and upper < INFINITY and (upper - lower)**2 < eps):
+            return middle
+
+        if f < 0:
+            upper = middle
+        else:
+            lower = middle
+
+        mid1 = middle - f / df
+        if mid1 - lower < eps or upper - mid1 < eps:
+            middle = (upper + lower) / 2.
+        else:
+            middle = mid1
+    return middle
+
+def aheig(np.ndarray[np.float64_t, ndim=1] d_np, np.ndarray[np.float64_t, ndim=1] z_np, double alpha):
+    cdef double[:] d = memoryview(d_np)
+    cdef double[:] z = memoryview(z_np)
+
+    cdef int n = len(d) + 1
+
+    lams_np = np.zeros(n)
+    vecs_np = np.zeros((n, n))
+
+    cdef double[:] lams = memoryview(lams_np)
+    cdef double[:, :] vecs = memoryview(vecs_np)
+
+    lower_np = np.zeros(n)
+    upper_np = np.zeros(n)
+    middle_np = np.zeros(n)
+
+    cdef double[:] lower = memoryview(lower_np)
+    cdef double[:] upper = memoryview(upper_np)
+    cdef double[:] middle = memoryview(middle_np)
+
+    cdef double avgdiff = (d[n - 2] - d[0]) / (n - 1)
+    if abs(avgdiff) < 1e-15:
+        avgdiff = 1e-2
+    cdef double denom
+
+    cdef size_t i, j, k
+
+    lower[0] = -INFINITY
+    upper[0] = d[0]
+    middle[0] = d[0] - avgdiff
+
+    for i in range(1, n - 1):
+        lower[i] = d[i - 1]
+        upper[i] = d[i]
+        middle[i] = (d[i - 1] + d[i]) / 2.
+
+    lower[n - 1] = d[n - 2]
+    upper[n - 1] = INFINITY
+    middle[n - 1] = d[n - 2] + avgdiff
+
+    for i in range(n):
+        lams[i] = ahbisect(d, z, alpha, lower[i], upper[i], middle[i])
+        for j in range(n - 2):
+            if (d[j] - lams[i])**2 < 1e-15:
+                denom = 0.
+                for k in range(j, i):
+                    vecs[k, i] = z[k] * z[i]
+                    denom += z[k] * z[k]
+                for k in range(j, i):
+                    vecs[k, i] /= denom
+                vecs[i, i] = -1.
+                vecs_np[:, i] /= np.linalg.norm(vecs_np[:, i])
+                break
+        else:
+            for j in range(n - 1):
+                vecs[j, i] = z[j] / (d[j] - lams[i])
+            vecs[-1, i] = -1.
+            vecs_np[:, i] /= np.linalg.norm(vecs_np[:, i])
+    return lams_np, vecs_np
