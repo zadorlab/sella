@@ -7,6 +7,7 @@ import warnings
 import numpy as np
 import scipy
 from scipy.linalg import eigh, lstsq
+from sella.cython_routines import aheig
 
 def _trmag(xi, num, denom):
     """Helper used to find Lagrange multiplier for trust radius methods"""
@@ -96,6 +97,108 @@ def rs_newton(minmode, g, r_tr, order=1, xi=1.):
     dx_mag = np.linalg.norm(dx)
     assert abs(dx_mag - r_tr) < 1e-12
     return dx, dx_mag, xi, True
+
+def lams2vecs(d, z, lams):
+    n = len(lams)
+    vecs = np.zeros((n, n))
+    for i, lam in enumerate(lams[:-1]):
+        for j, dj in enumerate(d):
+            if np.abs(dj - lam)**2 < 1e-15:
+                #raise RuntimeError(i, lam, j, dj)
+                vecs[j:i, i] = z[j:i] * z[i] / (z[j:i] @ z[j:i])
+                vecs[i, i] = -1
+                break
+        else:
+            vecs[:-1, i] = z / (d - lam)
+            vecs[-1, i] = -1
+        vecs[:, i] /= np.linalg.norm(vecs[:, i])
+    return vecs
+
+def rs_rfo(minmode, g, r_tr, order=1, alpha=0.5):
+    lams = minmode.lams
+    vecs = minmode.vecs
+
+    gmax = vecs[:, :order].T @ g
+    gmin = vecs[:, order:].T @ g
+
+    Hmax0 = np.block([[np.diag(lams[:order]), gmax[:, np.newaxis]],
+                      [gmax, 0]])
+    Hmin0 = np.block([[np.diag(lams[order:]), gmin[:, np.newaxis]],
+                      [gmin, 0]])
+
+    lmax, vmax = eigh(Hmax0)
+
+    lmin, vmin = aheig(lams[order:], gmin, 0)
+
+    smax = vmax[:-1, -1] / vmax[-1, -1]
+    smin = vmin[:-1, 0] / vmin[-1, 0]
+
+    s = vecs[:, :order] @ smax + vecs[:, order:] @ smin
+    smag = np.linalg.norm(s)
+
+    if smag <= r_tr:
+        return s, smag, 1., False
+
+    lower = 0.
+    upper = 1.
+
+    dHmax = np.zeros_like(Hmax0)
+    dHmax[:, :-1] = 1.
+    dHmax[:-1, :] += 1.
+
+    dHmin = np.zeros_like(Hmin0)
+    dHmin[:, :-1] = 1.
+    dHmin[:-1, :] += 1.
+
+    alpha = r_tr
+
+    n = 1
+    while abs(r_tr - smag) > 1e-15:
+        if n >= 1000:
+            raise RuntimeError('RFO failed!')
+        n += 1
+
+        Hmax = Hmax0.copy() * alpha
+        Hmin = Hmin0.copy() * alpha
+
+        Hmax[:-1, :-1] *= alpha
+        Hmin[:-1, :-1] *= alpha
+
+        lmax, vmax = eigh(Hmax)
+        lmin, vmin = aheig(lams[order:] * alpha**2, gmin * alpha, 0)
+
+        smax = vmax[:-1, -1] * alpha / vmax[-1, -1]
+        smin = vmin[:-1, 0] * alpha / vmin[-1, 0]
+        s = vecs[:, :order] @ smax + vecs[:, order:] @ smin
+        smag = np.linalg.norm(s)
+
+        if smag > r_tr:
+            upper = alpha
+        else:
+            lower = alpha
+
+        dHmaxda = Hmax0.copy()
+        dHmaxda[:-1, :-1] *= 2 * alpha
+
+        dHminda = Hmin0.copy()
+        dHminda[:-1, :-1] *= 2 * alpha
+
+        dvmaxda = vmax[:, :-1] @ ((vmax[:, :-1].T @ dHmaxda @ vmax[:, -1]) / (lmax[-1] - lmax[:-1]))
+
+        dvminda = vmin[:, 1:] @ ((vmin[:, 1:].T @ dHminda @ vmin[:, 0]) / (lmin[0] - lmin[1:]))
+
+        dsmaxda = vmax[:-1, -1] / vmax[-1, -1] + (alpha / vmax[-1, -1]) * dvmaxda[:-1] - (vmax[:-1, -1] * alpha / vmax[-1, -1]**2) * dvmaxda[-1]
+        dsminda = vmin[:-1, 0] / vmin[-1, 0] + (alpha / vmin[-1, 0]) * dvminda[:-1] - (vmin[:-1, 0] * alpha / vmin[-1, 0]**2) * dvminda[-1]
+
+        dsmagda = (smin @ dsminda + smax @ dsmaxda) / smag
+        err = smag - r_tr
+
+        alpha -=  err / dsmagda
+        if np.isnan(alpha) or alpha < lower or alpha > upper:
+            alpha = (lower + upper) / 2.
+
+    s = vecs[:, :order] @ smax + vecs[:, order:] @ smin
+    return s, smag, alpha, True
 
 # These interpolators are not currently being used, but we'll keep them
 # in case we find a use for them later.
@@ -241,7 +344,7 @@ def interpolate_quadratic(f0, f1, g0, g1, dx, rmax=np.infty):
 
 def optimize(minmode, maxiter, ftol, r_trust=5e-4, inc_factr=1.1,
              dec_factr=0.9, dec_ratio=5.0, inc_ratio=1.01, order=1, eig=True,
-             **kwargs):
+             dump_xs_hessians=False, **kwargs):
 
     if order != 0 and not eig:
         warnings.warn("Saddle point optimizations with eig=False will "
@@ -256,18 +359,30 @@ def optimize(minmode, maxiter, ftol, r_trust=5e-4, inc_factr=1.1,
     if eig:
         minmode.f_minmode(**kwargs)
 
+    if dump_xs_hessians:
+        all_hessians = []
+        all_xs = []
+        all_xs.append(minmode.last['x'])
+        all_hessians.append(minmode.H.copy())
+
     xi = 1.
     while True:
         # Find new search step
         dx, dx_mag, xi, bound_clip = rs_newton(minmode, g, r_trust, order, xi)
+        #dx, dx_mag, xi, bound_clip = rs_rfo(minmode, g, r_trust, order, xi)
 
         # Determine if we need to call the eigensolver, then step
         ev = (eig and minmode.lams is not None
                   and np.any(minmode.lams[:order] > 0))
         f, g, dx = minmode.kick(dx, ev, **kwargs)
+        if dump_xs_hessians:
+            all_xs.append(minmode.last['x'])
+            all_hessians.append(minmode.H.copy())
 
         # Loop exit criterion: convergence or maxiter reached
         if minmode.converged(ftol) or minmode.calls >= maxiter:
+            if dump_xs_hessians:
+                return all_xs, all_hessians
             return minmode.last['x']
 
         # Update trust radius
@@ -280,7 +395,7 @@ def optimize(minmode, maxiter, ftol, r_trust=5e-4, inc_factr=1.1,
             r_trust = max(inc_factr * dx_mag, r_trust)
 
         # Debug print statement
-        print(f, np.linalg.norm(g), ratio, dx_mag / r_trust, r_trust, minmode.lams[0])
+        print(f, np.linalg.norm(g), ratio, dx_mag / r_trust, r_trust, xi, minmode.lams[0])
 
 
 class GDIIS(object):
