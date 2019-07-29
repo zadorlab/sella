@@ -27,9 +27,11 @@ class Sella(Optimizer):
         self.dxL = dxL
         self.r_trust_min = self.dxL
         if mmkwargs is None:
-            self.mmkwargs = dict()
+            self.mmkwargs = dict(dxL=self.dxL)
         else:
             self.mmkwargs = mmkwargs
+            if 'dxL' not in self.mmkwargs:
+                self.mmkwargs['dxL'] = self.dxL
 
         if self.ord != 0 and not self.eig:
             warnings.warn("Saddle point optimizations with eig=False will "
@@ -44,7 +46,7 @@ class Sella(Optimizer):
         if not self.initialized:
             f, self.glast, _ = self.mm.kick(np.zeros_like(self.mm.x_m))
             if self.eig:
-                self.mm.f_minmode(dxL=self.dxL, **self.mmkwargs)
+                self.mm.f_minmode(**self.mmkwargs)
             self.initialized = True
 
         # Find new search step
