@@ -322,7 +322,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
 def expand(V, Y, P, lams, vecs, shift, method='jd_alt', seeking=0):
     d, n = V.shape
     R = Y @ vecs - V @ vecs * lams[np.newaxis, :]
-    I = np.eye(n)
+    I = np.eye(d)
     if P is None:
         P = I.copy()
     Pshift = P - shift * I
