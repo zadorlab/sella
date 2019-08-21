@@ -481,7 +481,7 @@ def optimize(mm,
 
     delta = delta0 * len(mm.x_m)
 
-    delta_min = kwargs.get('dxL', delta / 100.)
+    delta_min = kwargs.get('eta', delta / 100.)
 
     # Force a gradient evaluation without changing the structure
     f, g, _ = mm.kick(np.zeros_like(mm.x_m))

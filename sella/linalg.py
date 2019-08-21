@@ -40,11 +40,11 @@ class MatrixWrapper(LinearOperator):
 class NumericalHessian(MatrixWrapper):
     dtype = np.dtype('float64')
 
-    def __init__(self, func, x0, g0, dxL, threepoint):
+    def __init__(self, func, x0, g0, eta, threepoint):
         self.func = func
         self.x0 = x0.copy()
         self.g0 = g0.copy()
-        self.dxL = dxL
+        self.eta = eta
         self.threepoint = threepoint
         self.calls = 0
 
@@ -83,11 +83,11 @@ class NumericalHessian(MatrixWrapper):
                     break
 
         vnorm = np.linalg.norm(v) * sign
-        _, gplus = self.func(self.x0 + self.dxL * v.ravel() / vnorm)
+        _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
         if self.threepoint:
-            fminus, gminus = self.func(self.x0 - self.dxL * v.ravel() / vnorm)
-            return vnorm * (gplus - gminus) / (2 * self.dxL)
-        return vnorm * ((gplus - self.g0) / self.dxL).reshape(v.shape)
+            fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
+            return vnorm * (gplus - gminus) / (2 * self.eta)
+        return vnorm * ((gplus - self.g0) / self.eta).reshape(v.shape)
 
     def _matmat(self, V):
         W = np.zeros_like(V)

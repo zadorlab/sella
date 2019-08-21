@@ -16,7 +16,7 @@ ext_modules = [Extension('sella.force_match',
                ]
 
 setup(name='Sella',
-      version='0.0.1',
+      version='0.1.0',
       author='Eric Hermes',
       author_email='ehermes@sandia.gov',
       long_description=long_description,

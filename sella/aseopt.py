@@ -14,8 +14,8 @@ class Sella(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
                  master=None, force_consistent=False, delta0=1.3e-3,
                  sigma_inc=1.15, sigma_dec=0.65, rho_dec=5.0, rho_inc=1.035,
-                 order=1, eig=True, dxL=1e-4, peskwargs=None, method='rsprfo',
-                 gamma=0.4, **kwargs):
+                 order=1, eig=True, eta=1e-4, peskwargs=None, method='rsprfo',
+                 gamma=0.4, constraints_tol=1e-5, **kwargs):
         Optimizer.__init__(self, atoms, restart, logfile, None, master,
                            force_consistent)
         self.pes = PESWrapper(atoms, atoms.calc, trajectory=trajectory,
@@ -27,15 +27,16 @@ class Sella(Optimizer):
         self.rho_dec = rho_dec
         self.ord = order
         self.eig = eig
-        self.dxL = dxL
-        self.delta_min = self.dxL
+        self.eta = eta
+        self.delta_min = self.eta
+        self.constraints_tol = constraints_tol
         self.niter = 0
         if peskwargs is None:
-            self.peskwargs = dict(dxL=self.dxL, gamma=gamma)
+            self.peskwargs = dict(eta=self.eta, gamma=gamma)
         else:
             self.peskwargs = peskwargs
-            if 'dxL' not in self.peskwargs:
-                self.peskwargs['dxL'] = self.dxL
+            if 'eta' not in self.peskwargs:
+                self.peskwargs['eta'] = self.eta
             if 'gamma' not in self.peskwargs:
                 self.peskwargs['gamma'] = gamma
 
@@ -87,3 +88,20 @@ class Sella(Optimizer):
             self.delta = max(smag * self.sigma_dec, self.delta_min)
         elif 1./self.rho_inc < rho < self.rho_inc:
             self.delta = max(self.sigma_inc * smag, self.delta)
+
+    def _project_forces(self, forces):
+        # Fool the optimizer into thinking the gradient is orthogonal to the
+        # constraint subspace
+        return (self.pes.Tm @ self.pes.Tm.T @ forces.ravel()).reshape((-1, 3))
+
+    def converged(self, forces=None):
+        if forces is None:
+            forces = self.atoms.get_forces()
+        forces = self._project_forces(forces)
+        return (np.all(np.abs(self.pes.res) < self.constraints_tol)
+                and (forces**2).sum(1).max() < self.fmax**2)
+
+    def log(self, forces=None):
+        if forces is None:
+            forces = self.atoms.get_forces()
+        return Optimizer.log(self, self._project_forces(forces))

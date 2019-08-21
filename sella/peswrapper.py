@@ -248,7 +248,7 @@ class PESWrapper(object):
 
         return f, g
 
-    def diag(self, dxL, gamma=0.5, threepoint=False, shift=False,
+    def diag(self, eta, gamma=0.5, threepoint=False, shift=False,
              shiftfactr=1000, maxiter=None, **kwargs):
         if self.last['g'] is None:
             self.evaluate(self.x)
@@ -271,7 +271,7 @@ class PESWrapper(object):
         # Htrue is a representation of the *true* Hessian matrix, which
         # can be probed only through Hessian-vector products that are
         # evaluated using finite difference of the gradient
-        Htrue = NumericalHessian(self.calc_eg, x, g, dxL, threepoint)
+        Htrue = NumericalHessian(self.calc_eg, x, g, eta, threepoint)
 
         # We project the true Hessian into the space of free coordinates
         if shift:
