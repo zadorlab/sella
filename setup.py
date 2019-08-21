@@ -10,6 +10,8 @@ except ImportError:
 else:
     use_cython = True
 
+cmdclass = dict()
+
 if use_cython:
     ext_modules = [Extension('sella.force_match',
                              ['sella/force_match.pyx']),
