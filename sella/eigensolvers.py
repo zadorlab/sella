@@ -1,14 +1,12 @@
-#!/usr/bin/env python
-
 import numpy as np
 
 from scipy.linalg import eigh, lstsq, solve, null_space
 
 from .cython_routines import ortho
-from .hessian_update import symmetrize_Y, update_H
+from .hessian_update import symmetrize_Y
 
 
-def exact(A, maxres=None, P=None):
+def exact(A, gamma=None, P=None):
     if isinstance(A, np.ndarray):
         lams, vecs = eigh(A)
     else:
@@ -30,14 +28,14 @@ def exact(A, maxres=None, P=None):
     return lams, vecs, lams[np.newaxis, :] * vecs
 
 
-def lobpcg(A, v0, maxres, P=None):
+def lobpcg(A, v0, gamma, P=None):
 
-    if maxres <= 0:
-        return exact(A, maxres, P)
+    if gamma <= 0:
+        return exact(A, gamma, P)
 
     # Use identity matrix as preconditioner if none provided
     if P is None:
-        N = I.copy()
+        N = np.eye(len(v0))
     else:
         N = P
 
@@ -51,8 +49,8 @@ def lobpcg(A, v0, maxres, P=None):
     I = np.eye(n)
 
     # Relative convergence tolerance
-    if maxres is None:
-        maxres = np.sqrt(1e-15) * n
+    if gamma is None:
+        gamma = np.sqrt(1e-15) * n
 
     # Orthogonalize initial guess vectors
     X = ortho(X0, np.empty((n, 0)))
@@ -104,8 +102,9 @@ def lobpcg(A, v0, maxres, P=None):
         R = AX - X @ np.diag(thetas[:nev])
 
         # Check which if any vectors are converged
-        converged = np.linalg.norm(R, axis=0) < maxres * np.abs(thetas[:nev])
-        print(np.linalg.norm(R[:, 0]), thetas[0], np.linalg.norm(R[:, 0]) / thetas[0])
+        converged = np.linalg.norm(R, axis=0) < gamma * np.abs(thetas[:nev])
+        print(np.linalg.norm(R[:, 0]), thetas[0],
+              np.linalg.norm(R[:, 0]) / thetas[0])
 
         if all(converged):
             print("LOBPCG converged in {} iterations".format(k))
@@ -128,18 +127,23 @@ def lobpcg(A, v0, maxres, P=None):
     return thetas, S @ Y, AS @ Y
 
 
-def davidson(A, maxres, P, vref=None, refine=False, harmonic=False):
+def davidson(A, gamma, P, v0=None, vref=None, vreftol=0.99, refine=False,
+             harmonic=False, maxiter=None):
     n, _ = A.shape
+    if maxiter is None:
+        maxiter = 2 * n + 1
 
-    if maxres <= 0:
-        return exact(A, maxres, P)
+    if gamma <= 0:
+        return exact(A, gamma, P)
 
     I = np.eye(n)
 
-    P_lams, P_vecs, _ = exact(P, 0)
-    nneg = max(2, np.sum(P_lams < 0) + 1)
-
-    V = ortho(P_vecs[:, :nneg])
+    if v0 is not None:
+        V = ortho(v0.reshape((-1, 1)))
+    else:
+        P_lams, P_vecs, _ = exact(P, 0)
+        nneg = max(1, np.sum(P_lams < 0))
+        V = ortho(P_vecs[:, :nneg])
 
     AV = A.dot(V)
 
@@ -148,22 +152,27 @@ def davidson(A, maxres, P, vref=None, refine=False, harmonic=False):
     while True:
         Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
         lams, vecs = eigh(Atilde, V.T @ V)
-        nneg = max(2, np.sum(lams < 0) + 1)
+        nneg = min(V.shape[1], max(2, np.sum(lams < 0) + 1))
         # Rotate our subspace V to be diagonal in A.
         # This is not strictly necessary but it makes our lives easier later
         AV = AV @ vecs
         V = V @ vecs
         vecs = np.eye(V.shape[1])
+        if V.shape[1] >= maxiter:
+            return lams, V, AV
 
         # a hack for the optbench.org eigensolver convergence test
         if vref is not None:
-            v0 = V @ vecs[:, 0]
-            print(np.abs(v0 @ vref))
-            if np.abs(v0 @ vref) > 0.99:
+            x0 = V @ vecs[:, 0]
+            print(np.abs(x0 @ vref))
+            if np.abs(x0 @ vref) > vreftol:
+                print("Dot product between your v0 and the final answer:",
+                      np.abs(v0 @ x0) / np.linalg.norm(v0))
                 return lams, V, AV
 
         Ytilde = symmetrize_Y(V, AV, symm=method)
-        R = Ytilde @ vecs[:, :nneg] - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg]
+        R = (Ytilde @ vecs[:, :nneg]
+             - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg])
         Rnorm = np.linalg.norm(R, axis=0)
         print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
 
@@ -171,7 +180,7 @@ def davidson(A, maxres, P, vref=None, refine=False, harmonic=False):
         for seeking, (rinorm, thetai) in enumerate(zip(Rnorm, lams)):
             # Take the first Ritz value that is not converged, and use it
             # to extend V
-            if rinorm >= maxres * np.abs(thetai):
+            if V.shape[1] == 1 or rinorm >= gamma * np.abs(thetai):
                 ri = R[:, seeking]
                 ui = V @ vecs[:, seeking]
                 thetai = lams[seeking]
@@ -204,6 +213,12 @@ def davidson(A, maxres, P, vref=None, refine=False, harmonic=False):
         alpha = solve(V.T @ PprojV, V.T @ Pprojr)
         ti = solve(Pproj, (V @ alpha - ri))
 
+#        Pproj = P - thetai * I
+#        Pprojr, _, _, _ = lstsq(Pproj, ri)
+#        PprojV, _, _, _ = lstsq(Pproj, V)
+#        alpha, _, _, _ = lstsq(V.T @ PprojV, V.T @ Pprojr)
+#        ti, _, _, _ = lstsq(Pproj, (V @ alpha - ri))
+
         t = ortho(ti, V)
 
         # Davidson failed to find a new search direction
@@ -220,65 +235,74 @@ def davidson(A, maxres, P, vref=None, refine=False, harmonic=False):
     else:
         return lams, V, AV
 
-def eig_test(A, maxres, P, vref=None):
+
+def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
+                  update='jd_alt', maxiter=None):
     n, _ = A.shape
+    if maxiter is None:
+        maxiter = 2 * n + 1
 
-    if maxres <= 0:
-        return exact(A, maxres, P)
+    if gamma <= 0:
+        return exact(A, gamma, P)
 
-    I = np.eye(n)
-
-    P_lams, P_vecs, _ = exact(P, 0)
-    nneg = max(2, np.sum(P_lams < 0) + 1)
-
-    V = ortho(P_vecs[:, :nneg])
+    if v0 is not None:
+        V = ortho(v0.reshape((-1, 1)))
+    else:
+        P_lams, P_vecs, _ = exact(P, 0)
+        nneg = max(1, np.sum(P_lams < 0))
+        V = ortho(P_vecs[:, :nneg])
+        v0 = V[:, 0]
 
     AV = A.dot(V)
 
     method = 2
     seeking = 0
     while True:
-        #Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
-        Atilde = V.T @ AV
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
         lams, vecs = eigh(Atilde, V.T @ V)
-        nneg = max(2, np.sum(lams < 0) + 1)
+        nneg = max(1, np.sum(lams < 0))
         # Rotate our subspace V to be diagonal in A.
         # This is not strictly necessary but it makes our lives easier later
-        #AV = AV @ vecs
-        #V = V @ vecs
-        #vecs = np.eye(V.shape[1])
+        AV = AV @ vecs
+        V = V @ vecs
+        vecs = np.eye(V.shape[1])
+        if V.shape[1] >= maxiter:
+            return lams, V, AV
 
-
-        #Ytilde = symmetrize_Y(V, AV, symm=method)
-        Ytilde = AV
-        R = Ytilde @ vecs[:, :nneg] - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg]
+        Ytilde = symmetrize_Y(V, AV, symm=method)
+        R = (Ytilde @ vecs[:, :nneg]
+             - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg])
         Rnorm = np.linalg.norm(R, axis=0)
         print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
 
         # a hack for the optbench.org eigensolver convergence test
         if vref is not None:
-            Rtilde = Ytilde - lams[0] * V
-            _, C = eigh(Rtilde.T @ Rtilde)
-            v0 = V @ C[:, 0]
-            #v0 = V @ vecs[:, 0]
-            print(np.abs(v0 @ vref))
-            if np.abs(v0 @ vref) > 0.99:
+            x0 = V @ vecs[:, 0]
+            print(np.abs(x0 @ vref))
+            if np.abs(x0 @ vref) > vreftol:
+                print("Dot product between your v0 and the final answer:",
+                      np.abs(v0 @ x0) / np.linalg.norm(v0))
                 return lams, V, AV
 
         # Loop over all Ritz values of interest
         for seeking, (rinorm, thetai) in enumerate(zip(Rnorm, lams)):
             # Take the first Ritz value that is not converged, and use it
             # to extend V
-            if rinorm >= maxres * np.abs(thetai):
+            if V.shape[1] == 1 or rinorm >= gamma * np.abs(thetai):
                 ri = R[:, seeking]
-                ui = V @ vecs[:, seeking]
                 thetai = lams[seeking]
                 break
         # If they all seem converged, then we are done
         else:
             return lams, V, AV
 
-        t = ortho(expand(V, Ytilde, P, lams, vecs, thetai, 'lanczos', seeking), V)
+        t = expand(V, Ytilde, P, lams, vecs, thetai, update, seeking)
+        t /= np.linalg.norm(t)
+        if np.linalg.norm(t - V @ V.T @ t) < 1e-2:
+            # Do Lanczos instead
+            t = ri / np.linalg.norm(ri)
+
+        t = ortho(t, V)
 
         # Davidson failed to find a new search direction
         if t.shape[1] == 0:
@@ -294,17 +318,16 @@ def eig_test(A, maxres, P, vref=None):
     else:
         return lams, V, AV
 
-def expand(V, Y, P, lams, vecs, shift, method='modified_jacobi_davidson', seeking=0):
+
+def expand(V, Y, P, lams, vecs, shift, method='jd_alt', seeking=0):
+    d, n = V.shape
     R = Y @ vecs - V @ vecs * lams[np.newaxis, :]
-    Pshift = P - shift * np.eye(V.shape[0])
+    I = np.eye(n)
     if P is None:
         P = I.copy()
+    Pshift = P - shift * I
     if method == 'lanczos':
-        return Y @ vecs[:, seeking]
-    elif method == 'preconditioned_lanczos':
-        return np.linalg.solve(Pshift, Y @ vecs[:, seeking])
-    elif method == 'cg':
-        return np.linalg.solve(P, R[:, seeking])
+        return R[:, seeking]
     elif method == 'davidson':
         return np.linalg.solve(Pshift, R[:, seeking])
     elif method == 'jacobi_davidson':
@@ -313,92 +336,32 @@ def expand(V, Y, P, lams, vecs, shift, method='modified_jacobi_davidson', seekin
         Pprojv = solve(Pshift, vi)
         alpha = vi.T @ Pprojr / (vi.T @ Pprojv)
         return Pprojv * alpha - Pprojr
+    elif method == 'jd_alt':
+        vi = V @ vecs[:, seeking]
+        Aaug = np.block([[Pshift, vi[:, np.newaxis]], [vi, 0]])
+        raug = np.zeros(d + 1)
+        raug[:d] = R[:, seeking]
+        z = solve(Aaug, -raug)
+        return z[:d]
     elif method == 'modified_jacobi_davidson':
         Pprojr = solve(Pshift, R[:, seeking])
         PprojV = solve(Pshift, V @ vecs)
         alpha = solve((V @ vecs).T @ PprojV, (V @ vecs).T @ Pprojr)
         return solve(Pshift, ((V @ vecs) @ alpha - R[:, seeking]))
+    elif method == 'mod_jd_alt':
+        Vrot = V @ vecs
+        Aaug = np.block([[Pshift, Vrot], [Vrot.T, np.zeros((n, n))]])
+        raug = np.zeros(d + n)
+        raug[:d] = R[:, seeking]
+        z = solve(Aaug, -raug)
+        return z[:d]
 
 
-def lanczos(A, maxres, P, vref=None):
+def spam(A, gamma, P, vref=None):
     n, _ = A.shape
 
-    if maxres <= 0:
-        return exact(A, maxres, P)
-
-    I = np.eye(n)
-
-    P_lams, P_vecs, _ = exact(P, 0)
-    nneg = max(2, np.sum(P_lams < 0) + 1)
-
-    V = ortho(P_vecs[:, :nneg])
-
-    AV = A.dot(V)
-
-    Ytilde = symmetrize_Y(V, AV, symm=2)
-    Atilde = V.T @ Ytilde
-    lams, vecs = eigh(Atilde, V.T @ V)
-    nneg = max(2, np.sum(lams < 0) + 1)
-    R = Ytilde @ vecs[:, :nneg] - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg]
-
-    rlast = R[:, 0].copy()
-    dlast = -rlast
-
-    method = 2
-    seeking = 0
-    while True:
-        Ytilde = symmetrize_Y(V, AV, symm=method)
-        Atilde = V.T @ Ytilde
-        lams, vecs = eigh(Atilde, V.T @ V)
-        nneg = max(2, np.sum(lams < 0) + 1)
-        # hold onto this for later
-        # Rotate our subspace V to be diagonal in A.
-        # This is not strictly necessary but it makes our lives easier later
-        #AV = AV @ vecs
-        #V = V @ vecs
-
-        # a hack for the optbench.org eigensolver convergence test
-        if vref is not None:
-            print(np.abs(V @ vecs[:, 0] @ vref))
-            if np.abs(V @ vecs[:, 0] @ vref) > 0.99:
-                return lams, V, AV
-
-        #Ytilde = symmetrize_Y(V, AV, symm=method)
-        R = Ytilde @ vecs[:, :nneg] - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg]
-        Rnorm = np.linalg.norm(R, axis=0)
-        print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
-
-        # Loop over all Ritz values of interest
-        for seeking, (rinorm, thetai) in enumerate(zip(Rnorm, lams)):
-            # Take the first Ritz value that is not converged, and use it
-            # to extend V
-            if rinorm >= maxres * np.abs(thetai):
-                ri = R[:, seeking]
-                ui = V[:, seeking]
-                break
-        # If they all seem converged, then we are done
-        else:
-            return lams, V, AV
-        if vref is not None:
-            seeking = 0
-        t = expand(V, AV, P=P, method='modified_jacobi_davidson', seeking=seeking)
-
-        t = ortho(t, V)
-
-        V = np.hstack([V, t])
-        AV = np.hstack([AV, A.dot(t)])
-    else:
-        return lams, V, AV
-
-
-
-def spam(A, maxres, P, vref=None):
-    n, _ = A.shape
-
-    if maxres <= 0:
-        return exact(A, maxres, P)
-
-    I = np.eye(n)
+    if gamma <= 0:
+        return exact(A, gamma, P)
 
     P_lams, V, _ = exact(P, 0)
     W = P @ V
@@ -421,109 +384,28 @@ def spam(A, maxres, P, vref=None):
                     return thetas, V[:, :i], W[:, :i]
 
             nneg = max(2, np.sum(thetas < 0) + 1)
-            R = Ytilde @ X[:, :nneg] - V[:, :i] @ X[:, :nneg] * thetas[np.newaxis, :nneg]
+            R = (Ytilde @ X[:, :nneg]
+                 - V[:, :i] @ X[:, :nneg] * thetas[np.newaxis, :nneg])
             Rnorm = np.linalg.norm(R, axis=0)
             print(Rnorm, thetas[:nneg], Rnorm / thetas[:nneg], seeking)
 
             for seeking, (rinorm, theta) in enumerate(zip(Rnorm, thetas)):
-                if rinorm > maxres * np.abs(theta):
+                if rinorm > gamma * np.abs(theta):
                     break
             else:
                 return thetas, V[:, :i], W[:, :i]
 
             V[:, i:] = null_space(V[:, :i].T)
             W[:, i:] = P @ V[:, i:]
-            Ak = P + update_H(P, V[:, :i], W[:, :i], method='test')
         else:
             Ytilde = W[:, :i]
-            Ak = P
 
-        #Akhat[:, :i] = V.T @ Ytilde
-        #Akhat[:i, i:] = Akhat[i:, :i].T
-        #Akhat[i:, i:] = W[:, i:].T @ V[:, i:]
-        #Ak = V @ Akhat @ V.T
+        Akhat[:, :i] = V.T @ Ytilde
+        Akhat[:i, i:] = Akhat[i:, :i].T
+        Akhat[i:, i:] = W[:, i:].T @ V[:, i:]
+        Ak = V @ Akhat @ V.T
         lams, vecs = np.linalg.eigh(Ak)
         V[:, i] = ortho(vecs[:, seeking], V[:, :i]).ravel()
         W[:, i] = A.dot(V[:, i])
     else:
-        return lams, V, AV
-
-def lobpcg2(A, maxres, T, vref=None):
-    n, _ = A.shape
-
-    if maxres <= 0:
-        return exact(A, maxres, P)
-
-    I = np.eye(n)
-
-    T_lams, T_vecs, _ = exact(T, 0)
-    nneg = max(2, np.sum(T_lams < 0) + 1)
-
-    x = ortho(T_vecs[:, :nneg])
-    X = A.dot(x)
-
-    S = x.copy()
-    AS = X.copy()
-
-    p = np.empty((n, 0))
-    P = np.empty((n, 0))
-
-    theta = np.diag(x.T @ X)
-    w = X - theta[np.newaxis, :] * x
-    w /= np.linalg.norm(w, axis=0)[np.newaxis, :]
-
-    method = 2
-    seeking = 0
-    locked = np.empty((n, 0))
-    while True:
-        #W = A.dot(w)
-
-        Snew = ortho(w, S)
-        print(w.shape, Snew.shape)
-        #if Snew.shape[1] == 0:
-        #    return lams, V, AV
-        ASnew = A.dot(Snew)
-        S = np.hstack((S, Snew))
-        AS = np.hstack((AS, ASnew))
-        W = AS @ S.T @ w
-
-        V = np.hstack((x, w, p))
-        AV = np.hstack((X, W, P))
-        AVtilde = symmetrize_Y(V, AV, symm=method)
-
-        SA = V.T @ AVtilde
-        SB = V.T @ V
-        lams, vecs = eigh(SA, SB)
-        n = nneg
-        nneg = max(2, np.sum(lams < 0) + 1)
-
-        x = V @ vecs[:, :nneg]
-        xnorm = np.linalg.norm(x, axis=0)
-        x /= xnorm[np.newaxis, :]
-
-        X = AV @ vecs[:, :nneg]
-        X /= xnorm[np.newaxis, :]
-
-        R = X - x * lams[np.newaxis, :nneg]
-        Rnorm = np.linalg.norm(R, axis=0)
-
-        print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
-
-        if np.all(Rnorm < maxres * np.abs(lams[:nneg])):
-            return lams, V, AV
-
-        p = V[:, :n] @ vecs[:n, :nneg] + V[:, 2*n:] @ vecs[2*n:, :nneg]
-        pnorm = np.linalg.norm(p, axis=0)
-        p /= pnorm[np.newaxis, :]
-
-
-        P = AV[:, :n] @ vecs[:n, :nneg] + AV[:, 2*n:] @ vecs[2*n:, :nneg]
-        P /= pnorm[np.newaxis, :]
-
-        w = np.zeros_like(R)
-        for i, (thetai, ri) in enumerate(zip(lams[:nneg], R.T)):
-            w[:, i] = np.linalg.solve(T - thetai * I, ri)
-
-        w /= np.linalg.norm(w, axis=0)[np.newaxis, :]
-    else:
-        return lams, V, AV
+        return lams, V, W

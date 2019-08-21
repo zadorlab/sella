@@ -2,34 +2,28 @@
 # removes constraints from the degrees of freedom exposed to the
 # optimizer
 
-import warnings
-
 import numpy as np
 from scipy.linalg import eigh, lstsq
 
 from ase.io import Trajectory
-from ase.calculators.singlepoint import SinglePointCalculator
 
-from .eigensolvers import davidson
+from .eigensolvers import rayleigh_ritz
 from .linalg import NumericalHessian, ProjectedMatrix
 from .hessian_update import update_H, symmetrize_Y
 from .constraints import initialize_constraints, calc_constr_basis
 
 
-class MinModeAtoms(object):
-    def __init__(self, atoms, calc, eigensolver=davidson,
+class PESWrapper(object):
+    def __init__(self, atoms, calc, eigensolver=rayleigh_ritz,
                  project_translations=True, project_rotations=None,
                  constraints=None, trajectory=None, shift=1000,
                  v0=None, maxres=1e-5):
-        self.atoms = atoms.copy()
+        self.atoms = atoms
         self.H = None
-
-        if self.atoms.constraints:
-            warnings.warn('ASE Atoms object has attached constraints, '
-                          'but these will be ignored! Please provide '
-                          'constraints to the MinMode object '
-                          'initializer instead!')
-            self.atoms.set_constraint()
+        self.HPSB = None
+        self.HBFGS = None
+        self.HSR1 = None
+        self.HDFP = None
 
         # We don't want to pass the dummy atoms onto the calculator,
         # which might not know what to do with them, so we have a
@@ -137,7 +131,6 @@ class MinModeAtoms(object):
             else:
                 xreal[nreal] = row
                 nreal += 1
-        #print('POSITIONS:', xin)
         self.atoms.set_positions(xin)
         self._atoms_nodummy.set_positions(xreal)
         self._basis_update()
@@ -150,24 +143,23 @@ class MinModeAtoms(object):
 
     def _basis_update(self):
         if self._basis_xlast is None or np.any(self.x != self._basis_xlast):
-            out = calc_constr_basis(self.atoms, self.constraints, self.nconstraints,
-                                    self.rot_center, self.rot_axes)
+            out = calc_constr_basis(self.atoms, self.constraints,
+                                    self.nconstraints, self.rot_center,
+                                    self.rot_axes)
             self.res, self.drdx, self.Tm, self.Tfree, self.Tc = out
             self._basis_xlast = self.x.copy()
 
-    def kick(self, dx_m, minmode=False, **kwargs):
+    def kick(self, dx_m, diag=False, **kwargs):
         if np.linalg.norm(dx_m) == 0 and self.last['f'] is not None:
             return self.last['f'], self.Tm.T @ self.last['g'], dx_m
-
-        res_orig = self.res.copy()
 
         dx_c, _, _, _ = lstsq(-self.drdx.T, self.res)
 
         dx = self.Tm @ dx_m + dx_c
-        f1, g1 = self.f_update(self.x + dx)
+        f1, g1 = self.evaluate(self.x + dx)
 
-        if minmode:
-            self.f_minmode(**kwargs)
+        if diag:
+            self.diag(**kwargs)
 
         return f1, self.Tm.T @ self.last['g'], dx_m
 
@@ -209,7 +201,7 @@ class MinModeAtoms(object):
             self.trajectory.write(self.atoms, energy=e, forces=gout)
         return e, g
 
-    def f_update(self, x):
+    def evaluate(self, x):
         if self.last['f'] is not None and np.all(x == self.x):
             return self.last['f'], self.last['g']
 
@@ -230,11 +222,17 @@ class MinModeAtoms(object):
                             + (dx_c @ self.H @ dx_c) / 2.)
 
             self.ratio = self.df_pred / self.df
+            self.err = np.abs(self.df_pred - self.df) / np.abs(self.df_pred)
 
         if self.last['h'] is not None:
             # Update Hessian matrix
             dh_free = self.Tfree.T @ (h - self.last['h'])
             self.H = update_H(self.H, dx_free, dh_free)
+
+            self.HPSB = update_H(self.HPSB, dx_free, dh_free, method='PSB')
+            self.HBFGS = update_H(self.HBFGS, dx_free, dh_free, method='BFGS')
+            self.HSR1 = update_H(self.HSR1, dx_free, dh_free, method='SR1')
+            self.HDFP = update_H(self.HDFP, dx_free, dh_free, method='DFP')
 
         g_m = self.Tm.T @ g
         if self.H is not None:
@@ -250,21 +248,25 @@ class MinModeAtoms(object):
 
         return f, g
 
-    def f_minmode(self, dxL, maxres=0.5, threepoint=False, bad=False, **kwargs):
+    def diag(self, dxL, gamma=0.5, threepoint=False, shift=False,
+             shiftfactr=1000, maxiter=None, **kwargs):
         if self.last['g'] is None:
-            self.f_update(self.x)
+            self.evaluate(self.x)
+            if maxiter is not None:
+                maxiter -= 1
 
         x = self.last['x']
         g = self.last['g']
 
         # If we don't have an approximate Hessian yet, then
         H = self.H
+        v0 = None
         if H is None:
-            v = self.v0
-            if v is None:
-                v = self.last['g']
-            v = self.Tfree.T @ v
-            H = np.eye(len(v)) - 2 * np.outer(v, v) / (v @ v)
+            v0 = self.v0
+            if v0 is None:
+                v0 = self.last['g']
+            v0 = self.Tfree.T @ v0
+            H = np.eye(self.Tfree.shape[1])
 
         # Htrue is a representation of the *true* Hessian matrix, which
         # can be probed only through Hessian-vector products that are
@@ -272,29 +274,46 @@ class MinModeAtoms(object):
         Htrue = NumericalHessian(self.calc_eg, x, g, dxL, threepoint)
 
         # We project the true Hessian into the space of free coordinates
-        Hproj = ProjectedMatrix(Htrue, self.Tm)
-
-        Pproj = (self.Tm.T @ self.Tfree) @ H @ (self.Tfree.T @ self.Tm)
+        if shift:
+            Hproj = Htrue + shiftfactr * self.Tc @ self.Tc.T
+            Pproj = H + shiftfactr * self.Tc @ self.Tc.T
+        else:
+            if v0 is not None:
+                v0 = self.Tm.T @ self.Tfree @ v0
+            Hproj = ProjectedMatrix(Htrue, self.Tm)
+            Pproj = (self.Tm.T @ self.Tfree) @ H @ (self.Tfree.T @ self.Tm)
 
         x_orig = self.x.copy()
         vref = kwargs.pop('vref', None)
-        if vref is not None:
+        vreftol = kwargs.pop('vreftol', 0.99)
+        if vref is not None and not shift:
             vref = self.Tm.T @ vref
-        lams, Vs, AVs = self.eigensolver(Hproj, maxres, Pproj, vref=vref)
+        update = kwargs.pop('update', 'jd_alt')
+        lams, Vs, AVs = self.eigensolver(Hproj, gamma, Pproj, v0=v0,
+                                         vref=vref, vreftol=vreftol,
+                                         update=update, maxiter=maxiter)
         self.x = x_orig
 
-        Vs = Hproj.Vs
-        AVs = Hproj.AVs
+        if not shift:
+            Vs = Hproj.Vs
+            AVs = Hproj.AVs
         Atilde = Vs.T @ symmetrize_Y(Vs, AVs, symm=2)
         lams, vecs = eigh(Atilde, Vs.T @ Vs)
 
         Vs = Vs @ vecs
         AVs = AVs @ vecs
         AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
-        if bad:
-            self.H = update_H(self.H, self.Tfree.T @ Vs[:, 0], self.Tfree.T @ AVstilde[:, 0])
-        else:
-            self.H = update_H(self.H, self.Tfree.T @ Vs, self.Tfree.T @ AVstilde)
+
+        Vs_free = self.Tfree.T @ Vs
+        AVstilde_free = self.Tfree.T @ AVstilde
+
+        self.H = update_H(self.H, Vs_free, AVstilde_free)
+
+        self.HPSB = update_H(self.HPSB, Vs_free, AVstilde_free, method='PSB')
+        self.HBFGS = update_H(self.HBFGS, Vs_free, AVstilde_free,
+                              method='BFGS')
+        self.HSR1 = update_H(self.HSR1, Vs_free, AVstilde_free, method='SR1')
+        self.HDFP = update_H(self.HDFP, Vs_free, AVstilde_free, method='DFP')
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)

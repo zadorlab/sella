@@ -6,32 +6,38 @@ import numpy as np
 
 from ase.optimize.optimize import Optimizer
 
-from .sella import MinModeAtoms
-from .optimize import rs_newton
+from .peswrapper import PESWrapper
+from .optimize import rs_newton, rs_rfo, rs_prfo
+
 
 class Sella(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
-                 master=None, force_consistent=False, r_trust=5e-4,
-                 inc_factr=1.1, dec_factr=0.9, dec_ratio=5.0, inc_ratio=1.01,
-                 order=1, eig=True, dxL=1e-4, mmkwargs=None, **kwargs):
-        Optimizer.__init__(self, atoms, restart, logfile, None, master, force_consistent)
-        self.mm = MinModeAtoms(atoms, atoms.calc, trajectory=trajectory, **kwargs)
-        self.atoms = self.mm.atoms  # override assignment from Optimizer.__init__
-        self.r_trust = r_trust * len(self.mm.x_m)
-        self.sinc = inc_factr
-        self.sdec = dec_factr
-        self.Qinc = inc_ratio
-        self.Qdec = dec_ratio
+                 master=None, force_consistent=False, delta0=1.3e-3,
+                 sigma_inc=1.15, sigma_dec=0.65, rho_dec=5.0, rho_inc=1.035,
+                 order=1, eig=True, dxL=1e-4, peskwargs=None, method='rsprfo',
+                 gamma=0.4, **kwargs):
+        Optimizer.__init__(self, atoms, restart, logfile, None, master,
+                           force_consistent)
+        self.pes = PESWrapper(atoms, atoms.calc, trajectory=trajectory,
+                              **kwargs)
+        self.delta = delta0 * len(self.pes.x_m)
+        self.sigma_inc = sigma_inc
+        self.sigma_dec = sigma_dec
+        self.rho_inc = rho_inc
+        self.rho_dec = rho_dec
         self.ord = order
         self.eig = eig
         self.dxL = dxL
-        self.r_trust_min = self.dxL
-        if mmkwargs is None:
-            self.mmkwargs = dict(dxL=self.dxL)
+        self.delta_min = self.dxL
+        self.niter = 0
+        if peskwargs is None:
+            self.peskwargs = dict(dxL=self.dxL, gamma=gamma)
         else:
-            self.mmkwargs = mmkwargs
-            if 'dxL' not in self.mmkwargs:
-                self.mmkwargs['dxL'] = self.dxL
+            self.peskwargs = peskwargs
+            if 'dxL' not in self.peskwargs:
+                self.peskwargs['dxL'] = self.dxL
+            if 'gamma' not in self.peskwargs:
+                self.peskwargs['gamma'] = gamma
 
         if self.ord != 0 and not self.eig:
             warnings.warn("Saddle point optimizations with eig=False will "
@@ -40,28 +46,44 @@ class Sella(Optimizer):
 
         self.initialized = False
         self.xi = 1.
-
+        self.method = method
+        if self.method not in ['gmtrm', 'rsrfo', 'rsprfo']:
+            raise ValueError('Unknown method:', method)
 
     def step(self):
         if not self.initialized:
-            f, self.glast, _ = self.mm.kick(np.zeros_like(self.mm.x_m))
+            f, self.glast, _ = self.pes.kick(np.zeros_like(self.pes.x_m))
             if self.eig:
-                self.mm.f_minmode(**self.mmkwargs)
+                self.pes.diag(**self.peskwargs)
             self.initialized = True
 
         # Find new search step
-        dx, dx_mag, self.xi, bound_clip = rs_newton(self.mm, self.glast, self.r_trust, self.ord, self.xi)
+        if self.method == 'gmtrm':
+            s, smag, self.xi, bound_clip = rs_newton(self.pes, self.glast,
+                                                     self.delta, self.ord,
+                                                     self.xi)
+        elif self.method == 'rsrfo':
+            s, smag, self.xi, bound_clip = rs_rfo(self.pes, self.glast,
+                                                  self.delta, self.ord,
+                                                  self.xi)
+        elif self.method == 'rsprfo':
+            s, smag, self.xi, bound_clip = rs_prfo(self.pes, self.glast,
+                                                   self.delta, self.ord,
+                                                   self.xi)
+        else:
+            raise RuntimeError("Don't know what to do for method", self.method)
 
         # Determine if we need to call the eigensolver, then step
-        ev = (self.eig and self.mm.lams is not None
-                  and np.any(self.mm.lams[:self.ord] > 0))
-        f, self.glast, dx = self.mm.kick(dx, ev, **self.mmkwargs)
+        ev = (self.eig and self.pes.lams is not None
+              and np.any(self.pes.lams[:self.ord] > 0))
+        f, self.glast, dx = self.pes.kick(s, ev, **self.peskwargs)
+        self.niter += 1
 
         # Update trust radius
-        ratio = self.mm.ratio
-        if ratio is None:
-            ratio = 1.
-        if ratio < 1./self.Qdec or ratio > self.Qdec:
-            self.r_trust = max(dx_mag * self.sdec, self.r_trust_min)
-        elif 1./self.Qinc < ratio < self.Qinc:
-            self.r_trust = max(self.sinc * dx_mag, self.r_trust)
+        rho = self.pes.ratio
+        if rho is None:
+            rho = 1.
+        if rho < 1./self.rho_dec or rho > self.rho_dec:
+            self.delta = max(smag * self.sigma_dec, self.delta_min)
+        elif 1./self.rho_inc < rho < self.rho_inc:
+            self.delta = max(self.sigma_inc * smag, self.delta)

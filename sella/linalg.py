@@ -4,6 +4,7 @@ import numpy as np
 
 from scipy.sparse.linalg import LinearOperator
 
+
 class MatrixWrapper(LinearOperator):
     def __init__(self, A):
         self.shape = A.shape
@@ -59,19 +60,27 @@ class NumericalHessian(MatrixWrapper):
         # direction which brings the current coordinates projected onto
         # the displacement vector closer to "0". If the displacement
         # vector is orthogonal to both the gradient and the coordinate
-        # vector then... well... just use the sign of v as provided.
-        # We can't possibly enumerate a comprehensive and consistent
-        # set of criteria for choosing a sign in all possible circumstances.
+        # vector, then choose whatever direction makes the first nonzero
+        # element of the displacement positive.
         #
         # Note that these are completely arbitrary criteria for choosing
         # displacement direction. We are just trying to be as consistent
         # as possible for numerical stability and reproducibility reasons.
 
         vdotg = v.ravel() @ self.g0
+        vdotx = v.ravel() @ self.x0
         if abs(vdotg) > 1e-4:
             sign = 2. * (vdotg < 0) - 1.
+        elif abs(vdotx) > 1e-4:
+            sign = 2. * (vdotx < 0) - 1.
         else:
-            sign = 2. * (v.ravel() @ self.x0 <= 0.) - 1.
+            for vi in v.ravel():
+                if vi > 1e-4:
+                    sign = 1.
+                    break
+                elif vi < -1e-4:
+                    sign = -1.
+                    break
 
         vnorm = np.linalg.norm(v) * sign
         _, gplus = self.func(self.x0 + self.dxL * v.ravel() / vnorm)
