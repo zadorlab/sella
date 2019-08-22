@@ -30,10 +30,17 @@ dyn = Sella(slab,
 dyn.run(1e-3, 1000)
 ```
 
-Additional documentation forthcoming. All interfaces likely to change.
-
 If you are using Sella or you wish to use Sella, let me know!
 
-# Acknowledgments
+## Documentation
+
+For more information on how to use Sella, please check the [wiki](https://github.com/zadorlab/sella/wiki).
+
+## Support
+
+If you need help using Sella, please visit our [gitter support channel](https://gitter.im/zadorlab/sella),
+or open a GitHub issue.
+
+## Acknowledgments
 
 This work was supported by the U.S. Department of Energy, Office of Science, Basic Energy Sciences, Chemical Sciences, Geosciences and Biosciences Division, as part of the Computational Chemistry Sciences Program.
