@@ -288,10 +288,10 @@ class PESWrapper(object):
         vreftol = kwargs.pop('vreftol', 0.99)
         if vref is not None and not shift:
             vref = self.Tm.T @ vref
-        update = kwargs.pop('update', 'jd_alt')
+        method = kwargs.pop('method', 'jd0')
         lams, Vs, AVs = self.eigensolver(Hproj, gamma, Pproj, v0=v0,
                                          vref=vref, vreftol=vreftol,
-                                         update=update, maxiter=maxiter)
+                                         method=method, maxiter=maxiter)
         self.x = x_orig
 
         if not shift:

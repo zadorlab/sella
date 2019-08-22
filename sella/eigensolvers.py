@@ -237,7 +237,7 @@ def davidson(A, gamma, P, v0=None, vref=None, vreftol=0.99, refine=False,
 
 
 def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
-                  update='jd_alt', maxiter=None):
+                  method='jd0', maxiter=None):
     n, _ = A.shape
     if maxiter is None:
         maxiter = 2 * n + 1
@@ -296,7 +296,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
         else:
             return lams, V, AV
 
-        t = expand(V, Ytilde, P, lams, vecs, thetai, update, seeking)
+        t = expand(V, Ytilde, P, lams, vecs, thetai, method, seeking)
         t /= np.linalg.norm(t)
         if np.linalg.norm(t - V @ V.T @ t) < 1e-2:
             # Do Lanczos instead
@@ -319,7 +319,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
         return lams, V, AV
 
 
-def expand(V, Y, P, lams, vecs, shift, method='jd_alt', seeking=0):
+def expand(V, Y, P, lams, vecs, shift, method='jd0', seeking=0):
     d, n = V.shape
     R = Y @ vecs - V @ vecs * lams[np.newaxis, :]
     I = np.eye(d)
@@ -328,33 +328,35 @@ def expand(V, Y, P, lams, vecs, shift, method='jd_alt', seeking=0):
     Pshift = P - shift * I
     if method == 'lanczos':
         return R[:, seeking]
-    elif method == 'davidson':
+    elif method == 'gd':
         return np.linalg.solve(Pshift, R[:, seeking])
-    elif method == 'jacobi_davidson':
+    elif method == 'jd0_alt':
         vi = V @ vecs[:, seeking]
         Pprojr = solve(Pshift, R[:, seeking])
         Pprojv = solve(Pshift, vi)
         alpha = vi.T @ Pprojr / (vi.T @ Pprojv)
         return Pprojv * alpha - Pprojr
-    elif method == 'jd_alt':
+    elif method == 'jd0':
         vi = V @ vecs[:, seeking]
         Aaug = np.block([[Pshift, vi[:, np.newaxis]], [vi, 0]])
         raug = np.zeros(d + 1)
         raug[:d] = R[:, seeking]
         z = solve(Aaug, -raug)
         return z[:d]
-    elif method == 'modified_jacobi_davidson':
+    elif method == 'mjd0_alt':
         Pprojr = solve(Pshift, R[:, seeking])
         PprojV = solve(Pshift, V @ vecs)
         alpha = solve((V @ vecs).T @ PprojV, (V @ vecs).T @ Pprojr)
         return solve(Pshift, ((V @ vecs) @ alpha - R[:, seeking]))
-    elif method == 'mod_jd_alt':
+    elif method == 'mjd0':
         Vrot = V @ vecs
         Aaug = np.block([[Pshift, Vrot], [Vrot.T, np.zeros((n, n))]])
         raug = np.zeros(d + n)
         raug[:d] = R[:, seeking]
         z = solve(Aaug, -raug)
         return z[:d]
+    else:
+        raise ValueError("Unknown diagonalization method {}".format(method))
 
 
 def spam(A, gamma, P, vref=None):
