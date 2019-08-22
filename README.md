@@ -42,3 +42,7 @@ x1 = optimize(myminmode,    # Your MinMode object
 Additional documentation forthcoming. All interfaces likely to change.
 
 If you are using Sella or you wish to use Sella, let me know!
+
+# Acknowledgments
+
+This work was supported by the U.S. Department of Energy, Office of Science, Basic Energy Sciences, Chemical Sciences, Geosciences and Biosciences Division, as part of the Computational Chemistry Sciences Program.
