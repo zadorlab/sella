@@ -33,6 +33,9 @@ else:
 with open('README.md', 'r') as f:
     long_description = f.read()
 
+with open('requirements.txt', 'r') as f:
+    install_requires = f.read().strip().split()
+
 setup(name='Sella',
       version='0.1.0',
       author='Eric Hermes',
@@ -55,5 +58,5 @@ setup(name='Sella',
                    'Topic :: Scientific/Engineering :: Mathematics',
                    'Topic :: Scientific/Engineering :: Physics'],
       python_requires='>=3.5',
-      install_requires=['numpy>=1.14.0', 'scipy>=1.1.0', 'cython', 'ase'],
+      install_requires=install_requires,
       )
