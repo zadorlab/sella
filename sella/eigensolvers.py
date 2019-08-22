@@ -147,10 +147,10 @@ def davidson(A, gamma, P, v0=None, vref=None, vreftol=0.99, refine=False,
 
     AV = A.dot(V)
 
-    method = 2
+    symm = 2
     seeking = 0
     while True:
-        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=symm))
         lams, vecs = eigh(Atilde, V.T @ V)
         nneg = min(V.shape[1], max(2, np.sum(lams < 0) + 1))
         # Rotate our subspace V to be diagonal in A.
@@ -170,7 +170,7 @@ def davidson(A, gamma, P, v0=None, vref=None, vreftol=0.99, refine=False,
                       np.abs(v0 @ x0) / np.linalg.norm(v0))
                 return lams, V, AV
 
-        Ytilde = symmetrize_Y(V, AV, symm=method)
+        Ytilde = symmetrize_Y(V, AV, symm=symm)
         R = (Ytilde @ vecs[:, :nneg]
              - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg])
         Rnorm = np.linalg.norm(R, axis=0)
@@ -255,10 +255,10 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
 
     AV = A.dot(V)
 
-    method = 2
+    symm = 2
     seeking = 0
     while True:
-        Atilde = V.T @ (symmetrize_Y(V, AV, symm=method))
+        Atilde = V.T @ (symmetrize_Y(V, AV, symm=symm))
         lams, vecs = eigh(Atilde, V.T @ V)
         nneg = max(1, np.sum(lams < 0))
         # Rotate our subspace V to be diagonal in A.
@@ -269,7 +269,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
         if V.shape[1] >= maxiter:
             return lams, V, AV
 
-        Ytilde = symmetrize_Y(V, AV, symm=method)
+        Ytilde = symmetrize_Y(V, AV, symm=symm)
         R = (Ytilde @ vecs[:, :nneg]
              - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg])
         Rnorm = np.linalg.norm(R, axis=0)
