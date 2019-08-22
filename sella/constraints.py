@@ -57,7 +57,7 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
     nconstraints = 0
 
     con_ase = _ase_constraints_to_dict(atoms.constraints)
-    for kind in ['bond', 'angles', 'dihedrals']:
+    for kind in ['bonds', 'angles', 'dihedrals']:
         for i, indices in enumerate(con_ase.get(kind, [])):
             if indices[0] > indices[-1]:
                 con_ase[kind][i] = tuple(reversed(indices))
