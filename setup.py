@@ -37,7 +37,7 @@ with open('requirements.txt', 'r') as f:
     install_requires = f.read().strip().split()
 
 setup(name='Sella',
-      version='0.1.0',
+      version='0.1.1',
       author='Eric Hermes',
       author_email='ehermes@sandia.gov',
       long_description=long_description,
