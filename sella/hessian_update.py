@@ -4,7 +4,7 @@ from __future__ import division
 
 import numpy as np
 
-from scipy.linalg import eigh, lstsq, expm
+from scipy.linalg import eigh, lstsq, solve
 
 from .cython_routines import symmetrize_Y2
 
@@ -22,7 +22,7 @@ def symmetrize_Y(S, Y, symm):
         raise ValueError("Unknown symmetrization method {}".format(symm))
 
 
-def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
+def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
     if len(S.shape) == 1:
         if np.linalg.norm(S) < 1e-8:
             return B
@@ -68,6 +68,8 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
         Bplus = _MS_Greenstadt(B, S, Ytilde)
     elif method == 'TS-Greenstadt':
         Bplus = _MS_TS_Greenstadt(B, S, Ytilde)
+    elif method == 'test':
+        Bplus = _MS_test(B, S, Ytilde, lams, vecs)
     else:
         raise ValueError('Unknown update method {}'.format(method))
 
@@ -78,61 +80,76 @@ def update_H(B, S, Y, method='BFGS_auto', symm=2, lams=None, vecs=None):
 
 
 def _MS_BFGS(B, S, Y):
-    return Y @ lstsq(Y.T @ S, Y.T)[0] - B @ S @ lstsq(S.T @ B @ S, S.T @ B)[0]
+    return Y @ solve(Y.T @ S, Y.T) - B @ S @ solve(S.T @ B @ S, S.T @ B)
+
 
 def _MS_TS_BFGS(B, S, Y, lams, vecs):
     J = Y - B @ S
     X1 = S.T @ Y @ Y.T
     absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))
     X2 = S.T @ absBS @ absBS.T
-    U = lstsq((X1 + X2) @ S, X1 + X2)[0].T
+    U = solve((X1 + X2) @ S, X1 + X2).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
 
 def _MS_PSB(B, S, Y):
     J = Y - B @ S
-    U = lstsq(S.T @ S, S.T)[0].T
+    U = solve(S.T @ S, S.T).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
+
 def _MS_DFP(B, S, Y):
     J = Y - B @ S
-    U = lstsq(S.T @ Y, Y.T)[0].T
+    U = solve(S.T @ Y, Y.T).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
 
 def _MS_TS_DFP(B, S, Y, lams, vecs):
     J = Y - B @ S
     MS = Y @ Y.T @ S
-    U = lstsq(S.T @ MS, MS.T)[0].T
+    U = solve(S.T @ MS, MS.T).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
+
 def _MS_SR1(B, S, Y):
     YBS = Y - B @ S
-    return YBS @ lstsq(YBS.T @ S, YBS.T)[0]
+    return YBS @ solve(YBS.T @ S, YBS.T)
+
 
 def _MS_Greenstadt(B, S, Y):
     J = Y - B @ S
     MS = B @ S
-    U = lstsq(S.T @ MS, MS.T)[0].T
+    U = solve(S.T @ MS, MS.T).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
 
 def _MS_TS_Greenstadt(B, S, Y):
     J = Y - B @ S
     lams, vecs = eigh(B)
     MS = vecs @ (np.abs(lams)[:, np.newaxis] * vecs.T @ S)
-    U = lstsq(S.T @ MS, MS.T)[0].T
+    U = solve(S.T @ MS, MS.T).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
+
 def _MS_test(B, S, Y, lams, vecs):
-    J = Y - B @ S
-    M = expm(-Y @ Y.T - B @ S @ S.T @ B)
-    U = lstsq(S.T @ M @ S, S.T @ M)[0].T
+    Binv = np.linalg.inv(B)
+    Binvlams, _ = eigh(Binv)
+    J = Binv @ Y - S
+    MY = S
+    Ylams, _ = eigh(S.T @ Y, S.T @ S)
+    shift = min(0, sorted(1 / lams)[0])
+    MY -= 2.0 * shift * Y
+    U = solve(Y.T @ MY, MY.T).T
     UJT = U @ J.T
-    return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+    Binvplus = Binv - (UJT + UJT.T) + U @ (J.T @ Y) @ U.T
+    return np.linalg.inv(Binvplus) - B
+
 
 # Not a symmetric update, so not available my default
 def _MS_Powell(B, S, Y):

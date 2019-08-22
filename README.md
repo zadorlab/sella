@@ -9,7 +9,7 @@ An example script
 from ase.build import fcc111, add_adsorbate
 from ase.calculators.emt import EMT
 
-from sella import MinModeAtoms, optimize
+from sella import Sella
 
 # Set up your system as an ASE atoms object
 slab = fcc111('Cu', (5, 5, 6), vacuum=7.5)
@@ -20,23 +20,14 @@ add_adsorbate(slab, 'Cu', 2.0, 'bridge')
 fix = [atom.index for atom in slab if atom.position[2] < slab.cell[2, 2] / 2.]
 
 # Set up your calculator
-calc = EMT()
+slab.calc = EMT()
 
-# Create a Sella MinMode object
-myminmode = MinModeAtoms(slab,  # Your Atoms object
-                         calc,  # Your calculator
-                         constraints=dict(fix=fix),  # Your constraints
-                         trajectory='test_emt.traj',  # Optional trajectory
-                         )
+# Set up a Sella Dynamics object
+dyn = Sella(slab,
+            constraints=dict(fix=fix),
+            trajectory='test_emt.traj')
 
-x1 = optimize(myminmode,    # Your MinMode object
-              maxiter=500,  # Maximum number of force evaluations
-              ftol=1e-3,    # Norm of the force vector, convergence threshold
-              r_trust=5e-4, # Initial trust radius (Angstrom per d.o.f.)
-              order=1,      # Order of saddle point to find (set to 0 for minimization)
-              dxL=1e-4,     # Finite difference displacement magnitude (Angstrom)
-              maxres=0.1,   # Maximum residual for eigensolver convergence (should be <= 1)
-              )
+dyn.run(1e-3, 1000)
 ```
 
 Additional documentation forthcoming. All interfaces likely to change.

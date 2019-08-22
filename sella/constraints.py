@@ -3,6 +3,9 @@ import warnings
 import numpy as np
 from scipy.linalg import null_space
 
+from ase.constraints import (FixCartesian, FixAtoms, FixBondLengths,
+                             FixInternals)
+
 from .cython_routines import modified_gram_schmidt
 from .internal_cython import cart_to_internal
 
@@ -13,17 +16,74 @@ def _sort_indices(indices):
     return indices
 
 
+def _ase_constraints_to_dict(constraints):
+    fix = set()
+    bonds = set()
+    angles = set()
+    dihedrals = set()
+    for constraint in constraints:
+        if isinstance(constraint, FixAtoms):
+            fix.update(set(constraint.index))
+        elif isinstance(constraint, FixCartesian):
+            idx = constraint.a
+            if idx in fix:
+                continue
+            for i, xyz in enumerate(constraint.mask):
+                if xyz:
+                    fix.add((idx, i))
+        elif isinstance(constraint, FixBondLengths):
+            bonds.update(set(constraint.pairs))
+        elif isinstance(constraint, FixInternals):
+            bonds.update(set(constraints.bonds))
+            angles.update(set(constraints.angles))
+            dihedrals.update(set(constraints.dihedrals))
+        else:
+            raise ValueError("Sella does not know how to handle the ASE {} "
+                             "constraint object!".format(constraint))
+    con = dict()
+    if fix:
+        con['fix'] = list(fix)
+    if bonds:
+        con['bonds'] = list(bonds)
+    if angles:
+        con['angles'] = list(angles)
+    if dihedrals:
+        con['dihedrals'] = list(dihedrals)
+    return con
+
+
 def initialize_constraints(atoms, pos0, conin, p_t, p_r):
     constraints = dict()
     nconstraints = 0
+
+    con_ase = _ase_constraints_to_dict(atoms.constraints)
+    for kind in ['bonds', 'angles', 'dihedrals']:
+        for i, indices in enumerate(con_ase.get(kind, [])):
+            if indices[0] > indices[-1]:
+                con_ase[kind][i] = tuple(reversed(indices))
+
     # Make a copy, because we are going to be popping entries
     # off the object to ensure that we've parsed everything,
     # and we don't want to modify the user-provided object,
     # since they might have other plans for it!
     if conin is None:
-        con = dict()
+        con = con_ase
     else:
+        if con_ase:
+            warnings.warn("Constraints have been specified to Sella, but "
+                          "the ASE Atoms object also has constraints "
+                          "attached. These constraints will be merged, "
+                          "but any constraint that has been specified "
+                          "in both ways will result in a runtime failure. "
+                          "Consider removing all ASE constraints and "
+                          "instead specify all constraints to Sella "
+                          "directly.")
         con = conin.copy()
+        for key, val in con_ase.items():
+            if key not in con:
+                con[key] = val
+            else:
+                con[key] += val
 
     # First, consider fixed atoms
     # Note that unlike other constraints, we do not allow the user
@@ -61,7 +121,7 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
                 # the user.
                 axis = target - rot_center
                 axis /= np.linalg.norm(axis)
-                if 1 - np.abs(axis @ self.rot_axes) > 1e-2:
+                if 1 - np.abs(axis @ rot_axes) > 1e-2:
                     warnings.warn("At least 3 non-collinear atoms are "
                                   "fixed, but projection of rotational "
                                   "modes has been requested. This is "
@@ -80,7 +140,7 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
                               "not been tested!\n "
                               "Proceed at your own risk.")
             index, dim = arg
-            fix[(index, dim)] = ipos
+            fix[(index, dim)] = pos0[index, dim]
             fixed_dims[dim] = False
 
     constraints['fix'] = fix
@@ -157,7 +217,6 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
 def calc_constr_basis(atoms, con, ncon, rot_center, rot_axes):
     d = 3 * len(atoms)
     pos = atoms.get_positions()
-    #pos = x.reshape((-1, 3))
 
     # If we don't have any constraints, then this is a very
     # easy task.
