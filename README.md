@@ -1,3 +1,5 @@
+[![Gitter chat](https://badges.gitter.im/gitterHQ/gitter.png)](https://gitter.im/zadorlab/sella)
+
 # Sella
 
 Sella is a utility for finding first order saddle points
