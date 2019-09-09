@@ -8,6 +8,8 @@ import numpy as np
 from scipy.linalg import eigh
 
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.units import Bohr
+from ase.io import Trajectory
 
 def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     lams = pes.lams
@@ -34,18 +36,12 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     Hproj = (vecs @ vecs.T) @ pes.H @ (vecs @ vecs.T)
 
     for _ in range(100):
-        #if xiupper is None:
-        #    xi *= 2
-        #else:
-        #    xi = (xilower + xiupper) / 2.
         T0 = np.linalg.inv(Hproj + xi * W)
         eps = -T0 @ (g + xi * Wd1)
         deps = -(T0 @ W @ (d1 + eps))
 
-        #eps = -vecs @ ((Vg + xi * Vd1) / (L + xi * Vw))
         dxw = (d1 + eps) * sqrtm
         dxwmag = np.linalg.norm(dxw)
-        #print(xi, dxwmag, dx, xiupper, xilower)
         if abs(dxwmag - dx) < 1e-14 * dx:
             break
         dmagdxi = 2 * (d1 + eps) @ W @ deps
@@ -68,18 +64,13 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
                 xi = (xiupper + xilower) / 2.
         else:
             xi = xi1
-
-        #if dxwmag > dx:
-        #    xilower = xi
-        #else:
-        #    xiupper = xi
     else:
         raise RuntimeError("IRC Newton step failed!")
 
     return eps, xi, True
 
 
-def irc(pes, maxiter, ftol, dx=0.1, direction='both', diag=True, **kwargs):
+def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', diag=True, **kwargs):
     try:
         from ase.data import atomic_masses_common
     except ImportError:
@@ -100,7 +91,11 @@ def irc(pes, maxiter, ftol, dx=0.1, direction='both', diag=True, **kwargs):
     calc = SinglePointCalculator(conf, **pes.atoms.calc.results)
     conf.set_calculator(conf)
     path = [conf]
-    f1, g1, _ = pes.kick(np.zeros_like(x))
+    f1, g1 = pes.evaluate(pes.x.copy())
+
+    if direction in ['forward', 'reverse']:
+        traj = Trajectory('sella_irc_{}.traj'.format(direction), 'w', pes.atoms)
+        traj.write(pes.atoms, energy=f1, forces=-g1.reshape((-1, 3)))
 
     if diag:
         pes.diag(**kwargs)
@@ -113,12 +108,13 @@ def irc(pes, maxiter, ftol, dx=0.1, direction='both', diag=True, **kwargs):
         x0 = pes.x.copy()
         H = pes.H.copy()
         last = pes.last.copy()
-        fpath = irc(pes, maxiter, ftol, dx, 'forward', diag=False, **kwargs)
+        fpath = irc(pes, maxiter, ftol, dx=dx, direction='forward', diag=False, **kwargs)
         pes.x = x0
         pes.H = H
         pes.last = last
-        rpath = irc(pes, maxiter, ftol, dx, 'reverse', diag=False, **kwargs)
+        rpath = irc(pes, maxiter, ftol, dx=dx, direction='reverse', diag=False, **kwargs)
         return list(reversed(fpath)) + rpath[1:]
+
 
     # Square root of the mass array, not to be confused with
     # scipy.linalg.sqrtm, the matrix square root function.
@@ -136,36 +132,46 @@ def irc(pes, maxiter, ftol, dx=0.1, direction='both', diag=True, **kwargs):
     xi = 1.
 
     # Outer loop finds all points along the MEP
+    converged = False
     while True:
         # Back up current geometry and projection matrix, Tm
         Tm = pes.Tm.copy()
         x0 = pes.x.copy()
-        f1, g1 = pes.evaluate(x0 + d1)
+        g1 = None
         # Inner loop optimizes each individual point along the MEP
         for _ in range(100):
-            eps, xi, bound_clip = rs_newton_irc(pes, sqrtm, g1, d1, dx, xi)
-            epsnorm = np.linalg.norm(eps)
-            #if epsnorm < 1e-4:
-            #    break
-            d1 += eps
+            if g1 is not None:
+                eps, xi, bound_clip = rs_newton_irc(pes, sqrtm, g1, d1, dx, xi)
+                epsnorm = np.linalg.norm(eps)
+                d1 += eps
+            else:
+                epsnorm = np.linalg.norm(d1)
+                bound_clip = True
             f1, g1 = pes.evaluate(x0 + d1)
+
+            if np.linalg.norm(g1) < ftol and pes.lams[0] > 0:
+                print('IRC done')
+                converged = True
+                break
+
             d1m = d1 * sqrtm
             g1m = ((Tm @ Tm.T) @ g1) / sqrtm
             dot = np.abs(d1m @ g1m) / (np.linalg.norm(d1m) * np.linalg.norm(g1m))
             print('Epsnorm is {}, dot product is {}'.format(epsnorm, dot))
-            if bound_clip and abs(1 - dot) < 1e-4:
-                break
-            elif not bound_clip and np.linalg.norm(g1) < ftol:
+            if bound_clip and abs(1 - dot) < irctol:
+                print('Found new point on IRC')
                 break
         else:
             raise RuntimeError("Inner IRC loop failed to converge")
-        g1w = g1 / sqrtm
-        d1w = -dx * g1w / np.linalg.norm(g1w)
-        d1 = d1w / sqrtm
+        traj.write(pes.atoms, energy=f1, forces=-g1.reshape((-1, 3)))
 
         conf = pes.atoms.copy()
         calc = SinglePointCalculator(conf, **pes.atoms.calc.results)
         conf.set_calculator(calc)
         path.append(conf)
-        if np.all(pes.lams > 0) and pes.converged(ftol):
+        if converged:
             return path
+
+        g1w = g1 / sqrtm
+        d1w = -dx * g1w / np.linalg.norm(g1w)
+        d1 = d1w / sqrtm
