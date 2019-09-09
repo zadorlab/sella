@@ -16,10 +16,14 @@ class Sella(Optimizer):
                  sigma_inc=1.15, sigma_dec=0.65, rho_dec=5.0, rho_inc=1.035,
                  order=1, eig=True, eta=1e-4, peskwargs=None, method='rsprfo',
                  gamma=0.4, constraints_tol=1e-5, **kwargs):
+        if isinstance(atoms, PESWrapper):
+            self.pes = atoms
+            atoms = self.pes.atoms
+        else:
+            self.pes = PESWrapper(atoms, atoms.calc, trajectory=trajectory,
+                                  **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, None, master,
                            force_consistent)
-        self.pes = PESWrapper(atoms, atoms.calc, trajectory=trajectory,
-                              **kwargs)
         self.delta = delta0 * len(self.pes.x_m)
         self.sigma_inc = sigma_inc
         self.sigma_dec = sigma_dec
