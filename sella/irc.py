@@ -162,10 +162,7 @@ class IRC(Optimizer):
             g1m = ((Tm @ Tm.T) @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
-            print('Epsnorm is {}, dot product is {}, bound clip?: {}'
-                  ''.format(epsnorm, dot, bound_clip))
             if bound_clip and abs(1 - dot) < self.irctol:
-                print('Found new point on IRC')
                 break
         else:
             raise RuntimeError("Inner IRC loop failed to converge")
