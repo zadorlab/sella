@@ -14,15 +14,11 @@ from ase.io import Trajectory
 def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     lams = pes.lams
     vecs = pes.Tm @ pes.vecs
-    mass = sqrtm**2
 
     L = np.abs(lams)
     Vg = vecs.T @ g
-    Vd1 = vecs.T @ (sqrtm**2 * d1)
-    Vw = vecs.T @ (sqrtm**2)
 
     W = np.diag(sqrtm**2)
-    Wg = W @ g
     Wd1 = W @ d1
 
     xilower = 0
@@ -33,12 +29,15 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     if np.linalg.norm(dxw) < dx:
         return eps, xi, False
 
-    Hproj = (vecs @ vecs.T) @ pes.H @ (vecs @ vecs.T)
+    Hproj = vecs @ np.diag(L) @ vecs.T
 
     for _ in range(100):
-        T0 = np.linalg.inv(Hproj + xi * W)
-        eps = -T0 @ (g + xi * Wd1)
-        deps = -(T0 @ W @ (d1 + eps))
+        Hshift = Hproj + xi * W
+        T0g = np.linalg.solve(Hshift, g)
+        T0W = np.linalg.solve(Hshift, W)
+        eps = -T0g - xi * T0W @ d1
+        deps = -T0W @ (d1 + eps)
+        #deps = -(T0 @ W @ (d1 + eps))
 
         dxw = (d1 + eps) * sqrtm
         dxwmag = np.linalg.norm(dxw)
@@ -70,7 +69,7 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     return eps, xi, True
 
 
-def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', diag=True, **kwargs):
+def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', **kwargs):
     try:
         from ase.data import atomic_masses_common
     except ImportError:
@@ -86,35 +85,17 @@ def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', diag=T
     if direction not in ['forward', 'reverse', 'both']:
         raise ValueError("Don't understand direction='{}'".format(direction))
 
-    x = pes.x_m.copy()
     conf = pes.atoms.copy()
     calc = SinglePointCalculator(conf, **pes.atoms.calc.results)
     conf.set_calculator(conf)
     path = [conf]
     f1, g1 = pes.evaluate(pes.x.copy())
 
-    if direction in ['forward', 'reverse']:
-        traj = Trajectory('sella_irc_{}.traj'.format(direction), 'w', pes.atoms)
-        traj.write(pes.atoms, energy=f1, forces=-g1.reshape((-1, 3)))
-
-    if diag:
-        pes.diag(**kwargs)
+    pes.diag(**kwargs)
 
     if np.linalg.norm(g1) > ftol:
         warnings.warn('Initial forces are greater than convergence tolerance! '
                       'Are you sure this is a transition state?')
-
-    if direction == 'both':
-        x0 = pes.x.copy()
-        H = pes.H.copy()
-        last = pes.last.copy()
-        fpath = irc(pes, maxiter, ftol, dx=dx, direction='forward', diag=False, **kwargs)
-        pes.x = x0
-        pes.H = H
-        pes.last = last
-        rpath = irc(pes, maxiter, ftol, dx=dx, direction='reverse', diag=False, **kwargs)
-        return list(reversed(fpath)) + rpath[1:]
-
 
     # Square root of the mass array, not to be confused with
     # scipy.linalg.sqrtm, the matrix square root function.
@@ -126,28 +107,51 @@ def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', diag=T
     d1w = dx * vecs[:, 0]
     d1 = d1w / sqrtm
 
-    if direction == 'reverse':
-        d1 *= -1
+    if direction == 'forward':
+        return _irc_half(pes, maxiter, ftol, d1, irctol, dx, sqrtm, 'forward')
+    elif direction == 'reverse':
+        return _irc_half(pes, maxiter, ftol, -d1, irctol, dx, sqrtm, 'reverse')
+    elif direction == 'both':
+        x0 = pes.x.copy()
+        last = pes.last.copy()
+        H = pes.H.copy()
+        path = list(reversed(_irc_half(pes, maxiter, ftol, d1, irctol, dx, sqrtm, 'forward')))
+        pes.x = x0
+        pes.last = last
+        pes.H = H
+        path += _irc_half(pes, maxiter, ftol, -d1, irctol, dx, sqrtm, 'reverse')[1:]
+        return path
 
-    xi = 1.
-
+def _irc_half(pes, maxiter, ftol, d1, irctol, dx, sqrtm, label='forward'):
+    traj = Trajectory('sella_irc_{}.traj'.format(label), 'w', pes.atoms)
+    f1 = pes.last['f']
+    g1 = pes.last['g']
+    traj.write(pes.atoms, energy=f1, forces=-g1.reshape((-1, 3)))
+    path = []
     # Outer loop finds all points along the MEP
+    xi = 1.
     converged = False
+    first = True
+    x0 = pes.x.copy()
     while True:
         # Back up current geometry and projection matrix, Tm
         Tm = pes.Tm.copy()
-        x0 = pes.x.copy()
-        g1 = None
         # Inner loop optimizes each individual point along the MEP
         for _ in range(100):
-            if g1 is not None:
+            #f1last, g1last, d1last = f1, g1.copy(), d1.copy()
+            if first:
+                epsnorm = np.linalg.norm(d1)
+                bound_clip = True
+                first = False
+            else:
                 eps, xi, bound_clip = rs_newton_irc(pes, sqrtm, g1, d1, dx, xi)
                 epsnorm = np.linalg.norm(eps)
                 d1 += eps
-            else:
-                epsnorm = np.linalg.norm(d1)
-                bound_clip = True
+                #d1 = (Tm @ Tm.T) @ (d1 + eps)
             f1, g1 = pes.evaluate(x0 + d1)
+            #if f1 > f1last:
+            #    f1, g1, d1 = f1last, g1last.copy(), d1last.copy()
+            #    continue
 
             if np.linalg.norm(g1) < ftol and pes.lams[0] > 0:
                 print('IRC done')
@@ -157,7 +161,7 @@ def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', diag=T
             d1m = d1 * sqrtm
             g1m = ((Tm @ Tm.T) @ g1) / sqrtm
             dot = np.abs(d1m @ g1m) / (np.linalg.norm(d1m) * np.linalg.norm(g1m))
-            print('Epsnorm is {}, dot product is {}'.format(epsnorm, dot))
+            print('Epsnorm is {}, dot product is {}, bound clip?: {}'.format(epsnorm, dot, bound_clip))
             if bound_clip and abs(1 - dot) < irctol:
                 print('Found new point on IRC')
                 break
@@ -172,6 +176,7 @@ def irc(pes, maxiter, ftol, irctol=1e-4, dx=0.2 * Bohr, direction='both', diag=T
         if converged:
             return path
 
+        x0 += d1
         g1w = g1 / sqrtm
         d1w = -dx * g1w / np.linalg.norm(g1w)
         d1 = d1w / sqrtm
