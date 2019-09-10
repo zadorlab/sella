@@ -9,43 +9,45 @@ from scipy.linalg import eigh
 
 from sella.peswrapper import PESWrapper
 
-from ase.calculators.singlepoint import SinglePointCalculator
-from ase.units import Bohr
-from ase.io import Trajectory
 from ase.optimize.optimize import Optimizer
 
 
 def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
-    lams = pes.lams
-    vecs = pes.Tm @ pes.vecs
+    Lcart = pes.lams
+    vecscart = pes.Tm @ pes.vecs
 
-    L = np.abs(lams)
-    Vg = vecs.T @ g
-
-    W = np.diag(sqrtm**2)
-
-    xilower = 0
-    xiupper = None
-
-    eps = -vecs @ (Vg / L)
-    dxw = (d1 + eps) * sqrtm
-    if np.linalg.norm(dxw) < dx:
-        return eps, xi, False
-
-    Hproj = vecs @ np.diag(L) @ vecs.T
-    Hmw = Hproj / np.outer(sqrtm, sqrtm)
-    lams, vecs = eigh(Hmw)
-    L = np.abs(lams)
+    Hmw = (vecscart @ np.diag(Lcart) @ vecscart.T) / np.outer(sqrtm, sqrtm)
+    L, vecs = eigh(Hmw)
 
     gmw = g / sqrtm
     d1mw = d1 * sqrtm
     Vg = vecs.T @ gmw
     Vd1 = vecs.T @ d1mw
 
+    # Only do "naive" check if Hessian is p.d.
+    if Lcart[0] > 0:
+        epsmw = -vecs @ (Vg / L)
+        d2mw = d1mw + epsmw
+        d2mw_mag = np.linalg.norm(d2mw)
+        if d2mw_mag < dx:
+            eps = epsmw / sqrtm
+            return eps, xi, False
+
+    # use nextafter to avoid division by zero if xi is ever set equal
+    # to xilower
+    if Lcart[0] < 0 and L[0] < 0:
+        xi0 = np.nextafter(-L[0], np.infty)
+    else:
+        xi0 = 0.
+    xi += xi0
+    xilower = xi0
+    xiupper = None
+
     for _ in range(100):
         epsmw = -vecs @ ((Vg + xi * Vd1) / (L + xi))
         d2mw = d1mw + epsmw
         d2mw_mag = np.linalg.norm(d2mw)
+        print('innermost:', xi, xilower, xiupper, d2mw_mag, dx)
 
         if abs(d2mw_mag - dx) < 1e-14 * dx:
             break
@@ -74,7 +76,7 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
         raise RuntimeError("IRC Newton step failed!")
     eps = epsmw / sqrtm
 
-    return eps, xi, True
+    return eps, xi - xi0, True
 
 
 class IRC(Optimizer):
@@ -168,6 +170,7 @@ class IRC(Optimizer):
             g1m = ((Tm @ Tm.T) @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
+            print('middle:', epsnorm, dot)
             if bound_clip and abs(1 - dot) < self.irctol:
                 print('Inner IRC step converged in {} iteration(s)'
                       ''.format(n + 1))
