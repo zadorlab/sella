@@ -33,20 +33,25 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
         return eps, xi, False
 
     Hproj = vecs @ np.diag(L) @ vecs.T
+    Hmw = Hproj / np.outer(sqrtm, sqrtm)
+    lams, vecs = eigh(Hmw)
+    L = np.abs(lams)
+
+    gmw = g / sqrtm
+    d1mw = d1 * sqrtm
+    Vg = vecs.T @ gmw
+    Vd1 = vecs.T @ d1mw
 
     for _ in range(100):
-        Hshift = Hproj + xi * W
-        T0g = np.linalg.solve(Hshift, g)
-        T0W = np.linalg.solve(Hshift, W)
-        eps = -T0g - xi * T0W @ d1
-        deps = -T0W @ (d1 + eps)
+        epsmw = -vecs @ ((Vg + xi * Vd1) / (L + xi))
+        d2mw = d1mw + epsmw
+        d2mw_mag = np.linalg.norm(d2mw)
 
-        dxw = (d1 + eps) * sqrtm
-        dxwmag = np.linalg.norm(dxw)
-        if abs(dxwmag - dx) < 1e-14 * dx:
+        if abs(d2mw_mag - dx) < 1e-14 * dx:
             break
-        dmagdxi = 2 * (d1 + eps) @ W @ deps
-        dxi = (dx - dxwmag) / dmagdxi
+        depsmw = -vecs @ (Vd1 / (L + xi) - (Vg + xi * Vd1) / (L + xi)**2)
+        dd2mw_mag = (d2mw @ depsmw) / d2mw_mag
+        dxi = (dx - d2mw_mag) / dd2mw_mag
 
         if dxi < 0:
             xiupper = xi
@@ -67,6 +72,7 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
             xi = xi1
     else:
         raise RuntimeError("IRC Newton step failed!")
+    eps = epsmw / sqrtm
 
     return eps, xi, True
 
@@ -144,7 +150,7 @@ class IRC(Optimizer):
         x0 = self.pes.x.copy()
         Tm = self.pes.Tm.copy()
         g1 = self.pes.last['g']
-        for _ in range(100):
+        for n in range(100):
             if self.first:
                 epsnorm = np.linalg.norm(self.d1)
                 bound_clip = True
@@ -163,9 +169,12 @@ class IRC(Optimizer):
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
             if bound_clip and abs(1 - dot) < self.irctol:
+                print('Inner IRC step converged in {} iteration(s)'
+                      ''.format(n + 1))
                 break
         else:
             raise RuntimeError("Inner IRC loop failed to converge")
+
         g1w = g1 / self.sqrtm
         d1w = -self.dx * g1w / np.linalg.norm(g1w)
         self.d1 = d1w / self.sqrtm
