@@ -157,7 +157,6 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
 
     if rot_center is None:
         rot_center = center
-    print(center)
 
     # Next we look at the bonds
     con_b = con.pop('bonds', tuple())
