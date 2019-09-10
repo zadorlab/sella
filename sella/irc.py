@@ -15,34 +15,36 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     Hmw = (vecscart @ np.diag(Lcart) @ vecscart.T) / np.outer(sqrtm, sqrtm)
     L, vecs = eigh(Hmw)
 
+    # exclude indices corresponding to neglected
+    # translational/rotational modes
+    ind = []
+    for i, Li in enumerate(L):
+        if abs(Li) > 1e-8:
+            ind.append(i)
+
+    L = np.abs(L[ind])
+    vecs = vecs[:, ind]
+
     gmw = g / sqrtm
     d1mw = d1 * sqrtm
     Vg = vecs.T @ gmw
     Vd1 = vecs.T @ d1mw
 
-    # Only do "naive" check if Hessian is p.d.
-    if Lcart[0] > 0:
-        epsmw = -vecs @ (Vg / L)
-        d2mw = d1mw + epsmw
-        d2mw_mag = np.linalg.norm(d2mw)
-        if d2mw_mag < dx:
-            eps = epsmw / sqrtm
-            return eps, xi, False
+    epsmw = -vecs @ (Vg / L)
+    d2mw = d1mw + epsmw
+    d2mw_mag = np.linalg.norm(d2mw)
+    if d2mw_mag < dx:
+        eps = epsmw / sqrtm
+        return eps, xi, False
 
-    # use nextafter to avoid division by zero if xi is ever set equal
-    # to xilower
-    if Lcart[0] < 0 and L[0] < 0:
-        xi0 = np.nextafter(-L[0], np.infty)
-    else:
-        xi0 = 0.
-    xi += xi0
-    xilower = xi0
+    xilower = 0.
     xiupper = None
 
     for _ in range(100):
         epsmw = -vecs @ ((Vg + xi * Vd1) / (L + xi))
         d2mw = d1mw + epsmw
         d2mw_mag = np.linalg.norm(d2mw)
+        print('inner:', xi, xilower, xiupper, d2mw_mag, dx)
 
         if abs(d2mw_mag - dx) < 1e-14 * dx:
             break
@@ -71,7 +73,7 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
         raise RuntimeError("IRC Newton step failed!")
     eps = epsmw / sqrtm
 
-    return eps, xi - xi0, True
+    return eps, xi, True
 
 
 class IRC(Optimizer):
@@ -134,6 +136,7 @@ class IRC(Optimizer):
             self.d1 = self.v0ts.copy()
         elif direction == 'reverse':
             self.d1 = -self.v0ts.copy()
+        print('d1 is:', self.d1)
 
         self.first = True
         return Optimizer.irun(self, fmax, steps)
@@ -165,6 +168,7 @@ class IRC(Optimizer):
             g1m = ((Tm @ Tm.T) @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
+            print('middle:', epsnorm, dot)
             if bound_clip and abs(1 - dot) < self.irctol:
                 break
         else:
