@@ -73,7 +73,7 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
 
 class IRC(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
-                 master=None, force_consistent=False, irctol=1e-4, dx=0.1,
+                 master=None, force_consistent=False, irctol=1e-2, dx=0.1,
                  eta=1e-4, gamma=0.4, peskwargs=None, **kwargs):
         if isinstance(atoms, PESWrapper):
             self.pes = atoms
