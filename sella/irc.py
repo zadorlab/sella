@@ -44,7 +44,6 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
         epsmw = -vecs @ ((Vg + xi * Vd1) / (L + xi))
         d2mw = d1mw + epsmw
         d2mw_mag = np.linalg.norm(d2mw)
-        print('inner:', xi, xilower, xiupper, d2mw_mag, dx)
 
         if abs(d2mw_mag - dx) < 1e-14 * dx:
             break
@@ -136,7 +135,6 @@ class IRC(Optimizer):
             self.d1 = self.v0ts.copy()
         elif direction == 'reverse':
             self.d1 = -self.v0ts.copy()
-        print('d1 is:', self.d1)
 
         self.first = True
         return Optimizer.irun(self, fmax, steps)
@@ -168,7 +166,6 @@ class IRC(Optimizer):
             g1m = ((Tm @ Tm.T) @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
-            print('middle:', epsnorm, dot)
             if bound_clip and abs(1 - dot) < self.irctol:
                 break
         else:
