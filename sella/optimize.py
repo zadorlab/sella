@@ -209,6 +209,9 @@ def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
 def rs_prfo(pes, g, r_tr, order=1, alpha=0.5):
     lams = pes.lams
     vecs = pes.vecs
+    if lams is None:
+        lams = np.ones_like(g)
+        vecs = np.diag(lams)
 
     gmax = vecs[:, :order].T @ g
     gmin = vecs[:, order:].T @ g
