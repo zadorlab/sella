@@ -20,10 +20,6 @@ class PESWrapper(object):
                  v0=None, maxres=1e-5):
         self.atoms = atoms
         self.H = None
-        self.HPSB = None
-        self.HBFGS = None
-        self.HSR1 = None
-        self.HDFP = None
 
         # We don't want to pass the dummy atoms onto the calculator,
         # which might not know what to do with them, so we have a
@@ -229,11 +225,6 @@ class PESWrapper(object):
             dh_free = self.Tfree.T @ (h - self.last['h'])
             self.H = update_H(self.H, dx_free, dh_free)
 
-            self.HPSB = update_H(self.HPSB, dx_free, dh_free, method='PSB')
-            self.HBFGS = update_H(self.HBFGS, dx_free, dh_free, method='BFGS')
-            self.HSR1 = update_H(self.HSR1, dx_free, dh_free, method='SR1')
-            self.HDFP = update_H(self.HDFP, dx_free, dh_free, method='DFP')
-
         g_m = self.Tm.T @ g
         if self.H is not None:
             Tproj = self.Tm.T @ self.Tfree
@@ -308,12 +299,6 @@ class PESWrapper(object):
         AVstilde_free = self.Tfree.T @ AVstilde
 
         self.H = update_H(self.H, Vs_free, AVstilde_free)
-
-        self.HPSB = update_H(self.HPSB, Vs_free, AVstilde_free, method='PSB')
-        self.HBFGS = update_H(self.HBFGS, Vs_free, AVstilde_free,
-                              method='BFGS')
-        self.HSR1 = update_H(self.HSR1, Vs_free, AVstilde_free, method='SR1')
-        self.HDFP = update_H(self.HDFP, Vs_free, AVstilde_free, method='DFP')
 
     def converged(self, ftol):
         return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)

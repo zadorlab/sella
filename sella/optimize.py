@@ -141,7 +141,7 @@ def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
     if Hmm is None:
         Hmm = np.eye(len(g))
     else:
-        Hmm = pes.Tm.T @ Hmm @ pes.Tm
+        Hmm = (pes.Tm.T @ pes.Tfree) @ Hmm @ (pes.Tfree.T @ pes.Tm)
     H0 = np.block([[Hmm, g[:, np.newaxis]], [g, 0]])
     l, V = eigh(H0)
 
@@ -201,7 +201,6 @@ def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
         if np.nextafter(lower, upper) >= upper:
             # It is impossible to refine any further
             break
-    print(f'Took {n} iterations')
 
     return s, smag, alpha, True
 

@@ -4,33 +4,87 @@ import warnings
 
 import numpy as np
 
+from scipy.optimize.linesearch import scalar_search_wolfe1
+
 from ase.optimize.optimize import Optimizer
 
 from .peswrapper import PESWrapper
 from .optimize import rs_newton, rs_rfo, rs_prfo
 
+_default_kwargs = dict(minimum=dict(delta0=1e-1,
+                                    sigma_inc=1.15,
+                                    sigma_dec=0.90,
+                                    rho_inc=1.035,
+                                    rho_dec=100,
+                                    method='rsrfo',
+                                    eig=False),
+                       saddle=dict(delta0=1.3e-3,
+                                   sigma_inc=1.15,
+                                   sigma_dec=0.65,
+                                   rho_inc=1.035,
+                                   rho_dec=5.0,
+                                   method='rsprfo',
+                                   eig=True))
+
 
 class Sella(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
-                 master=None, force_consistent=False, delta0=1.3e-3,
-                 sigma_inc=1.15, sigma_dec=0.65, rho_dec=5.0, rho_inc=1.035,
-                 order=1, eig=True, eta=1e-4, peskwargs=None, method='rsprfo',
+                 master=None, force_consistent=False, delta0=None,
+                 sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
+                 order=1, eig=None, eta=1e-4, peskwargs=None, method=None,
                  gamma=0.4, constraints_tol=1e-5, **kwargs):
+        if order == 0:
+            default = _default_kwargs['minimum']
+        else:
+            default = _default_kwargs['saddle']
+
         if isinstance(atoms, PESWrapper):
+            asetraj = trajectory
             self.pes = atoms
             atoms = self.pes.atoms
         else:
+            asetraj = None
             self.pes = PESWrapper(atoms, atoms.calc, trajectory=trajectory,
                                   **kwargs)
-        Optimizer.__init__(self, atoms, restart, logfile, None, master,
+        Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
-        self.delta = delta0 * len(self.pes.x_m)
-        self.sigma_inc = sigma_inc
-        self.sigma_dec = sigma_dec
-        self.rho_inc = rho_inc
-        self.rho_dec = rho_dec
+
+        if delta0 is None:
+            self.delta = default['delta0'] * len(self.pes.x_m)
+        else:
+            self.delta = delta0 * len(self.pes.x_m)
+
+        if sigma_inc is None:
+            self.sigma_inc = default['sigma_inc']
+        else:
+            self.sigma_inc = sigma_inc
+
+        if sigma_dec is None:
+            self.sigma_dec = default['sigma_dec']
+        else:
+            self.sigma_dec = sigma_dec
+
+        if rho_inc is None:
+            self.rho_inc = default['rho_inc']
+        else:
+            self.rho_inc = rho_inc
+
+        if rho_dec is None:
+            self.rho_dec = default['rho_dec']
+        else:
+            self.rho_dec = rho_dec
+
+        if method is None:
+            self.method = default['method']
+        else:
+            self.method = method
+
+        if eig is None:
+            self.eig = default['eig']
+        else:
+            self.eig = eig
+
         self.ord = order
-        self.eig = eig
         self.eta = eta
         self.delta_min = self.eta
         self.constraints_tol = constraints_tol
@@ -51,9 +105,8 @@ class Sella(Optimizer):
 
         self.initialized = False
         self.xi = 1.
-        self.method = method
         if self.method not in ['gmtrm', 'rsrfo', 'rsprfo']:
-            raise ValueError('Unknown method:', method)
+            raise ValueError('Unknown method:', self.method)
 
     def step(self):
         if not self.initialized:
