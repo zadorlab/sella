@@ -96,6 +96,8 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
     # rotations.
     rot_center = None
     rot_axes = None
+    if len(atoms) == 2 and p_r:
+        rot_axes = null_space(np.atleast_2d(atoms.positions[1] - atoms.positions[0])).T
     # We also keep track of which dimensions any atom has been
     # fixed in for projecting out translations. E.g. if any atom
     # has been fixed in the X direction, then we do not project
@@ -111,7 +113,7 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
             if rot_center is None:
                 rot_center = target
             elif rot_axes is None:
-                rot_axes = target - rot_center
+                rot_axes = (target - rot_center)[np.newaxis, :]
                 rot_axes /= np.linalg.norm(rot_axes)
             elif p_r:
                 # If at least three atoms have been specified as
@@ -153,7 +155,12 @@ def initialize_constraints(atoms, pos0, conin, p_t, p_r):
         if fixed:
             constraints['translations'][dim] = center[dim]
     constraints['rotations'] = p_r
-    nconstraints += np.sum(fixed_dims) + 3 * p_r
+    nconstraints += np.sum(fixed_dims)
+    if p_r:
+        if rot_axes is None:
+            nconstraints += 3
+        else:
+            nconstraints += rot_axes.shape[0]
 
     if rot_center is None:
         rot_center = center

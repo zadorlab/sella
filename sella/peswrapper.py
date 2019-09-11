@@ -36,7 +36,7 @@ class PESWrapper(object):
         self.dummy_pos = self.atoms.positions[self.dummy_indices]
         del self._atoms_nodummy[self.dummy_indices]
 
-        self._atoms_nodummy.set_calculator(calc)
+        self._atoms_nodummy.calc = calc
 
         self.eigensolver = eigensolver
         self.shift = shift
