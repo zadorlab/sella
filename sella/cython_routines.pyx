@@ -130,22 +130,26 @@ def modified_gram_schmidt(X_np, double eps=1e-15):
 
     cdef int d = X.shape[0]
     cdef int n = X.shape[1]
-    cdef int i
-    cdef int j
-    cdef double scale
+    cdef int i, j, k
+    cdef double dot, scale, scale_tot
 
     cdef int sd = X.strides[0] // 8
     
     with nogil:
         for i in range(n):
+            scale = dnrm2(&d, &X[0, i], &sd)
+            for k in range(d):
+                X[k, i] /= scale
             while True:
-                for j in range(i - 1):
-                    scale = -ddot(&d, &X[0, j], &sd, &X[0, i], &sd)
-                    daxpy(&d, &scale, &X[0, j], &sd, &X[0, i], &sd)
-                scale = dnrm2(&d, &X[0, i], &sd)
-                for j in range(d):
-                    X[j, i] /= scale
-                if fabs(1 - scale) < eps:
+                scale_tot = 1.
+                for j in range(i):
+                    dot = -ddot(&d, &X[0, j], &sd, &X[0, i], &sd)
+                    daxpy(&d, &dot, &X[0, j], &sd, &X[0, i], &sd)
+                    scale = dnrm2(&d, &X[0, i], &sd)
+                    scale_tot *= scale
+                    for k in range(d):
+                        X[k, i] /= scale
+                if fabs(1. - scale_tot) < eps:
                     break
 
     return X_local
