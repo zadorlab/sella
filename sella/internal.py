@@ -9,9 +9,10 @@ from scipy.optimize import minimize
 from .internal_cython import get_internal, cart_to_internal
 
 from ase.data import covalent_radii, vdw_radii
+from ase.units import Hartree, Bohr
 
 class Internal(object):
-    def __init__(self, atoms, angles=False, dihedrals=False, extra_bonds=None):
+    def __init__(self, atoms, angles=True, dihedrals=True, extra_bonds=None):
         self.extra_bonds = []
         if extra_bonds is not None:
             self.extra_bonds = extra_bonds
@@ -45,7 +46,9 @@ class Internal(object):
         self._mask = np.ones(self.ninternal, dtype=np.uint8)
 
         self._p = None
+        self._U = None
         self._B = None
+        self._Binv = None
         self._D = None
 
     @property
@@ -54,7 +57,7 @@ class Internal(object):
 
     @atoms.setter
     def atoms(self, new_atoms):
-        self._atoms = new_atoms.copy()
+        self._atoms = new_atoms
         self.natoms = len(self._atoms)
 
         self.get_internal()
@@ -126,23 +129,64 @@ class Internal(object):
                                                      gradient, curvature)
         self._pos_old = self.atoms.positions.copy()
 
+        if self._B is not None:
+            self._Binv = np.linalg.pinv(self._B)
+            G = self._B @ self._B.T
+            lams, vecs = np.linalg.eigh(G)
+            indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-8]
+            self._U = vecs[:, indices]
+
     @property
     def p(self):
         if self._p is not None and np.all(self.atoms.positions == self._pos_old):
             return self._p
         self._calc_internal()
+        self._U = None
         self._B = None
+        self._Binv = None
         self._D = None
         return self._p
 
+    def p_wrap(self, vec):
+        nba = self.nb + self.na
+        out = vec.copy()
+        out[nba:] = (out[nba:] + np.pi) % (2 * np.pi) - np.pi
+        return out
+
+    def _p_setter_naive(self, target):
+        x0 = self.atoms.get_positions().ravel().copy()
+        x = x0.copy()
+        dp0 = None
+        errlast = np.infty
+        for _ in range(20):
+            Binv = np.linalg.pinv(self.B)
+            dp = self.p_wrap(target - self.p)
+            if dp0 is None:
+                dp0 = dp.copy()
+            err = np.linalg.norm(dp)
+            if err < 1e-8:
+                return True
+            elif abs(err - errlast) < 1e-8:
+                return False
+            errlast = err
+            x += Binv @ dp
+            self.atoms.positions = x.reshape((-1, 3))
+        # If the error is bigger than after the first step, revert entirely
+        if err > np.linalg.norm(dp0):
+            self.atoms.positions = x0.reshape((-1, 3))
+        return False
+
+
+
     @p.setter
     def p(self, target):
+        # Try naive algorithm first
+        if self._p_setter_naive(target):
+            return
+
         # Dihedral angles can differ by at most pi and at least -pi.
         # Modify dihedral angles accordingly
-        nba = self.nb + self.na
-        dp = target - self.p
-        dp[nba:] = (dp[nba:] + np.pi) % (2 * np.pi) - np.pi
-
+        dp = self.p_wrap(target - self.p)
 
         # Calculate linearized cartesian displacement vector.
         # Rather than calculating pinv(B), we do SVD and explicitly
@@ -152,7 +196,7 @@ class Internal(object):
         dx = rvecs[indices, :].T @ ((lvecs[:, indices].T @ dp) / lams[indices])
         self.v0 = dx.copy()
         dxnorm = np.linalg.norm(dx)
-        dx_max = 1e-3  # Maximum linear displacement to use
+        dx_max = 1e-2  # Maximum linear displacement to use
 
         # If the total displacement is less than dx_max, just do a linear
         # displacement and skip the rest of the algorithm
@@ -177,7 +221,8 @@ class Internal(object):
         errors = np.zeros((len(dx), nscf))
         p = self.p.copy()
         # Outer loop controls linear displacements in cartesian coordinates
-        for _ in range(nsteps):
+        for k in range(nsteps):
+            print('step {} of {}'.format(k, nsteps))
             # Use explicit velocity-verlet to integrate
             vhalf = v + a * dt / 2
             self.atoms.positions += (vhalf * dt).reshape((-1, 3))
@@ -252,55 +297,81 @@ class Internal(object):
         return self._B
 
     @property
+    def Binv(self):
+        if self._Binv is not None and np.all(self.atoms.positions == self._pos_old):
+            return self._Binv
+        self._calc_internal(gradient=True)
+        self._D = None
+        return self._Binv
+
+    @property
+    def U(self):
+        if self._U is not None and np.all(self.atoms.positions == self._pos_old):
+            return self._U
+        self._calc_internal(gradient=True)
+        self._D = None
+        return self._U
+
+    @property
     def D(self):
         if self._D is not None and np.all(self.atoms.positions == self._pos_old):
             return self._D
         self._calc_internal(gradient=True, curvature=True)
         return self._D
 
-    def guess_hessian(self, g0):
-        D = self.D
-        B = self.B
-        rcov = np.zeros(len(self.atoms))
-        for i, atom in enumerate(self.atoms):
-            rcov[i] = covalent_radii[atom.number]
+    def guess_hessian(self):
+        rcov = covalent_radii[self.atoms.numbers]
 
-        rho = {}
-        for i, (a, b) in enumerate(self.bonds):
-            rho[tuple(sorted((a, b)))] = np.exp(-self.atoms.get_distance(a, b) / (rcov[a] + rcov[b]) + 1.)
+        # Stretch parameters
+        Ab = 0.3601 * Hartree / Bohr**2
+        Bb = 1.944 / Bohr
 
-        H0 = np.zeros(self.nb + self.na + self.nd)
+        # Bend parameters
+        Aa = 0.089 * Hartree
+        Ba = 0.11 * Hartree
+        Ca = 0.44 / Bohr
+        Da = -0.42
+
+        # Torsion parameters
+        At = 0.0015 * Hartree
+        Bt = 14.0 * Hartree
+        Ct = 2.85 / Bohr
+        Dt = 0.57
+        Et = 4.00
+
+        h0 = np.zeros(self.ninternal)
 
         n = 0
         start = 0
         for i, (a, b) in enumerate(self.bonds):
             if not self._mask[i]:
                 continue
-            H0[n] = 45 * rho[tuple(sorted((a, b)))]
+            rab = self.atoms.get_distance(a, b)
+            rcovab = rcov[a] + rcov[b]
+            h0[n] = Aa * np.exp(-Bb * (rab - rcovab))
             n += 1
 
         start += self.nb
         for i, (a, b, c) in enumerate(self.angles):
             if not self._mask[start + i]:
                 continue
-            rhoab = rho[tuple(sorted((a, b)))]
-            rhobc = rho[tuple(sorted((b, c)))]
-            H0[n] = 4 * rhoab * rhobc
+            rab = self.atoms.get_distance(a, b)
+            rbc = self.atoms.get_distance(b, c)
+            rcovab = rcov[a] + rcov[b]
+            rcovbc = rcov[b] + rcov[c]
+            h0[n] = Aa + Ba * np.exp(-Ca * (rab + rbc - rcovab - rcovbc)) / (rcovab * rcovbc / Bohr**2)**Da
             n += 1
 
         start += self.na
         for i, (a, b, c, d) in enumerate(self.dihedrals):
             if not self._mask[start + i]:
                 continue
-            rhoab = rho[tuple(sorted((a, b)))]
-            rhobc = rho[tuple(sorted((b, c)))]
-            rhocd = rho[tuple(sorted((c, d)))]
-            H0[n] = 0.15 * rhoab * rhobc * rhocd
+            rbc = self.atoms.get_distance(b, c)
+            rcovbc = rcov[b] + rcov[c]
+            L = self.nbonds[b] + self.nbonds[c] - 2
+            h0[n] = At + Bt * L**Dt * np.exp(-Ct * (rbc - rcovbc)) / (rbc * rcovbc / Bohr**2)**Et
             n += 1
 
-        H = np.diag(H0[:n])
-        lvecs, lams, rvecs = np.linalg.svd(B, full_matrices=False)
-        indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
-        Binv = rvecs[indices, :].T @ (lvecs[:, indices].T / lams[indices, np.newaxis])
-        Hcart = B.T @ H @ B + D.ldot(Binv.T @ g0)
-        return Hcart
+        H0 = np.diag(h0)
+        P = self.B @ self.Binv
+        return P.T @ H0 @ P
