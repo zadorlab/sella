@@ -236,9 +236,13 @@ def davidson(A, gamma, P, v0=None, vref=None, vreftol=0.99, refine=False,
         return lams, V, AV
 
 
-def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
+def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
                   method='jd0', maxiter=None):
     n, _ = A.shape
+
+    if B is None:
+        B = np.eye(n)
+
     if maxiter is None:
         maxiter = 2 * n + 1
 
@@ -259,7 +263,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
     seeking = 0
     while True:
         Atilde = V.T @ (symmetrize_Y(V, AV, symm=symm))
-        lams, vecs = eigh(Atilde, V.T @ V)
+        lams, vecs = eigh(Atilde, V.T @ B @ V)
         nneg = max(1, np.sum(lams < 0))
         # Rotate our subspace V to be diagonal in A.
         # This is not strictly necessary but it makes our lives easier later
@@ -271,7 +275,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
 
         Ytilde = symmetrize_Y(V, AV, symm=symm)
         R = (Ytilde @ vecs[:, :nneg]
-             - V @ vecs[:, :nneg] * lams[np.newaxis, :nneg])
+             - B @ V @ vecs[:, :nneg] * lams[np.newaxis, :nneg])
         Rnorm = np.linalg.norm(R, axis=0)
         print(Rnorm, lams[:nneg], Rnorm / lams[:nneg], seeking)
 
@@ -296,7 +300,7 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
         else:
             return lams, V, AV
 
-        t = expand(V, Ytilde, P, lams, vecs, thetai, method, seeking)
+        t = expand(V, Ytilde, P, B, lams, vecs, thetai, method, seeking)
         t /= np.linalg.norm(t)
         if np.linalg.norm(t - V @ V.T @ t) < 1e-2:
             # Do Lanczos instead
@@ -319,13 +323,13 @@ def rayleigh_ritz(A, gamma, P, v0=None, vref=None, vreftol=0.99,
         return lams, V, AV
 
 
-def expand(V, Y, P, lams, vecs, shift, method='jd0', seeking=0):
+def expand(V, Y, P, B, lams, vecs, shift, method='jd0', seeking=0):
     d, n = V.shape
-    R = Y @ vecs - V @ vecs * lams[np.newaxis, :]
+    R = Y @ vecs - B @ V @ vecs * lams[np.newaxis, :]
     I = np.eye(d)
     if P is None:
         P = I.copy()
-    Pshift = P - shift * I
+    Pshift = P - shift * B
     if method == 'lanczos':
         return R[:, seeking]
     elif method == 'gd':
