@@ -4,12 +4,10 @@ import warnings
 
 import numpy as np
 
-from scipy.optimize.linesearch import scalar_search_wolfe1
-
 from ase.optimize.optimize import Optimizer
 
-from .peswrapper import PESWrapper
-from .optimize import rs_newton, rs_rfo, rs_prfo
+from sella.peswrapper import PESWrapper
+from sella.optimize import rs_newton, rs_rfo, rs_prfo
 
 _default_kwargs = dict(minimum=dict(delta0=1e-1,
                                     sigma_inc=1.15,
@@ -31,8 +29,8 @@ class Sella(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
                  master=None, force_consistent=False, delta0=None,
                  sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
-                 order=1, eig=None, eta=1e-4, peskwargs=None, method=None,
-                 gamma=0.4, constraints_tol=1e-5, **kwargs):
+                 order=1, eig=None, eta=1e-4, method=None, gamma=0.4,
+                 threepoint=False, constraints=None, constraints_tol=1e-5):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
@@ -44,15 +42,16 @@ class Sella(Optimizer):
             atoms = self.pes.atoms
         else:
             asetraj = None
-            self.pes = PESWrapper(atoms, atoms.calc, trajectory=trajectory,
-                                  **kwargs)
+            self.pes = PESWrapper(atoms, constraints=constraints,
+                                  trajectory=trajectory, eta=eta)
+        self.geom = self.pes.geom
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
 
         if delta0 is None:
-            self.delta = default['delta0'] * len(self.pes.x_m)
+            self.delta = default['delta0'] * len(self.geom.xfree)
         else:
-            self.delta = delta0 * len(self.pes.x_m)
+            self.delta = delta0 * len(self.geom.xfree)
 
         if sigma_inc is None:
             self.sigma_inc = default['sigma_inc']
@@ -89,14 +88,7 @@ class Sella(Optimizer):
         self.delta_min = self.eta
         self.constraints_tol = constraints_tol
         self.niter = 0
-        if peskwargs is None:
-            self.peskwargs = dict(eta=self.eta, gamma=gamma)
-        else:
-            self.peskwargs = peskwargs
-            if 'eta' not in self.peskwargs:
-                self.peskwargs['eta'] = self.eta
-            if 'gamma' not in self.peskwargs:
-                self.peskwargs['gamma'] = gamma
+        self.peskwargs = dict(gamma=gamma, threepoint=threepoint)
 
         if self.ord != 0 and not self.eig:
             warnings.warn("Saddle point optimizations with eig=False will "
@@ -110,7 +102,7 @@ class Sella(Optimizer):
 
     def step(self):
         if not self.initialized:
-            f, self.glast, _ = self.pes.kick(np.zeros_like(self.pes.x_m))
+            self.glast = self.geom.gfree
             if self.eig:
                 self.pes.diag(**self.peskwargs)
             self.initialized = True
@@ -134,11 +126,10 @@ class Sella(Optimizer):
         # Determine if we need to call the eigensolver, then step
         ev = (self.eig and self.pes.lams is not None
               and np.any(self.pes.lams[:self.ord] > 0))
-        f, self.glast, dx = self.pes.kick(s, ev, **self.peskwargs)
+        f, self.glast, rho = self.pes.update(s, ev, **self.peskwargs)
         self.niter += 1
 
         # Update trust radius
-        rho = self.pes.ratio
         if rho is None:
             rho = 1.
         if rho < 1./self.rho_dec or rho > self.rho_dec:
@@ -146,19 +137,8 @@ class Sella(Optimizer):
         elif 1./self.rho_inc < rho < self.rho_inc:
             self.delta = max(self.sigma_inc * smag, self.delta)
 
-    def _project_forces(self, forces):
-        # Fool the optimizer into thinking the gradient is orthogonal to the
-        # constraint subspace
-        return (self.pes.Tm @ self.pes.Tm.T @ forces.ravel()).reshape((-1, 3))
-
     def converged(self, forces=None):
-        if forces is None:
-            forces = self.atoms.get_forces()
-        forces = self._project_forces(forces)
-        return (np.all(np.abs(self.pes.res) < self.constraints_tol)
-                and (forces**2).sum(1).max() < self.fmax**2)
+        return self.pes.converged(self.fmax)
 
     def log(self, forces=None):
-        if forces is None:
-            forces = self.atoms.get_forces()
-        return Optimizer.log(self, self._project_forces(forces))
+        return Optimizer.log(self, self.geom.forces)

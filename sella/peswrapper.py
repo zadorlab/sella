@@ -1,80 +1,29 @@
-# Proof of concept MinMode implementation for Atoms which explicitly
-# removes constraints from the degrees of freedom exposed to the
-# optimizer
-
 import numpy as np
-from scipy.linalg import eigh, lstsq
 
-from ase.io import Trajectory
+from scipy.linalg import eigh
 
-from .eigensolvers import rayleigh_ritz
-from .linalg import NumericalHessian, ProjectedMatrix
-from .hessian_update import update_H, symmetrize_Y
-from .constraints import initialize_constraints, calc_constr_basis
+from sella.geom import CartGeom
+from sella.eigensolvers import rayleigh_ritz
+from sella.linalg import NumericalHessian, ProjectedMatrix
+from sella.hessian_update import update_H, symmetrize_Y
 
 
-class PESWrapper(object):
-    def __init__(self, atoms, calc, eigensolver=rayleigh_ritz,
-                 project_translations=True, project_rotations=None,
-                 constraints=None, trajectory=None, shift=1000,
-                 v0=None, maxres=1e-5):
-        self.atoms = atoms
-        self.H = None
+class DummyTrajectory:
+    def write(self):
+        pass
 
-        # We don't want to pass the dummy atoms onto the calculator,
-        # which might not know what to do with them, so we have a
-        # second Atoms object with dummy atoms removed, and attach
-        # the calculator to *that*
-        self._atoms_nodummy = self.atoms
-        self.dummy_indices = [x.index for x in self.atoms if x.symbol == 'X']
-        if self.dummy_indices:
-            self._atoms_nodummy = self.atoms.copy()
-        self.dummy_pos = self.atoms.positions[self.dummy_indices]
-        del self._atoms_nodummy[self.dummy_indices]
 
-        self._atoms_nodummy.calc = calc
+_valid_diag_keys = set(('gamma', 'threepoint', 'maxiter'))
 
+
+class PESWrapper:
+    def __init__(self, atoms, eigensolver='jd0', constraints=None,
+                 trajectory=None, eta=1e-4, v0=None):
+        self.geom = CartGeom(atoms, constraints, trajectory=trajectory)
         self.eigensolver = eigensolver
-        self.shift = shift
+        self.H = None
+        self.eta = eta
         self.v0 = v0
-        self.maxres = maxres
-
-        # Default to projecting out rotations for aperiodic systems, but
-        # not for periodic systems.
-        if project_rotations is None:
-            project_rotations = not np.any(self.atoms.pbc)
-        # Extract the initial positions for use in fixed atom constraints
-        self.pos0 = self.atoms.get_positions().copy()
-        self.constraints = dict()
-        self.set_constraints(constraints,
-                             project_translations,
-                             project_rotations)
-
-        # The true dimensionality of the problem
-        self.d = 3 * len(self.atoms)
-
-        if trajectory is not None:
-            self.trajectory = Trajectory(trajectory, 'w', self.atoms)
-        else:
-            self.trajectory = None
-
-        # The position, function value, its gradient, and some other
-        # information from the *previous* function call.
-        # This dictionary should never be *updated*; instead, it
-        # should be *replaced* by an entirely new dictionary with
-        # new values. This will avoid the entries becoming out of
-        # sync from one another.
-        self.last = dict(x=None,
-                         f=None,
-                         g=None,
-                         h=None,
-                         x_m=None,
-                         g_m=None)
-        self.calls = 0
-        self._basis_xlast = None
-        self.ratio = None
-
-        self._basis_update()
 
     @property
     def H(self):
@@ -89,217 +38,84 @@ class PESWrapper(object):
             self.vecs = None
             return
         self._H = target
-        Tproj = self.Tm.T @ self.Tfree
-        self.Hred = Tproj @ target @ Tproj.T
-        lams, vecs = eigh(self.Hred)
-        indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
-        self.lams = lams[indices]
-        self.vecs = vecs[:, indices]
+        self.Hred = self.geom.Ufree.T @ self._H @ self.geom.Ufree
+        self.lams, self.vecs = eigh(self.Hred)
 
-    @property
-    def x(self):
-        # The current atomic positions in a flattened array.
-        # Full dimensional.
-        xout = np.zeros(self.d).reshape((-1, 3))
-        x_real = self._atoms_nodummy.positions
-        x_dummy = self.dummy_pos
-        nreal = 0
-        ndummy = 0
-        for i, row in enumerate(xout):
-            if i in self.dummy_indices:
-                row[:] = x_dummy[ndummy]
-                ndummy += 1
-            else:
-                row[:] = x_real[nreal]
-                nreal += 1
-        return xout.ravel()
+    def _calc_eg(self, x):
+        self.geom.x = x
+        return self.geom.f, self.geom.g
 
-    @x.setter
-    def x(self, target):
-        xin = target.reshape((-1, 3))
-        xreal = self.atoms.positions.copy()
-        nreal = 0
-        ndummy = 0
-        for i, row in enumerate(xin):
-            if i in self.dummy_indices:
-                self.dummy_pos[ndummy] = row
-                ndummy += 1
-            else:
-                xreal[nreal] = row
-                nreal += 1
-        self.atoms.set_positions(xin)
-        self._atoms_nodummy.set_positions(xreal)
-        self._basis_update()
+    def converged(self, fmax, maxres=1e-5):
+        return ((self.geom.forces**2).sum(1).max() < fmax**2
+                and (np.linalg.norm(self.geom.res) < maxres))
 
-    @property
-    def x_m(self):
-        # The current atomic positions in the subspace orthogonal to
-        # any constraints.
-        return self.Tm.T @ self.x
+    def update(self, dx, diag=False, **diag_kwargs):
+        """Update the molecular geometry according
+        to the displacement vector dx"""
 
-    def _basis_update(self):
-        if self._basis_xlast is None or np.any(self.x != self._basis_xlast):
-            out = calc_constr_basis(self.atoms, self.constraints,
-                                    self.nconstraints, self.rot_center,
-                                    self.rot_axes)
-            self.res, self.drdx, self.Tm, self.Tfree, self.Tc = out
-            self._basis_xlast = self.x.copy()
+        # Before we do anything, make sure the diag_kwargs are valid
+        invalid_keys = set(diag_kwargs.keys()) - _valid_diag_keys
+        if invalid_keys:
+            raise ValueError("Unknown keywords passed to update:",
+                             invalid_keys)
 
-    def kick(self, dx_m, diag=False, **kwargs):
-        if np.linalg.norm(dx_m) == 0 and self.last['f'] is not None:
-            return self.last['f'], self.Tm.T @ self.last['g'], dx_m
+        x0 = self.geom.x.copy()
+        f0 = self.geom.f
+        g0 = self.geom.g.copy()
+        h0 = self.geom.h.copy()
 
-        dx_c, _, _, _ = lstsq(-self.drdx.T, self.res)
+        self.geom.xfree = self.geom.xfree + dx
 
-        dx = self.Tm @ dx_m + dx_c
-        f1, g1 = self.evaluate(self.x + dx)
+        df_actual = self.geom.f - f0
+
+        dx_full = self.geom.x - x0
+        dx_free, dx_cons = self.geom.split_dx(dx_full)
+        if self.H is not None:
+            df_pred = (g0.T @ dx_full - dx_free @ self.H @ dx_cons
+                       + (dx_free @ self.H @ dx_free) / 2.
+                       + (dx_cons @ self.H @ dx_cons) / 2.)
+
+            ratio = df_actual / df_pred
+        else:
+            ratio = None
+
+        dh = self.geom.h - h0
+        self.H = update_H(self.H, dx_full, dh)
 
         if diag:
-            self.diag(**kwargs)
+            self.diag(**diag_kwargs)
 
-        return f1, self.Tm.T @ self.last['g'], dx_m
+        return self.geom.f, self.geom.gfree, ratio
 
-    def set_constraints(self, constraints, p_t, p_r):
-        if self.H is not None:
-            assert self.Tfree is not None
-            Hfull = self.Tfree @ self.H @ self.Tfree.T
-        else:
-            Hfull = None
+    def diag(self, gamma=0.5, threepoint=False, maxiter=None):
+        x0 = self.geom.x.copy()
 
-        con, ncon, rc, ra = initialize_constraints(self.atoms, self.pos0,
-                                                   constraints, p_t, p_r)
-        self.constraints = con
-        self.nconstraints = ncon
-        self.rot_center = rc
-        self.rot_axes = ra
-
-        if Hfull is not None:
-            # Project into new basis
-            self._basis_update()
-            self.H = self.Tfree.T @ Hfull @ self.Tfree
-
-    def calc_eg(self, x=None):
-        if x is not None:
-            self.x = x
-
-        e = self._atoms_nodummy.get_potential_energy()
-        gin = self._atoms_nodummy.get_forces()
-        gout = np.zeros(self.d).reshape((-1, 3))
-        nreal = 0
-        for i, row in enumerate(gout):
-            if i not in self.dummy_indices:
-                row[:] = gin[nreal]
-                nreal += 1
-        g = -gout.ravel()
-        self.calls += 1
-
-        if self.trajectory is not None:
-            self.trajectory.write(self.atoms, energy=e, forces=gout)
-        return e, g
-
-    def evaluate(self, x):
-        if self.last['f'] is not None and np.all(x == self.x):
-            return self.last['f'], self.last['g']
-
-        f, g = self.calc_eg(x)
-        h = g - self.drdx @ self.Tc.T @ g
-
-        if self.last['f'] is not None:
-            self.df = f - self.last['f']
-            dx = self.x - self.last['x']
-            dx_free = self.Tfree.T @ dx
-            dx_m = (self.Tfree.T @ (self.Tm @ self.Tm.T)) @ dx
-            dx_c = (self.Tfree.T @ (self.Tc @ self.Tc.T)) @ dx
-
-        if self.last['f'] is not None and self.H is not None:
-            # Calculate predicted vs actual change in energy
-            self.df_pred = (self.last['g'].T @ dx - (dx_m @ self.H @ dx_c)
-                            + (dx_m @ self.H @ dx_m) / 2.
-                            + (dx_c @ self.H @ dx_c) / 2.)
-
-            self.ratio = self.df_pred / self.df
-            self.err = np.abs(self.df_pred - self.df) / np.abs(self.df_pred)
-
-        if self.last['h'] is not None:
-            # Update Hessian matrix
-            dh_free = self.Tfree.T @ (h - self.last['h'])
-            self.H = update_H(self.H, dx_free, dh_free)
-
-        g_m = self.Tm.T @ g
-        if self.H is not None:
-            Tproj = self.Tm.T @ self.Tfree
-            g_m -= Tproj @ self.H @ (self.Tfree.T @ (self.Tc @ self.res))
-
-        self.last = dict(x=self.x.copy(),
-                         f=f,
-                         g=g.copy(),
-                         h=h.copy(),
-                         x_m=self.x_m.copy(),
-                         g_m=g_m.copy())
-
-        return f, g
-
-    def diag(self, eta, gamma=0.5, threepoint=False, shift=False,
-             shiftfactr=1000, maxiter=None, **kwargs):
-        if self.last['g'] is None:
-            self.evaluate(self.x)
-            if maxiter is not None:
-                maxiter -= 1
-
-        x = self.last['x']
-        g = self.last['g']
-
-        # If we don't have an approximate Hessian yet, then
-        H = self.H
+        P = self.Hred
         v0 = None
-        if H is None:
-            v0 = self.v0
-            if v0 is None:
-                v0 = self.last['g']
-            v0 = self.Tfree.T @ v0
-            H = np.eye(self.Tfree.shape[1])
+        if P is None:
+            P = np.eye(len(self.geom.xfree))
+            if self.v0 is not None:
+                v0 = self.geom.Ufree.T @ self.v0
+            else:
+                v0 = self.geom.gfree
 
-        # Htrue is a representation of the *true* Hessian matrix, which
-        # can be probed only through Hessian-vector products that are
-        # evaluated using finite difference of the gradient
-        Htrue = NumericalHessian(self.calc_eg, x, g, eta, threepoint)
+        Htrue = NumericalHessian(self._calc_eg, self.geom.x.copy(),
+                                 self.geom.g.copy(), self.eta, threepoint)
 
-        # We project the true Hessian into the space of free coordinates
-        if shift:
-            Hproj = Htrue + shiftfactr * self.Tc @ self.Tc.T
-            Pproj = H + shiftfactr * self.Tc @ self.Tc.T
-        else:
-            if v0 is not None:
-                v0 = self.Tm.T @ self.Tfree @ v0
-            Hproj = ProjectedMatrix(Htrue, self.Tm)
-            Pproj = (self.Tm.T @ self.Tfree) @ H @ (self.Tfree.T @ self.Tm)
+        Hproj = ProjectedMatrix(Htrue, self.geom.Ufree)
+        lams, Vs, AVs = rayleigh_ritz(Hproj, gamma, P, v0=v0,
+                                      method=self.eigensolver,
+                                      maxiter=maxiter)
 
-        x_orig = self.x.copy()
-        vref = kwargs.pop('vref', None)
-        vreftol = kwargs.pop('vreftol', 0.99)
-        if vref is not None and not shift:
-            vref = self.Tm.T @ vref
-        method = kwargs.pop('method', 'jd0')
-        lams, Vs, AVs = self.eigensolver(Hproj, gamma, Pproj, v0=v0,
-                                         vref=vref, vreftol=vreftol,
-                                         method=method, maxiter=maxiter)
-        self.x = x_orig
+        Vs = Hproj.Vs
+        AVs = Hproj.AVs
 
-        if not shift:
-            Vs = Hproj.Vs
-            AVs = Hproj.AVs
+        self.geom.x = x0
         Atilde = Vs.T @ symmetrize_Y(Vs, AVs, symm=2)
-        lams, vecs = eigh(Atilde, Vs.T @ Vs)
+        theta, X = eigh(Atilde)
 
-        Vs = Vs @ vecs
-        AVs = AVs @ vecs
-        AVstilde = AVs - self.drdx @ self.Tc.T @ AVs
+        Vs = Vs @ X
+        AVs = AVs @ X
+        AVstilde = AVs - self.geom.drdx @ self.geom.Ucons.T @ AVs
 
-        Vs_free = self.Tfree.T @ Vs
-        AVstilde_free = self.Tfree.T @ AVstilde
-
-        self.H = update_H(self.H, Vs_free, AVstilde_free)
-
-    def converged(self, ftol):
-        return ((np.linalg.norm(self.Tm.T @ self.last['g']) < ftol)
-                and np.all(np.abs(self.res) < self.maxres))
+        self.H = update_H(self.H, Vs, AVstilde)
