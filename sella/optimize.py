@@ -137,11 +137,9 @@ def rs_newton(pes, g, r_tr, order=1, xi=1.):
 
 
 def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
-    Hmm = pes.H
+    Hmm = pes.Hred
     if Hmm is None:
         Hmm = np.eye(len(g))
-    else:
-        Hmm = (pes.Tm.T @ pes.Tfree) @ Hmm @ (pes.Tfree.T @ pes.Tm)
     H0 = np.block([[Hmm, g[:, np.newaxis]], [g, 0]])
     l, V = eigh(H0)
 
