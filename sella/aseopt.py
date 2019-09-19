@@ -30,7 +30,8 @@ class Sella(Optimizer):
                  master=None, force_consistent=False, delta0=None,
                  sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
                  order=1, eig=None, eta=1e-4, method=None, gamma=0.4,
-                 threepoint=False, constraints=None, constraints_tol=1e-5):
+                 threepoint=False, constraints=None, constraints_tol=1e-5,
+                 v0=None, internal=False):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
@@ -43,7 +44,8 @@ class Sella(Optimizer):
         else:
             asetraj = None
             self.pes = PESWrapper(atoms, constraints=constraints,
-                                  trajectory=trajectory, eta=eta)
+                                  trajectory=trajectory, eta=eta, v0=v0,
+                                  internal=internal)
         self.geom = self.pes.geom
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)

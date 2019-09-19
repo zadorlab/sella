@@ -52,7 +52,7 @@ def _ase_constraints_to_dict(constraints):
 
 
 class Constraints:
-    def __init__(self, atoms, conin):
+    def __init__(self, atoms, conin, p_t=True, p_r=True):
         # Note: We do not keep a reference to atoms!
         con_ase = _ase_constraints_to_dict(atoms.constraints)
         for kind in ['bonds', 'angles', 'dihedrals']:
@@ -90,16 +90,20 @@ class Constraints:
         self.fix_target = []
         # If there are any fixed atoms, this will affect how we project
         # rotations.
-        self.rot_center = None
-        self.rot_axes = np.eye(3)
-        if len(atoms) == 2:
-            Y = (pos[1] - pos[0]).reshape((3, 1))
-            self.rot_axes = simple_ortho(np.eye(3), Y)
+        if p_r:
+            self.rot_center = None
+            self.rot_axes = np.eye(3)
+            if len(atoms) == 2:
+                Y = (pos[1] - pos[0]).reshape((3, 1))
+                self.rot_axes = simple_ortho(np.eye(3), Y)
+        else:
+            self.rot_center = np.zeros(3)
+            self.rot_axes = np.empty((0, 3))
         # We also keep track of which dimensions any atom has been
         # fixed in for projecting out translations. E.g. if any atom
         # has been fixed in the X direction, then we do not project
         # out overall translation in that direction.
-        self.fixed_dims = [True, True, True]
+        self.fixed_dims = [p_t, p_t, p_t]
         # The user can provide fixed atoms constraints either as a
         # list of atom indices, or as a list of (index, dimension)
         # tuples, or they can mix the two approaches.
@@ -129,7 +133,7 @@ class Constraints:
                     axis /= np.linalg.norm(axis)
                     # A very loose threshold here to improve numerical
                     # stability.
-                    if 1 - np.abs(axis @ self.rot_axes) > 1e-2:
+                    if 1 - np.abs(axis @ self.rot_axes[0]) > 1e-2:
                         self.rot_axes = np.empty((0, 3))
 
                 for dim, ipos in enumerate(target):
@@ -195,7 +199,7 @@ class Constraints:
         for arg in con_a:
             if len(arg) == 2:
                 indices = _sort_indices(arg[0])
-                target = arg[1]
+                target = arg[1] * np.pi / 180.
             else:
                 indices = _sort_indices(arg)
                 target = atoms.get_angle(*indices) * np.pi / 180.
@@ -213,7 +217,7 @@ class Constraints:
         for arg in con_d:
             if len(arg) == 2:
                 indices = _sort_indices(arg[0])
-                target = arg[1]
+                target = arg[1] * np.pi / 180.
             else:
                 indices = _sort_indices(arg)
                 target = atoms.get_dihedral(*indices) * np.pi / 180.
@@ -290,11 +294,11 @@ class Constraints:
 
         center = np.average(pos, axis=0)
         n += self.ndihedrals
-        res[n:self.ntrans] = center[self.trans_ind] - self.trans_target
+        res[n:n+self.ntrans] = center[self.trans_ind] - self.trans_target
 
         for i, (ind, dim) in enumerate(self.fix_ind):
             k = 3 * ind + dim
-            drdx[i, k] = 1.
+            drdx[k, i] = 1.
 
         n = self.nfix
         drdx[:, n:n+self.ninternal] = B.T

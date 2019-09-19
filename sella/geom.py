@@ -2,8 +2,12 @@ import numpy as np
 
 from ase.io import Trajectory
 
-from sella.constraints import Constraints
+from scipy.linalg import eigh
+from scipy.integrate import LSODA, BDF, RK23, RK45, Radau
 
+from sella.constraints import Constraints
+from sella.internal import Internal
+from sella.cython_routines import simple_ortho, modified_gram_schmidt
 
 class DummyTrajectory:
     def write(self):
@@ -54,7 +58,6 @@ class CartGeom(Geom):
         self.last.update(gfree=None, h=None)
         self.cons = Constraints(atoms, constraints)
 
-    # Is this kosher?
     res = property(lambda self: self.cons.res(self.atoms.positions))
     drdx = property(lambda self: self.cons.drdx(self.atoms.positions))
     Ufree = property(lambda self: self.cons.Ufree(self.atoms.positions))
@@ -78,6 +81,15 @@ class CartGeom(Geom):
     @x.setter
     def x(self, target):
         self.atoms.positions = target.reshape((-1, 3))
+
+    def dx(self, x0, split=False):
+        dx = self.x - x0
+        if split:
+            dx_free = (self.Ufree @ self.Ufree.T) @ dx
+            dx_cons = (self.Ucons @ self.Ucons.T) @ dx
+            return dx_free, dx_cons
+        else:
+            return dx
 
     @property
     def g(self):
@@ -110,43 +122,133 @@ class CartGeom(Geom):
         self._update()
         return self.last['h']
 
-    def split_dx(self, dx):
-        """Splits a real Cartesian displacement vector into its
-        "free" and "cons" components"""
-        dx_free = (self.Ufree @ self.Ufree.T) @ dx
-        dx_cons = (self.Ucons @ self.Ucons.T) @ dx
-        return dx_free, dx_cons
+
+class IntGeom(Geom):
+    def __init__(self, atoms, constraints=None, trajectory=None, angles=True,
+                 dihedrals=True, extra_bonds=None):
+        Geom.__init__(self, atoms, trajectory)
+        self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
+        self.cons = Constraints(self.atoms, constraints, p_t=False, p_r=False)
+
+    res = property(lambda self: self.cons.res(self.atoms.positions))
+
+    @property
+    def drdx(self):
+        drdx = self.cons.drdx(self.atoms.positions)
+        return self.int.Binv(self.atoms.positions).T @ drdx
+
+    @property
+    def Ufree(self):
+        # This is a bit convoluted. There might be a better way to accomplish this.
+        Ufree = self.cons.Ufree(self.atoms.positions)
+        B = self.int.B(self.atoms.positions)
+        B = B @ (Ufree @ Ufree.T)
+        G = B @ B.T
+        lams, vecs = eigh(G)
+        indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-8]
+        return vecs[:, indices]
+
+    @property
+    def Ucons(self):
+        return modified_gram_schmidt(self.drdx)
+
+    def _update(self):
+        if not Geom._update(self):
+            # The geometry has not changed, so nothing needs to be done
+            return
+        xint = self.int.q(self.atoms.positions)
+        gint = self.int.Binv(self.atoms.positions).T @ self.last['g']
+        h = gint - (self.drdx @ self.Ucons.T) @ gint
+
+        self.last.update(xint=xint, gint=gint, h=h)
+
+    @property
+    def x(self):
+        return self.int.q(self.atoms.positions)
+
+    @x.setter
+    def x(self, target):
+        pos0 = self.atoms.positions.ravel().copy()
+        nx = len(pos0)
+        y0 = np.zeros(2 * nx)
+        y0[:nx] = pos0
+        y0[nx:] = self.int.Binv(self.atoms.positions) @ self.int.q_wrap(target - self.x)
+        ode = LSODA(self._q_ode, 0., y0, t_bound=1., jac=self._q_jac)
+        while ode.status == 'running':
+            ode.step()
+        if ode.status == 'failed':
+            raise RuntimeError("Geometry update ODE failed to converge!")
+        self.atoms.positions = ode.y[:nx].reshape((-1, 3))
+
+    def _q_ode(self, t, y):
+        nx = len(y) // 2
+        x = y[:nx]
+        dxdt = y[nx:]
+
+        dydt = np.zeros_like(y)
+        dydt[:nx] = dxdt
+
+        self.atoms.positions = x.reshape((-1, 3)).copy()
+        D = self.int.D(self.atoms.positions)
+        Binv = self.int.Binv(self.atoms.positions)
+        dydt[nx:] = -Binv @ D.ddot(dxdt, dxdt)
+
+        return dydt
+
+    def _q_jac(self, t, y):
+        nx = len(y) // 2
+        dxdt = y[nx:]
+        jac = np.zeros((2 * nx, 2 * nx))
+        jac[:nx, nx:] = np.eye(nx)
+        D = self.int.D(self.atoms.positions)
+        Binv = self.int.Binv(self.atoms.positions)
+        jac[nx:, nx:] = -2 * Binv @ D.rdot(dxdt)
+        return jac
+
+    @property
+    def f(self):
+        self._update()
+        return self.last['f']
+
+    @property
+    def g(self):
+        self._update()
+        return self.last['gint']
+
+    @property
+    def h(self):
+        self._update()
+        return self.last['h']
+
+    @property
+    def xfree(self):
+        return self.Ufree.T @ self.x
+
+    @xfree.setter
+    def xfree(self, target):
+        dx_cons = -np.linalg.pinv(self.drdx.T) @ self.res
+        dx_free = self.Ufree @ (target - self.xfree)
+        self.x = self.x + self.int.q_wrap(dx_free + dx_cons)
+
+    @property
+    def gfree(self):
+        self._update()
+        return self.Ufree.T @ self.g
+
+    @property
+    def forces(self):
+        self._update()
+        forces_int = -((self.Ufree @ self.Ufree.T) @ self.g)
+        forces_cart = forces_int @ self.int.B(self.atoms.positions)
+        return forces_cart.reshape((-1, 3))
+
+    def dx(self, x0, split=False):
+        dx = self.int.q_wrap(self.x - x0)
+        if split:
+            dx_free = (self.Ufree @ self.Ufree.T) @ dx
+            dx_cons = (self.Ucons @ self.Ucons.T) @ dx
+            return dx_free, dx_cons
+        else:
+            return dx
 
 
-#class IntGeom(Geom):
-#    def __init__(self, atoms):
-#        Geom.__init__(self, atoms)
-#        self.int = Internal(self.atoms)
-#        self.last.update(x_int=None, g_int=None)
-#
-#    def _update(self):
-#        if not Geom._update(self):
-#            # The geometry has not changed, so nothing needs to be done
-#            return
-#        x_int = self.int.p.copy()
-#        g_int = self.int.Binv @ self.last['g']
-#
-#        self.last.update(x_int=x_int, g_int=g_int)
-#
-#    @property
-#    def x(self):
-#        return self.int.p
-#
-#    @x.setter
-#    def x(self, target):
-#        self.int.p = target
-#
-#    @property
-#    def f(self):
-#        self._update()
-#        return self.last['f']
-#
-#    @property
-#    def g(self):
-#        self._update()
-#        return self.last['g_int']

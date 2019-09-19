@@ -2,7 +2,7 @@ import numpy as np
 
 from scipy.linalg import eigh
 
-from sella.geom import CartGeom
+from sella.geom import CartGeom, IntGeom
 from sella.eigensolvers import rayleigh_ritz
 from sella.linalg import NumericalHessian, ProjectedMatrix
 from sella.hessian_update import update_H, symmetrize_Y
@@ -18,12 +18,19 @@ _valid_diag_keys = set(('gamma', 'threepoint', 'maxiter'))
 
 class PESWrapper:
     def __init__(self, atoms, eigensolver='jd0', constraints=None,
-                 trajectory=None, eta=1e-4, v0=None):
-        self.geom = CartGeom(atoms, constraints, trajectory=trajectory)
+                 trajectory=None, eta=1e-4, v0=None, internal=False):
+        if internal:
+            self.geom = IntGeom(atoms, constraints, trajectory=trajectory)
+        else:
+            self.geom = CartGeom(atoms, constraints, trajectory=trajectory)
         self.eigensolver = eigensolver
         self.H = None
         self.eta = eta
         self.v0 = v0
+
+    @property
+    def calls(self):
+        return self.geom.neval
 
     @property
     def H(self):
@@ -42,8 +49,12 @@ class PESWrapper:
         self.lams, self.vecs = eigh(self.Hred)
 
     def _calc_eg(self, x):
+        pos0 = self.geom.atoms.positions.copy()
         self.geom.x = x
-        return self.geom.f, self.geom.g
+        g = self.geom.g
+        f = self.geom.f
+        self.geom.atoms.positions = pos0
+        return f, g
 
     def converged(self, fmax, maxres=1e-5):
         return ((self.geom.forces**2).sum(1).max() < fmax**2
@@ -68,19 +79,22 @@ class PESWrapper:
 
         df_actual = self.geom.f - f0
 
-        dx_full = self.geom.x - x0
-        dx_free, dx_cons = self.geom.split_dx(dx_full)
+        dx_free, dx_cons = self.geom.dx(x0, split=True)
+        dx_full = self.geom.dx(x0, split=False)
         if self.H is not None:
-            df_pred = (g0.T @ dx_full - dx_free @ self.H @ dx_cons
-                       + (dx_free @ self.H @ dx_free) / 2.
-                       + (dx_cons @ self.H @ dx_cons) / 2.)
+            #df_pred = (g0.T @ dx_full - dx_free @ self.H @ dx_cons
+            #           + (dx_free @ self.H @ dx_free) / 2.
+            #           + (dx_cons @ self.H @ dx_cons) / 2.)
+            df_pred = g0.T @ dx_full + (dx_full.T @ self.H @ dx_full) / 2.
 
             ratio = df_actual / df_pred
         else:
             ratio = None
 
-        dh = self.geom.h - h0
-        self.H = update_H(self.H, dx_full, dh)
+        #dh = self.geom.h - h0
+        #self.H = update_H(self.H, dx_full, dh)
+        dg = self.geom.g - g0
+        self.H = update_H(self.H, dx_full, dg)
 
         if diag:
             self.diag(**diag_kwargs)
