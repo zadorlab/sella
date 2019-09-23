@@ -112,16 +112,18 @@ class Sella(Optimizer):
         # Find new search step
         if self.method == 'gmtrm':
             s, smag, self.xi, bound_clip = rs_newton(self.pes, self.glast,
-                                                     self.delta, self.ord,
-                                                     self.xi)
+                                                     self.delta,
+                                                     self.pes.geom.Winv,
+                                                     self.ord, self.xi)
         elif self.method == 'rsrfo':
             s, smag, self.xi, bound_clip = rs_rfo(self.pes, self.glast,
-                                                  self.delta, self.ord,
-                                                  self.xi)
+                                                  self.delta,
+                                                  self.pes.geom.Winv,
+                                                  self.ord, self.xi)
         elif self.method == 'rsprfo':
             s, smag, self.xi, bound_clip = rs_prfo(self.pes, self.glast,
-                                                   self.delta, self.ord,
-                                                   self.xi)
+                                                   self.delta, self.pes.geom.Winv,
+                                                   self.ord, self.xi)
         else:
             raise RuntimeError("Don't know what to do for method", self.method)
 
@@ -130,6 +132,14 @@ class Sella(Optimizer):
               and np.any(self.pes.lams[:self.ord] > 0))
         f, self.glast, rho = self.pes.update(s, ev, **self.peskwargs)
         self.niter += 1
+
+        #print(smag, self.delta, rho)
+
+        ## TEMPORARY TEST: Schlegel trust radius update scheme
+        #if rho > 0.75 and smag > 0.8 * self.delta:
+        #    self.delta *= 2
+        #elif rho < 0.25:
+        #    self.delta /= 4
 
         # Update trust radius
         if rho is None:

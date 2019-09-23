@@ -136,11 +136,12 @@ def rs_newton(pes, g, r_tr, order=1, xi=1.):
     return dx, dx_mag, xi, True
 
 
-def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
+def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
     Hmm = pes.Hred
     if Hmm is None:
         Hmm = np.eye(len(g))
-    H0 = np.block([[Hmm, g[:, np.newaxis]], [g, 0]])
+    Hmm = Winv.T @ Hmm @ Winv
+    H0 = np.block([[Hmm, (g @ Winv)[:, np.newaxis]] , [g @ Winv, 0]])
     l, V = eigh(H0)
 
     s = V[:-1, order] / V[-1, order]
@@ -148,7 +149,7 @@ def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
     smag = np.linalg.norm(s)
 
     if smag <= r_tr:
-        return s, smag, 1., False
+        return s @ Winv, smag, 1., False
 
     lower = 0.
     upper = 1.
@@ -200,7 +201,7 @@ def rs_rfo(pes, g, r_tr, order=0, alpha=0.5):
             # It is impossible to refine any further
             break
 
-    return s, smag, alpha, True
+    return s @ Winv, smag, alpha, True
 
 
 def rs_prfo(pes, g, r_tr, order=1, alpha=0.5):

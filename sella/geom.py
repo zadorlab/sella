@@ -39,6 +39,14 @@ class Geom:
         return True
 
     @property
+    def B(self):
+        return np.eye(len(self.x))
+
+    @property
+    def Binv(self):
+        return np.eye(len(self.x))
+
+    @property
     def x(self):
         raise NotImplementedError
 
@@ -50,6 +58,27 @@ class Geom:
     @property
     def g(self):
         raise NotImplementedError
+
+    def kick(self, dxfree):
+        pos0 = self.atoms.positions.copy()
+        self.xfree = self.xfree + dxfree
+        self._update()
+        x1 = self.x.copy()
+        pos1 = self.atoms.positions.copy()
+        self.atoms.positions = pos0
+        x0 = self.x.copy()
+        self.atoms.positions = pos1
+        return x1 - x0
+
+    def H_to_cart(self, H):
+        return H
+
+    def H_to_int(self, H):
+        return H
+
+    @property
+    def w(self):
+        return np.eye(len(self.x))
 
 
 class CartGeom(Geom):
@@ -129,6 +158,7 @@ class IntGeom(Geom):
         Geom.__init__(self, atoms, trajectory)
         self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
         self.cons = Constraints(self.atoms, constraints, p_t=False, p_r=False)
+        self._H0 = self.int.guess_hessian(atoms)
 
     res = property(lambda self: self.cons.res(self.atoms.positions))
 
@@ -173,9 +203,12 @@ class IntGeom(Geom):
         y0 = np.zeros(2 * nx)
         y0[:nx] = pos0
         y0[nx:] = self.int.Binv(self.atoms.positions) @ self.int.q_wrap(target - self.x)
-        ode = LSODA(self._q_ode, 0., y0, t_bound=1., jac=self._q_jac)
+        ode = LSODA(self._q_ode, 0., y0, t_bound=1., jac=self._q_jac, atol=1e-8)
+        #ode = BDF(self._q_ode, 0., y0, t_bound=1., jac=self._q_jac)
         while ode.status == 'running':
             ode.step()
+            if ode.nfev > 200:
+                raise RuntimeError("Geometry update ODE is taking too long to converge!")
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
         self.atoms.positions = ode.y[:nx].reshape((-1, 3))
@@ -192,6 +225,7 @@ class IntGeom(Geom):
         D = self.int.D(self.atoms.positions)
         Binv = self.int.Binv(self.atoms.positions)
         dydt[nx:] = -Binv @ D.ddot(dxdt, dxdt)
+        #print(dydt)
 
         return dydt
 
@@ -230,6 +264,9 @@ class IntGeom(Geom):
         dx_free = self.Ufree @ (target - self.xfree)
         self.x = self.x + self.int.q_wrap(dx_free + dx_cons)
 
+    def kick(self, dxfree):
+        return self.int.q_wrap(Geom.kick(self, dxfree))
+
     @property
     def gfree(self):
         self._update()
@@ -250,5 +287,32 @@ class IntGeom(Geom):
             return dx_free, dx_cons
         else:
             return dx
+
+    @property
+    def B(self):
+        return self.int.B(self.atoms.positions)
+
+    @property
+    def Binv(self):
+        return self.int.Binv(self.atoms.positions)
+
+    def H_to_cart(self, Hint):
+        if Hint is None:
+            return Hint
+        D = self.int.D(self.atoms.positions)
+        return self.B.T @ Hint @ self.B + D.ldot(self.g)
+
+    def H_to_int(self, Hcart):
+        if Hcart is None:
+            return Hcart
+        D = self.int.D(self.atoms.positions)
+        return self.Binv.T @ (Hcart - D.ldot(self.g)) @ self.Binv
+
+    @property
+    def Winv(self):
+        H0free = self.Ufree.T @ self._H0 @ self.Ufree
+        lams, vecs = np.linalg.eigh(H0free)
+        lams = np.sqrt(lams/ np.prod(lams)**(1./len(lams)))
+        return vecs @ np.diag(1. / lams) @ vecs.T
 
 

@@ -75,22 +75,44 @@ class PESWrapper:
         g0 = self.geom.g.copy()
         h0 = self.geom.h.copy()
 
-        self.geom.xfree = self.geom.xfree + dx
+        B0 = self.geom.B.copy()
+        U0 = self.geom.Ufree.copy()
+        Binv0 = self.geom.Binv.copy()
+        #Hcart = self.geom.H_to_cart(self.H)
+        
+
+        if self.H is not None:
+            dx_full = self.geom.int.q_wrap(self.geom.Ufree @ dx)
+            df_pred = g0.T @ dx_full + (dx_full.T @ self.H @ dx_full) / 2.
+
+        dx_full = self.geom.kick(dx)
 
         df_actual = self.geom.f - f0
 
-        dx_free, dx_cons = self.geom.dx(x0, split=True)
-        dx_full = self.geom.dx(x0, split=False)
-        if self.H is not None:
-            #df_pred = (g0.T @ dx_full - dx_free @ self.H @ dx_cons
-            #           + (dx_free @ self.H @ dx_free) / 2.
-            #           + (dx_cons @ self.H @ dx_cons) / 2.)
-            df_pred = g0.T @ dx_full + (dx_full.T @ self.H @ dx_full) / 2.
+        ##dx_free, dx_cons = self.geom.dx(x0, split=True)
+        ##dx_full = self.geom.dx(x0, split=False)
+        #if self.H is not None:
+        #    P = B0 @ self.geom.Binv
+        #    H = P.T @ self.H @ P
+        #    g0 = g0 @ P
+        #    df_pred = g0.T @ dx_full + (dx_full.T @ H @ dx_full) / 2.
+        #    #df_pred = (g0.T @ dx_full - dx_free @ self.H @ dx_cons
+        #    #           + (dx_free @ self.H @ dx_free) / 2.
+        #    #           + (dx_cons @ self.H @ dx_cons) / 2.)
+        #    #df_pred = g0.T @ dx_full + (dx_full.T @ self.H @ dx_full) / 2.
 
-            ratio = df_actual / df_pred
+
+        #    ratio = df_actual / df_pred
+        #else:
+        #    ratio = None
+
+        if self.H is not None:
+            ratio = df_pred / df_actual
         else:
             ratio = None
 
+
+        #self.H = self.geom.H_to_int(Hcart)
         #dh = self.geom.h - h0
         #self.H = update_H(self.H, dx_full, dh)
         dg = self.geom.g - g0
