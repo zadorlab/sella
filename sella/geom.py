@@ -3,11 +3,12 @@ import numpy as np
 from ase.io import Trajectory
 
 from scipy.linalg import eigh
-from scipy.integrate import LSODA, BDF, RK23, RK45, Radau
+from scipy.integrate import LSODA
 
 from sella.constraints import Constraints
 from sella.internal import Internal
 from sella.cython_routines import simple_ortho, modified_gram_schmidt
+from sella.hessian_update import update_H
 
 class DummyTrajectory:
     def write(self):
@@ -18,6 +19,7 @@ class Geom:
     def __init__(self, atoms, trajectory=None):
         self.atoms = atoms
         self.last = dict(x=None, f=None, g=None)
+        self.lastlast = dict(x=None, f=None, g=None)
         self.neval = 0
         if trajectory is not None:
             self.traj = Trajectory(trajectory, 'w', self.atoms)
@@ -30,6 +32,7 @@ class Geom:
             return False
         g = -self.atoms.get_forces().ravel()
         f = self.atoms.get_potential_energy()
+        self.lastlast = self.last
         self.last = dict(x=x.copy(),
                          f=f,
                          g=g.copy())
@@ -151,6 +154,16 @@ class CartGeom(Geom):
         self._update()
         return self.last['h']
 
+    @property
+    def Winv(self):
+        return np.eye(self.Ufree.shape[1])
+
+    def update_H(self, H):
+        dx = self.x - self.lastlast['x']
+        dg = self.g - self.lastlast['g']
+        return update_H(H, dx, dg)
+
+
 
 class IntGeom(Geom):
     def __init__(self, atoms, constraints=None, trajectory=None, angles=True,
@@ -159,6 +172,7 @@ class IntGeom(Geom):
         self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
         self.cons = Constraints(self.atoms, constraints, p_t=False, p_r=False)
         self._H0 = self.int.guess_hessian(atoms)
+        self.Binvlast = self.Binv.copy()
 
     res = property(lambda self: self.cons.res(self.atoms.positions))
 
@@ -199,12 +213,12 @@ class IntGeom(Geom):
     @x.setter
     def x(self, target):
         pos0 = self.atoms.positions.ravel().copy()
+        dq = self.int.q_wrap(target - self.x)
         nx = len(pos0)
         y0 = np.zeros(2 * nx)
         y0[:nx] = pos0
-        y0[nx:] = self.int.Binv(self.atoms.positions) @ self.int.q_wrap(target - self.x)
-        ode = LSODA(self._q_ode, 0., y0, t_bound=1., jac=self._q_jac, atol=1e-8)
-        #ode = BDF(self._q_ode, 0., y0, t_bound=1., jac=self._q_jac)
+        y0[nx:] = self.int.Binv(self.atoms.positions) @ dq
+        ode = LSODA(self._q_ode, 0., y0, t_bound=1., atol=1e-9)
         while ode.status == 'running':
             ode.step()
             if ode.nfev > 200:
@@ -225,19 +239,8 @@ class IntGeom(Geom):
         D = self.int.D(self.atoms.positions)
         Binv = self.int.Binv(self.atoms.positions)
         dydt[nx:] = -Binv @ D.ddot(dxdt, dxdt)
-        #print(dydt)
 
         return dydt
-
-    def _q_jac(self, t, y):
-        nx = len(y) // 2
-        dxdt = y[nx:]
-        jac = np.zeros((2 * nx, 2 * nx))
-        jac[:nx, nx:] = np.eye(nx)
-        D = self.int.D(self.atoms.positions)
-        Binv = self.int.Binv(self.atoms.positions)
-        jac[nx:, nx:] = -2 * Binv @ D.rdot(dxdt)
-        return jac
 
     @property
     def f(self):
@@ -296,23 +299,20 @@ class IntGeom(Geom):
     def Binv(self):
         return self.int.Binv(self.atoms.positions)
 
-    def H_to_cart(self, Hint):
-        if Hint is None:
-            return Hint
-        D = self.int.D(self.atoms.positions)
-        return self.B.T @ Hint @ self.B + D.ldot(self.g)
-
-    def H_to_int(self, Hcart):
-        if Hcart is None:
-            return Hcart
-        D = self.int.D(self.atoms.positions)
-        return self.Binv.T @ (Hcart - D.ldot(self.g)) @ self.Binv
-
     @property
     def Winv(self):
-        H0free = self.Ufree.T @ self._H0 @ self.Ufree
-        lams, vecs = np.linalg.eigh(H0free)
-        lams = np.sqrt(lams/ np.prod(lams)**(1./len(lams)))
-        return vecs @ np.diag(1. / lams) @ vecs.T
+        H0free = self.Ufree.T @ np.diag(1./np.sqrt(np.diag(self.int.guess_hessian(self.atoms)))) @ self.Ufree
+        return H0free / np.linalg.det(H0free)**(1./len(H0free))
 
+    @property
+    def dg(self):
+        g1 = self.g
+        g0 = self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
+        return g1 - g0
+
+    def update_H(self, H):
+        dx = self.int.q_wrap(self.x - self.int.q(self.lastlast['x']))
+        P = self.int.B(self.lastlast['x']) @ self.Binvlast
+        self.Binvlast = self.Binv.copy()
+        return update_H(P @ H @ P.T, dx, self.dg)
 

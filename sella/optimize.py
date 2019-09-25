@@ -135,7 +135,6 @@ def rs_newton(pes, g, r_tr, order=1, xi=1.):
     assert abs(dx_mag - r_tr) < 1e-12
     return dx, dx_mag, xi, True
 
-
 def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
     Hmm = pes.Hred
     if Hmm is None:
@@ -144,12 +143,12 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
     H0 = np.block([[Hmm, (g @ Winv)[:, np.newaxis]] , [g @ Winv, 0]])
     l, V = eigh(H0)
 
-    s = V[:-1, order] / V[-1, order]
+    s = Winv @ V[:-1, order] / V[-1, order]
 
     smag = np.linalg.norm(s)
 
     if smag <= r_tr:
-        return s @ Winv, smag, 1., False
+        return s, smag, 1., False
 
     lower = 0.
     upper = 1.
@@ -167,7 +166,7 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
         H[:-1, :-1] *= alpha
         l, V = eigh(H)
 
-        s = V[:-1, order] * alpha / V[-1, order]
+        s = Winv @ V[:-1, order] * alpha / V[-1, order]
         smag = np.linalg.norm(s)
 
         if smag > r_tr:
@@ -186,12 +185,12 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
                  / (l[order] - l[:order])))
                 + (V[:, order+1:] @ ((V[:, order+1:].T @ dHda @ V[:, order])
                    / (l[order] - l[order+1:]))))
-        # dsda is the derivative of the displacement vector s w.r.t. alpha.
-        # ds/da = (ds/dv[:-1]) (dv[:-1]/da) + (ds/dv[-1]) (dv[-1]/da)
+        ## dsda is the derivative of the displacement vector s w.r.t. alpha.
+        ## ds/da = (ds/dv[:-1]) (dv[:-1]/da) + (ds/dv[-1]) (dv[-1]/da)
         dsda = (V[:-1, order] / V[-1, order]
                 + (alpha / V[-1, order]) * dVda[:-1]
                 - (V[:-1, order] * alpha / V[-1, order]**2) * dVda[-1])
-        dsmagda = (s @ dsda) / smag
+        dsmagda = (s @ Winv @ dsda) / smag
         err = smag - r_tr
         alpha -= err / dsmagda
         if np.isnan(alpha) or alpha <= lower or alpha >= upper:
@@ -201,18 +200,20 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
             # It is impossible to refine any further
             break
 
-    return s @ Winv, smag, alpha, True
+    return s, smag, alpha, True
 
 
-def rs_prfo(pes, g, r_tr, order=1, alpha=0.5):
-    lams = pes.lams
-    vecs = pes.vecs
-    if lams is None:
+def rs_prfo(pes, g, r_tr, Winv, order=1, alpha=0.5):
+    if pes.Hred is None:
         lams = np.ones_like(g)
         vecs = np.diag(lams)
+    else:
+        H0 = Winv.T @ pes.Hred @ Winv
+        lams, vecs = np.linalg.eigh(H0)
 
-    gmax = vecs[:, :order].T @ g
-    gmin = vecs[:, order:].T @ g
+    Winvg = Winv @ g
+    gmax = vecs[:, :order].T @ Winvg
+    gmin = vecs[:, order:].T @ Winvg
 
     Hmax0 = np.block([[np.diag(lams[:order]), gmax[:, np.newaxis]],
                       [gmax, 0]])
@@ -234,7 +235,7 @@ def rs_prfo(pes, g, r_tr, order=1, alpha=0.5):
         smag = np.linalg.norm(s)
 
     if smag <= r_tr:
-        return s, smag, 1., False
+        return Winv @ s, smag, 1., False
 
     lower = 0.
     upper = 1.
@@ -315,7 +316,7 @@ def rs_prfo(pes, g, r_tr, order=1, alpha=0.5):
             break
 
     s = vecs[:, :order] @ smax + vecs[:, order:] @ smin
-    return s, smag, alpha, True
+    return Winv @ s, smag, alpha, True
 
 
 # These interpolators are not currently being used, but we'll keep them

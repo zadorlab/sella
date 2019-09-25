@@ -102,7 +102,7 @@ class Sella(Optimizer):
         if self.method not in ['gmtrm', 'rsrfo', 'rsprfo']:
             raise ValueError('Unknown method:', self.method)
 
-    def step(self):
+    def _predict_step(self):
         if not self.initialized:
             self.glast = self.geom.gfree
             if self.eig:
@@ -126,6 +126,12 @@ class Sella(Optimizer):
                                                    self.ord, self.xi)
         else:
             raise RuntimeError("Don't know what to do for method", self.method)
+
+        return s, smag
+
+
+    def step(self):
+        s, smag = self._predict_step()
 
         # Determine if we need to call the eigensolver, then step
         ev = (self.eig and self.pes.lams is not None

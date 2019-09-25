@@ -28,6 +28,10 @@ class Internal:
         self._masked_angles = []
         self._get_internal()
 
+        # A flag used to indicate to GeomInt that the bonding structure has
+        # changed since the last time it checked
+        self._bonding_changed = False
+
     def _get_internal(self):
         out = get_internal(self.atoms, self.use_angles, self.use_dihedrals, self.extra_bonds)
         self.c10y, self.nbonds, self.bonds, self.angles, self.dihedrals = out
@@ -161,6 +165,8 @@ class Internal:
         if not bad:
             return
 
+        self._bonding_changed = True
+
         bad_np = np.array(list(bad), dtype=np.uintp)
         out = expand_internal(self.atoms, self.use_angles, self.use_dihedrals,
                               self.c10y, self.nbonds, self.bonds, bad_np)
@@ -192,22 +198,22 @@ class Internal:
                     self._mask[na + nb + i] = False
 
     def guess_hessian(self, atoms):
-        rcov = covalent_radii[atoms.numbers]
+        rcov = covalent_radii[atoms.numbers] / Bohr
 
         # Stretch parameters
-        Ab = 0.3601 * Hartree / Bohr**2
-        Bb = 1.944 / Bohr
+        Ab = 0.3601 #* Hartree / Bohr**2
+        Bb = 1.944 #/ Bohr
 
         # Bend parameters
-        Aa = 0.089 * Hartree
-        Ba = 0.11 * Hartree
-        Ca = 0.44 / Bohr
+        Aa = 0.089 #* Hartree
+        Ba = 0.11 #* Hartree
+        Ca = 0.44 #/ Bohr
         Da = -0.42
 
         # Torsion parameters
-        At = 0.0015 * Hartree
-        Bt = 14.0 * Hartree
-        Ct = 2.85 / Bohr
+        At = 0.0015 #* Hartree
+        Bt = 14.0 #* Hartree
+        Ct = 2.85 #/ Bohr
         Dt = 0.57
         Et = 4.00
 
@@ -218,32 +224,30 @@ class Internal:
         for i, (a, b) in enumerate(self.bonds):
             if not self._mask[i]:
                 continue
-            rab = atoms.get_distance(a, b)
+            rab = atoms.get_distance(a, b) / Bohr
             rcovab = rcov[a] + rcov[b]
-            h0[n] = Aa * np.exp(-Bb * (rab - rcovab))
+            h0[n] = (Aa * np.exp(-Bb * (rab - rcovab))) * Hartree / Bohr**2
             n += 1
 
         start += self.n['bonds']
         for i, (a, b, c) in enumerate(self.angles):
             if not self._mask[start + i]:
                 continue
-            rab = atoms.get_distance(a, b)
-            rbc = atoms.get_distance(b, c)
+            rab = atoms.get_distance(a, b) / Bohr
+            rbc = atoms.get_distance(b, c) / Bohr
             rcovab = rcov[a] + rcov[b]
             rcovbc = rcov[b] + rcov[c]
-            h0[n] = Aa + Ba * np.exp(-Ca * (rab + rbc - rcovab - rcovbc)) / (rcovab * rcovbc / Bohr**2)**Da
+            h0[n] = (Aa + Ba * np.exp(-Ca * (rab + rbc - rcovab - rcovbc)) / (rcovab * rcovbc)**Da) * Hartree
             n += 1
 
         start += self.n['angles']
         for i, (a, b, c, d) in enumerate(self.dihedrals):
             if not self._mask[start + i]:
                 continue
-            rbc = atoms.get_distance(b, c)
+            rbc = atoms.get_distance(b, c) / Bohr
             rcovbc = rcov[b] + rcov[c]
             L = self.nbonds[b] + self.nbonds[c] - 2
-            h0[n] = At + Bt * L**Dt * np.exp(-Ct * (rbc - rcovbc)) / (rbc * rcovbc / Bohr**2)**Et
+            h0[n] = (At + Bt * L**Dt * np.exp(-Ct * (rbc - rcovbc)) / (rbc * rcovbc)**Et) * Hartree
             n += 1
 
-        H0 = np.diag(h0)
-        P = self.B(atoms.positions) @ self.Binv(atoms.positions)
-        return P.T @ H0 @ P
+        return np.diag(h0)

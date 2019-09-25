@@ -73,17 +73,12 @@ class PESWrapper:
         x0 = self.geom.x.copy()
         f0 = self.geom.f
         g0 = self.geom.g.copy()
-        h0 = self.geom.h.copy()
+        #h0 = self.geom.h.copy()
 
-        B0 = self.geom.B.copy()
-        U0 = self.geom.Ufree.copy()
         Binv0 = self.geom.Binv.copy()
-        #Hcart = self.geom.H_to_cart(self.H)
-        
 
         if self.H is not None:
-            dx_full = self.geom.int.q_wrap(self.geom.Ufree @ dx)
-            df_pred = g0.T @ dx_full + (dx_full.T @ self.H @ dx_full) / 2.
+            df_pred = self.geom.gfree.T @ dx + (dx.T @ self.Hred @ dx) / 2.
 
         dx_full = self.geom.kick(dx)
 
@@ -107,16 +102,20 @@ class PESWrapper:
         #    ratio = None
 
         if self.H is not None:
-            ratio = df_pred / df_actual
+            ratio = df_actual / df_pred
         else:
             ratio = None
 
 
-        #self.H = self.geom.H_to_int(Hcart)
-        #dh = self.geom.h - h0
-        #self.H = update_H(self.H, dx_full, dh)
-        dg = self.geom.g - g0
-        self.H = update_H(self.H, dx_full, dg)
+        ##dh = self.geom.h - h0
+        ##self.H = update_H(self.H, dx_full, dh)
+        #dg = self.geom.dg
+        #if self.H is not None:
+        #    Bnew = self.geom.int.B(self.geom.lastlast['x'])
+        #    P = Bnew @ Binv0
+        #    self.H = P @ self.H @ P.T
+        #self.H = update_H(self.H, dx_full, dg)
+        self.H = self.geom.update_H(self.H)
 
         if diag:
             self.diag(**diag_kwargs)
