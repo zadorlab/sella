@@ -95,17 +95,18 @@ class BasePES:
     def kick(self, dxfree, diag=False, **diag_kwargs):
         pos0 = self.atoms.positions.copy()
         f0 = self.f
-        g0 = self.g.copy()
+        #g0 = self.g.copy()
 
         # Update "free" coordinates, which in turn will also update
         # the "constrained" coordinates to reduce self.res
         self.xfree = self.xfree + dxfree
+        df_actual = self.f - f0
+        g0 = self.glast.copy()
 
         dx = self.dx(pos0)
         if self.H is not None:
             df_pred = g0.T @ dx + (dx.T @ self.H @ dx) / 2.
 
-        df_actual = self.f - f0
 
         if self.H is not None:
             ratio = df_pred / df_actual
@@ -201,6 +202,11 @@ class CartPES(BasePES):
         return self.last['g']
 
     @property
+    def glast(self):
+        self._update()
+        return self.lastlast['g']
+
+    @property
     def xfree(self):
         Ufree = self.cons.Ufree(self.atoms.positions)
         return Ufree.T @ self.x
@@ -243,6 +249,7 @@ class IntPES(BasePES):
                  trajectory=None, eta=1e-4, v0=None, angles=True,
                  dihedrals=True, extra_bonds=None):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
+        self.last.update(xint=None, gint=None, hint=None)
         self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
         self.cons = Constraints(self.atoms, constraints, p_t=False, p_r=False)
         self._H0 = self.int.guess_hessian(atoms)
@@ -275,11 +282,20 @@ class IntPES(BasePES):
         if not BasePES._update(self):
             # The geometry has not changed, so nothing needs to be done
             return
+        g = self.last['g']
         xint = self.int.q(self.atoms.positions)
-        gint = self.int.Binv(self.atoms.positions).T @ self.last['g']
-        h = gint - (self.drdx @ self.Ucons.T) @ gint
+        gint = self.int.Binv(self.atoms.positions).T @ g
+        #h = gint - (self.drdx @ self.Ucons.T) @ gint
+        h = g - self.int.B(self.atoms.positions).T @ self.drdx @ self.Ucons.T @ gint
+        hint = self.int.Binv(self.atoms.positions).T @ h
 
-        self.last.update(xint=xint, gint=gint, h=h)
+        self.last.update(xint=xint, gint=gint, h=h, hint=hint)
+        if (self.lastlast['xint'] is not None
+                and self.H is not None
+                and len(xint) != len(self.lastlast['xint'])):
+            P = self.int.B(self.lastlast['x']) @ self.Binvlast
+            self.H = P @ self.H @ P.T
+        self.Binvlast = self.Binv.copy()
 
     @property
     def x(self):
@@ -329,9 +345,15 @@ class IntPES(BasePES):
         return self.last['gint']
 
     @property
+    def glast(self):
+        self._update()
+        Binvlast = self.int.Binv(self.lastlast['x'].reshape((-1, 3)))
+        return Binvlast.T @ self.lastlast['g']
+
+    @property
     def h(self):
         self._update()
-        return self.last['h']
+        return self.last['hint']
 
     @property
     def xfree(self):
@@ -377,9 +399,7 @@ class IntPES(BasePES):
         dg = self.g - self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
         if self.H is None:
             H = self.int.guess_hessian(self.atoms)
-            P = self.B @ self.Binv
         else:
             H = self.H
-            P = self.int.B(self.lastlast['x']) @ self.Binvlast
-        self.Binvlast = self.Binv.copy()
+        P = self.B @ self.Binv
         self.H = update_H(P @ H @ P.T, dx, dg)
