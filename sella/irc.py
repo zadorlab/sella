@@ -3,14 +3,14 @@ import warnings
 import numpy as np
 from scipy.linalg import eigh
 
-from sella.peswrapper import PESWrapper
+from sella.peswrapper import CartPES, IntPES
 
 from ase.optimize.optimize import Optimizer
 
 
 def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
     Lcart = pes.lams
-    vecscart = pes.Tm @ pes.vecs
+    vecscart = pes.Ufree @ pes.vecs
 
     Hmw = (vecscart @ np.diag(Lcart) @ vecscart.T) / np.outer(sqrtm, sqrtm)
     L, vecs = eigh(Hmw)
@@ -79,17 +79,21 @@ class IRC(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
                  master=None, force_consistent=False, irctol=1e-2, dx=0.1,
                  eta=1e-4, gamma=0.4, peskwargs=None, **kwargs):
-        if isinstance(atoms, PESWrapper):
+        if isinstance(atoms, IntPES):
+            raise ValueError("IRC must use Cartesian coordinates. Please "
+                             "provide either an ASE Atoms object or a Sella "
+                             "CartPES object instead of an IntPES object.")
+        elif isinstance(atoms, CartPES):
             self.pes = atoms
             atoms = self.pes.atoms
         else:
-            self.pes = PESWrapper(atoms, atoms.calc, **kwargs)
+            self.pes = CartPES(atoms, eta=eta, **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, trajectory, master,
                            force_consistent)
         self.irctol = irctol
         self.dx = dx
         if peskwargs is None:
-            self.peskwargs = dict(eta=eta, gamma=gamma)
+            self.peskwargs = dict(gamma=gamma)
 
         if 'masses' not in self.atoms.arrays:
             try:
@@ -146,7 +150,7 @@ class IRC(Optimizer):
 
     def step(self):
         x0 = self.pes.x.copy()
-        Tm = self.pes.Tm.copy()
+        Pfree = self.pes.Ufree @ self.pes.Ufree.T
         g1 = self.pes.last['g']
         for n in range(100):
             if self.first:
@@ -159,13 +163,16 @@ class IRC(Optimizer):
                                                          self.xi)
                 epsnorm = np.linalg.norm(eps)
                 self.d1 += eps
-            f1, g1 = self.pes.evaluate(x0 + self.d1)
+            self.pes.x = x0 + self.d1
+            f1 = self.pes.f
+            g1 = self.pes.g.copy()
 
             d1m = self.d1 * self.sqrtm
             d1m /= np.linalg.norm(d1m)
-            g1m = ((Tm @ Tm.T) @ g1) / self.sqrtm
+            g1m = (Pfree @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
+            print(abs(1 - dot))
             if bound_clip and abs(1 - dot) < self.irctol:
                 break
         else:

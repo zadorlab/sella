@@ -211,6 +211,9 @@ def rs_prfo(pes, g, r_tr, Winv, order=1, alpha=0.5):
         H0 = Winv.T @ pes.Hred @ Winv
         lams, vecs = np.linalg.eigh(H0)
 
+    Winvmax = vecs[:, :order].T @ Winv @ vecs[:, :order]
+    Winvmin = vecs[:, order:].T @ Winv @ vecs[:, order:]
+
     Winvg = Winv @ g
     gmax = vecs[:, :order].T @ Winvg
     gmin = vecs[:, order:].T @ Winvg
@@ -231,11 +234,11 @@ def rs_prfo(pes, g, r_tr, Winv, order=1, alpha=0.5):
     else:
         smax = vmax[:-1, -1] / vmax[-1, -1]
         smin = vmin[:-1, 0] / vmin[-1, 0]
-        s = vecs[:, :order] @ smax + vecs[:, order:] @ smin
+        s = Winv @ (vecs[:, :order] @ smax + vecs[:, order:] @ smin)
         smag = np.linalg.norm(s)
 
     if smag <= r_tr:
-        return Winv @ s, smag, 1., False
+        return s, smag, 1., False
 
     lower = 0.
     upper = 1.
@@ -276,7 +279,7 @@ def rs_prfo(pes, g, r_tr, Winv, order=1, alpha=0.5):
 
         smax = vmax[:-1, -1] * alpha / vmax[-1, -1]
         smin = vmin[:-1, 0] * alpha / vmin[-1, 0]
-        s = vecs[:, :order] @ smax + vecs[:, order:] @ smin
+        s = Winv @ (vecs[:, :order] @ smax + vecs[:, order:] @ smin)
         smag = np.linalg.norm(s)
 
         if smag > r_tr:
@@ -304,7 +307,7 @@ def rs_prfo(pes, g, r_tr, Winv, order=1, alpha=0.5):
                    + (alpha / vmin[-1, 0]) * dvminda[:-1]
                    - (vmin[:-1, 0] * alpha / vmin[-1, 0]**2) * dvminda[-1])
 
-        dsmagda = (smin @ dsminda + smax @ dsmaxda) / smag
+        dsmagda = (smin @ Winvmin @ dsminda + smax @ Winvmax @ dsmaxda) / smag
         err = smag - r_tr
 
         alpha -= err / dsmagda

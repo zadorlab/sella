@@ -6,8 +6,10 @@ import numpy as np
 
 from ase.optimize.optimize import Optimizer
 
-from sella.peswrapper import PESWrapper
+#from sella.peswrapper import PESWrapper
 from sella.optimize import rs_newton, rs_rfo, rs_prfo
+#from sella.geom import CartGeom, IntGeom
+from sella.peswrapper import BasePES, CartPES, IntPES
 
 _default_kwargs = dict(minimum=dict(delta0=1e-1,
                                     sigma_inc=1.15,
@@ -37,23 +39,26 @@ class Sella(Optimizer):
         else:
             default = _default_kwargs['saddle']
 
-        if isinstance(atoms, PESWrapper):
+        if isinstance(atoms, BasePES):
             asetraj = trajectory
             self.pes = atoms
             atoms = self.pes.atoms
         else:
             asetraj = None
-            self.pes = PESWrapper(atoms, constraints=constraints,
-                                  trajectory=trajectory, eta=eta, v0=v0,
-                                  internal=internal)
-        self.geom = self.pes.geom
+            if internal:
+                self.pes = IntPES(atoms, constraints=constraints, trajectory=trajectory, eta=eta, v0=v0)
+            else:
+                self.pes = CartPES(atoms, constraints=constraints, trajectory=trajectory, eta=eta, v0=v0)
+            #self.pes = PESWrapper(atoms, constraints=constraints,
+            #                      trajectory=trajectory, eta=eta, v0=v0,
+            #                      internal=internal)
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
 
         if delta0 is None:
-            self.delta = default['delta0'] * len(self.geom.xfree)
+            self.delta = default['delta0'] * len(self.pes.xfree)
         else:
-            self.delta = delta0 * len(self.geom.xfree)
+            self.delta = delta0 * len(self.pes.xfree)
 
         if sigma_inc is None:
             self.sigma_inc = default['sigma_inc']
@@ -104,7 +109,7 @@ class Sella(Optimizer):
 
     def _predict_step(self):
         if not self.initialized:
-            self.glast = self.geom.gfree
+            self.glast = self.pes.gfree
             if self.eig:
                 self.pes.diag(**self.peskwargs)
             self.initialized = True
@@ -113,16 +118,16 @@ class Sella(Optimizer):
         if self.method == 'gmtrm':
             s, smag, self.xi, bound_clip = rs_newton(self.pes, self.glast,
                                                      self.delta,
-                                                     self.pes.geom.Winv,
+                                                     self.pes.Winv,
                                                      self.ord, self.xi)
         elif self.method == 'rsrfo':
             s, smag, self.xi, bound_clip = rs_rfo(self.pes, self.glast,
                                                   self.delta,
-                                                  self.pes.geom.Winv,
+                                                  self.pes.Winv,
                                                   self.ord, self.xi)
         elif self.method == 'rsprfo':
             s, smag, self.xi, bound_clip = rs_prfo(self.pes, self.glast,
-                                                   self.delta, self.pes.geom.Winv,
+                                                   self.delta, self.pes.Winv,
                                                    self.ord, self.xi)
         else:
             raise RuntimeError("Don't know what to do for method", self.method)
@@ -136,21 +141,24 @@ class Sella(Optimizer):
         # Determine if we need to call the eigensolver, then step
         ev = (self.eig and self.pes.lams is not None
               and np.any(self.pes.lams[:self.ord] > 0))
-        f, self.glast, rho = self.pes.update(s, ev, **self.peskwargs)
+        #f, self.glast, rho = self.pes.update(s, ev, **self.peskwargs)
+        f, self.glast, rho = self.pes.kick(s, ev, **self.peskwargs)
         self.niter += 1
 
         #print(smag, self.delta, rho)
 
-        ## TEMPORARY TEST: Schlegel trust radius update scheme
-        #if rho > 0.75 and smag > 0.8 * self.delta:
+        # TEMPORARY TEST: Schlegel trust radius update scheme
+        #if rho is None:
+        #    pass
+        #elif rho > 0.75 and smag > 0.8 * self.delta:
         #    self.delta *= 2
         #elif rho < 0.25:
         #    self.delta /= 4
 
         # Update trust radius
         if rho is None:
-            rho = 1.
-        if rho < 1./self.rho_dec or rho > self.rho_dec:
+            pass
+        elif rho < 1./self.rho_dec or rho > self.rho_dec:
             self.delta = max(smag * self.sigma_dec, self.delta_min)
         elif 1./self.rho_inc < rho < self.rho_inc:
             self.delta = max(self.sigma_inc * smag, self.delta)
@@ -159,4 +167,4 @@ class Sella(Optimizer):
         return self.pes.converged(self.fmax)
 
     def log(self, forces=None):
-        return Optimizer.log(self, self.geom.forces)
+        return Optimizer.log(self, self.pes.forces)
