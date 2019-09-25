@@ -226,6 +226,8 @@ class CartPES(BasePES):
         return np.eye(self.Ufree.shape[1])
 
     def update_H(self):
+        if self.lastlast['x'] is None:
+            return
         dx = self.x - self.lastlast['x']
         dg = self.g - self.lastlast['g']
         self.H = update_H(self.H, dx, dg)

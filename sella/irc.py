@@ -166,13 +166,13 @@ class IRC(Optimizer):
             self.pes.x = x0 + self.d1
             f1 = self.pes.f
             g1 = self.pes.g.copy()
+            self.pes.update_H()
 
             d1m = self.d1 * self.sqrtm
             d1m /= np.linalg.norm(d1m)
             g1m = (Pfree @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
-            print(abs(1 - dot))
             if bound_clip and abs(1 - dot) < self.irctol:
                 break
         else:
