@@ -161,10 +161,8 @@ class IRC(Optimizer):
                 eps, self.xi, bound_clip = rs_newton_irc(self.pes, self.sqrtm,
                                                          g1, self.d1, self.dx,
                                                          self.xi)
-                epsnorm = np.linalg.norm(eps)
                 self.d1 += eps
             self.pes.x = x0 + self.d1
-            f1 = self.pes.f
             g1 = self.pes.g.copy()
             self.pes.update_H()
 

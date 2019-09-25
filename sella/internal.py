@@ -2,15 +2,13 @@
 
 from __future__ import division
 
-import warnings
-
 import numpy as np
-from scipy.optimize import minimize
 from scipy.linalg import eigh
 from .internal_cython import get_internal, cart_to_internal, expand_internal
 
-from ase.data import covalent_radii, vdw_radii
+from ase.data import covalent_radii
 from ase.units import Hartree, Bohr
+
 
 class Internal:
     def __init__(self, atoms, angles=True, dihedrals=True, extra_bonds=None):
@@ -33,17 +31,21 @@ class Internal:
         self._bonding_changed = False
 
     def _get_internal(self):
-        out = get_internal(self.atoms, self.use_angles, self.use_dihedrals, self.extra_bonds)
+        out = get_internal(self.atoms, self.use_angles, self.use_dihedrals,
+                           self.extra_bonds)
         self.c10y, self.nbonds, self.bonds, self.angles, self.dihedrals = out
 
+        na = len(self.angles) if self.use_angles else 0
+        nd = len(self.dihedrals) if self.use_dihedrals else 0
+
         self.n = dict(bonds=len(self.bonds),
-                      angles=len(self.angles) if self.use_angles else 0,
-                      dihedrals=len(self.dihedrals) if self.use_dihedrals else 0)
+                      angles=na,
+                      dihedrals=nd)
         self.n.update(total=sum(self.n.values()))
         self._mask = np.ones(self.n['total'], dtype=np.uint8)
-        self.last = dict(x=None, q=None, B=None, U=None, Binv=None, D=None, w=None)
+        self.last = dict(x=None, q=None, B=None, U=None,
+                         Binv=None, D=None, w=None)
         self._update(self.atoms.positions, True, False)
-
 
     def _update(self, pos, gradient=False, curvature=False):
         pos = pos.reshape((-1, 3))
@@ -147,7 +149,7 @@ class Internal:
                 continue
 
             if (theta < np.pi / 36  # angle between 175 and 180 degrees
-                    or theta + np.pi / 36 > np.pi):  # Angle less than 5 degrees
+                    or theta + np.pi / 36 > np.pi):  # Angle < 5 degrees
                 # Add the terminal atoms to the "bad" list
                 bad.add(self.angles[i, 0])
                 bad.add(self.angles[i, 2])
@@ -158,8 +160,7 @@ class Internal:
                 # shouldn't be in self._masked_angles. Verify this.
                 for masked_angle in self._masked_angles:
                     assert not np.all(self.angles[i] == masked_angle)
-                
-                #print('masking new angle:', self.angles[i], "with value", theta)
+
                 self._masked_angles.append(self.angles[i].copy())
 
         if not bad:
@@ -172,9 +173,12 @@ class Internal:
                               self.c10y, self.nbonds, self.bonds, bad_np)
         self.c10y, self.nbonds, self.bonds, self.angles, self.dihedrals = out
 
+        na = len(self.angles) if self.use_angles else 0
+        nd = len(self.dihedrals) if self.use_dihedrals else 0
+
         self.n = dict(bonds=len(self.bonds),
-                      angles=len(self.angles) if self.use_angles else 0,
-                      dihedrals=len(self.dihedrals) if self.use_dihedrals else 0)
+                      angles=na,
+                      dihedrals=nd)
         self.n.update(total=sum(self.n.values()))
         self._mask = np.ones(self.n['total'], dtype=np.uint8)
         self.last = dict(x=None, q=None, B=None, U=None, Binv=None, D=None)
@@ -188,7 +192,8 @@ class Internal:
                     self._mask[nb + i] = False
                     break
             else:
-                raise RuntimeError("Couldn't find a masked angle in the list of all angles!")
+                raise RuntimeError("Couldn't find a masked angle "
+                                   "in the list of all angles!")
         for i, dihedral in enumerate(self.dihedrals):
             for masked_angle in self._masked_angles:
                 if (np.all(dihedral[:3] == masked_angle)
@@ -201,19 +206,19 @@ class Internal:
         rcov = covalent_radii[atoms.numbers] / Bohr
 
         # Stretch parameters
-        Ab = 0.3601 #* Hartree / Bohr**2
-        Bb = 1.944 #/ Bohr
+        Ab = 0.3601
+        Bb = 1.944
 
         # Bend parameters
-        Aa = 0.089 #* Hartree
-        Ba = 0.11 #* Hartree
-        Ca = 0.44 #/ Bohr
+        Aa = 0.089
+        Ba = 0.11
+        Ca = 0.44
         Da = -0.42
 
         # Torsion parameters
-        At = 0.0015 #* Hartree
-        Bt = 14.0 #* Hartree
-        Ct = 2.85 #/ Bohr
+        At = 0.0015
+        Bt = 14.0
+        Ct = 2.85
         Dt = 0.57
         Et = 4.00
 
@@ -226,7 +231,7 @@ class Internal:
                 continue
             rab = atoms.get_distance(a, b) / Bohr
             rcovab = rcov[a] + rcov[b]
-            h0[n] = (Aa * np.exp(-Bb * (rab - rcovab))) * Hartree / Bohr**2
+            h0[n] = (Ab * np.exp(-Bb * (rab - rcovab))) * Hartree / Bohr**2
             n += 1
 
         start += self.n['bonds']
@@ -237,7 +242,8 @@ class Internal:
             rbc = atoms.get_distance(b, c) / Bohr
             rcovab = rcov[a] + rcov[b]
             rcovbc = rcov[b] + rcov[c]
-            h0[n] = (Aa + Ba * np.exp(-Ca * (rab + rbc - rcovab - rcovbc)) / (rcovab * rcovbc)**Da) * Hartree
+            h0[n] = ((Aa + Ba * np.exp(-Ca * (rab + rbc - rcovab - rcovbc))
+                      / (rcovab * rcovbc)**Da) * Hartree)
             n += 1
 
         start += self.n['angles']
@@ -247,7 +253,8 @@ class Internal:
             rbc = atoms.get_distance(b, c) / Bohr
             rcovbc = rcov[b] + rcov[c]
             L = self.nbonds[b] + self.nbonds[c] - 2
-            h0[n] = (At + Bt * L**Dt * np.exp(-Ct * (rbc - rcovbc)) / (rbc * rcovbc)**Et) * Hartree
+            h0[n] = ((At + Bt * L**Dt * np.exp(-Ct * (rbc - rcovbc))
+                      / (rbc * rcovbc)**Et) * Hartree)
             n += 1
 
         return np.diag(h0)

@@ -7,10 +7,11 @@ from scipy.integrate import LSODA
 
 from sella.constraints import Constraints
 from sella.internal import Internal
-from sella.cython_routines import simple_ortho, modified_gram_schmidt
+from sella.cython_routines import modified_gram_schmidt
 from sella.hessian_update import update_H, symmetrize_Y
 from sella.linalg import NumericalHessian, ProjectedMatrix
 from sella.eigensolvers import rayleigh_ritz
+
 
 class DummyTrajectory:
     def write(self):
@@ -18,7 +19,8 @@ class DummyTrajectory:
 
 
 class BasePES:
-    def __init__(self, atoms, eigensolver='jd0', trajectory=None, eta=1e-4, v0=None):
+    def __init__(self, atoms, eigensolver='jd0', trajectory=None, eta=1e-4,
+                 v0=None):
         self.atoms = atoms
         self.last = dict(x=None, f=None, g=None)
         self.lastlast = dict(x=None, f=None, g=None)
@@ -69,7 +71,6 @@ class BasePES:
         return ((self.forces**2).sum(1).max() < fmax**2
                 and (np.linalg.norm(self.res) < maxres))
 
-
     @property
     def B(self):
         return np.eye(len(self.x))
@@ -95,7 +96,7 @@ class BasePES:
         pos0 = self.atoms.positions.copy()
         f0 = self.f
         g0 = self.g.copy()
-        
+
         # Update "free" coordinates, which in turn will also update
         # the "constrained" coordinates to reduce self.res
         self.xfree = self.xfree + dxfree
@@ -117,7 +118,6 @@ class BasePES:
             self.diag(**diag_kwargs)
 
         return self.f, self.gfree, ratio
-
 
     def dx(self, pos0):
         x1 = self.x.copy()
@@ -145,9 +145,12 @@ class BasePES:
         if P is None:
             P = np.eye(len(self.xfree))
             v0 = self.gfree.copy()
-        Htrue = NumericalHessian(self._calc_eg, x0, self.g.copy(), self.eta, threepoint)
+        Htrue = NumericalHessian(self._calc_eg, x0, self.g.copy(), self.eta,
+                                 threepoint)
         Hproj = ProjectedMatrix(Htrue, self.Ufree)
-        lams, Vs, AVs = rayleigh_ritz(Hproj, gamma, P, v0=v0, method=self.eigensolver, maxiter=maxiter)
+        lams, Vs, AVs = rayleigh_ritz(Hproj, gamma, P, v0=v0,
+                                      method=self.eigensolver,
+                                      maxiter=maxiter)
         Vs = Hproj.Vs
         AVs = Hproj.AVs
         self.x = x0
@@ -160,8 +163,10 @@ class BasePES:
         self.lastlast = lastlast
         self.last = last
 
+
 class CartPES(BasePES):
-    def __init__(self, atoms, eigensolver='jd0', constraints=None, trajectory=None, eta=1e-4, v0=None):
+    def __init__(self, atoms, eigensolver='jd0', constraints=None,
+                 trajectory=None, eta=1e-4, v0=None):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
         self.last.update(gfree=None, h=None)
         self.cons = Constraints(atoms, constraints)
@@ -234,8 +239,8 @@ class CartPES(BasePES):
 
 
 class IntPES(BasePES):
-    def __init__(self, atoms, eigensolver='jd0', constraints=None, trajectory=None, 
-                 eta=1e-4, v0=None, angles=True,
+    def __init__(self, atoms, eigensolver='jd0', constraints=None,
+                 trajectory=None, eta=1e-4, v0=None, angles=True,
                  dihedrals=True, extra_bonds=None):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
         self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
@@ -252,7 +257,8 @@ class IntPES(BasePES):
 
     @property
     def Ufree(self):
-        # This is a bit convoluted. There might be a better way to accomplish this.
+        # This is a bit convoluted.
+        # There might be a better way to accomplish this.
         Ufree = self.cons.Ufree(self.atoms.positions)
         B = self.int.B(self.atoms.positions)
         B = B @ (Ufree @ Ufree.T)
@@ -291,7 +297,8 @@ class IntPES(BasePES):
         while ode.status == 'running':
             ode.step()
             if ode.nfev > 200:
-                raise RuntimeError("Geometry update ODE is taking too long to converge!")
+                raise RuntimeError("Geometry update ODE is taking "
+                                   "too long to converge!")
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
         self.atoms.positions = ode.y[:nx].reshape((-1, 3))
@@ -361,8 +368,9 @@ class IntPES(BasePES):
 
     @property
     def Winv(self):
-        H0free = self.Ufree.T @ np.diag(1./np.sqrt(np.diag(self.int.guess_hessian(self.atoms)))) @ self.Ufree
-        return H0free / np.linalg.det(H0free)**(1./len(H0free))
+        h0 = np.diag(self.int.guess_hessian(self.atoms))
+        Winv = self.Ufree.T @ np.diag(1./np.sqrt(h0)) @ self.Ufree
+        return Winv / np.linalg.det(Winv)**(1./len(Winv))
 
     def update_H(self):
         dx = self.int.q_wrap(self.x - self.int.q(self.lastlast['x']))

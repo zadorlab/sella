@@ -135,12 +135,13 @@ def rs_newton(pes, g, r_tr, order=1, xi=1.):
     assert abs(dx_mag - r_tr) < 1e-12
     return dx, dx_mag, xi, True
 
+
 def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
     Hmm = pes.Hred
     if Hmm is None:
         Hmm = np.eye(len(g))
     Hmm = Winv.T @ Hmm @ Winv
-    H0 = np.block([[Hmm, (g @ Winv)[:, np.newaxis]] , [g @ Winv, 0]])
+    H0 = np.block([[Hmm, (g @ Winv)[:, np.newaxis]], [g @ Winv, 0]])
     l, V = eigh(H0)
 
     s = Winv @ V[:-1, order] / V[-1, order]
@@ -185,8 +186,8 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
                  / (l[order] - l[:order])))
                 + (V[:, order+1:] @ ((V[:, order+1:].T @ dHda @ V[:, order])
                    / (l[order] - l[order+1:]))))
-        ## dsda is the derivative of the displacement vector s w.r.t. alpha.
-        ## ds/da = (ds/dv[:-1]) (dv[:-1]/da) + (ds/dv[-1]) (dv[-1]/da)
+        # dsda is the derivative of the displacement vector s w.r.t. alpha.
+        # ds/da = (ds/dv[:-1]) (dv[:-1]/da) + (ds/dv[-1]) (dv[-1]/da)
         dsda = (V[:-1, order] / V[-1, order]
                 + (alpha / V[-1, order]) * dVda[:-1]
                 - (V[:-1, order] * alpha / V[-1, order]**2) * dVda[-1])

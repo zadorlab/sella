@@ -6,9 +6,7 @@ import numpy as np
 
 from ase.optimize.optimize import Optimizer
 
-#from sella.peswrapper import PESWrapper
 from sella.optimize import rs_newton, rs_rfo, rs_prfo
-#from sella.geom import CartGeom, IntGeom
 from sella.peswrapper import BasePES, CartPES, IntPES
 
 _default_kwargs = dict(minimum=dict(delta0=1e-1,
@@ -46,12 +44,11 @@ class Sella(Optimizer):
         else:
             asetraj = None
             if internal:
-                self.pes = IntPES(atoms, constraints=constraints, trajectory=trajectory, eta=eta, v0=v0)
+                self.pes = IntPES(atoms, constraints=constraints,
+                                  trajectory=trajectory, eta=eta, v0=v0)
             else:
-                self.pes = CartPES(atoms, constraints=constraints, trajectory=trajectory, eta=eta, v0=v0)
-            #self.pes = PESWrapper(atoms, constraints=constraints,
-            #                      trajectory=trajectory, eta=eta, v0=v0,
-            #                      internal=internal)
+                self.pes = CartPES(atoms, constraints=constraints,
+                                   trajectory=trajectory, eta=eta, v0=v0)
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
 
@@ -134,26 +131,14 @@ class Sella(Optimizer):
 
         return s, smag
 
-
     def step(self):
         s, smag = self._predict_step()
 
         # Determine if we need to call the eigensolver, then step
         ev = (self.eig and self.pes.lams is not None
               and np.any(self.pes.lams[:self.ord] > 0))
-        #f, self.glast, rho = self.pes.update(s, ev, **self.peskwargs)
         f, self.glast, rho = self.pes.kick(s, ev, **self.peskwargs)
         self.niter += 1
-
-        #print(smag, self.delta, rho)
-
-        # TEMPORARY TEST: Schlegel trust radius update scheme
-        #if rho is None:
-        #    pass
-        #elif rho > 0.75 and smag > 0.8 * self.delta:
-        #    self.delta *= 2
-        #elif rho < 0.25:
-        #    self.delta /= 4
 
         # Update trust radius
         if rho is None:
