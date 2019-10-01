@@ -308,7 +308,8 @@ def rs_prfo(pes, g, r_tr, Winv, order=1, alpha=0.5):
                    + (alpha / vmin[-1, 0]) * dvminda[:-1]
                    - (vmin[:-1, 0] * alpha / vmin[-1, 0]**2) * dvminda[-1])
 
-        dsmagda = (smin @ Winvmin @ dsminda + smax @ Winvmax @ dsmaxda) / smag
+        dsda = Winv @ (vecs[:, :order] @ dsmaxda + vecs[:, order:] @ dsminda)
+        dsmagda = (s @ dsda) / smag
         err = smag - r_tr
 
         alpha -= err / dsmagda

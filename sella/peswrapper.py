@@ -107,7 +107,6 @@ class BasePES:
         if self.H is not None:
             df_pred = g0.T @ dx + (dx.T @ self.H @ dx) / 2.
 
-
         if self.H is not None:
             ratio = df_pred / df_actual
         else:
@@ -251,22 +250,34 @@ class IntPES(BasePES):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
         self.last.update(xint=None, gint=None, hint=None)
         self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
-        self.cons = Constraints(self.atoms, constraints, p_t=False, p_r=False)
+        
+        self._conin = constraints
+        if self._conin is None:
+            con = dict()
+        else:
+            con = self._conin.copy()
+        for key, val in self.int.cons.items():
+            con[key] = con.get(key, []) + val
+        self.cons = Constraints(self.atoms, con, p_t=False, p_r=False)
         self._H0 = self.int.guess_hessian(atoms)
         self.Binvlast = self.Binv.copy()
+        self._natoms = len(atoms)
+        self.int_last = None
 
-    res = property(lambda self: self.cons.res(self.atoms.positions))
+    dummies = property(lambda self: self.int.dummies)
+
+    res = property(lambda self: self.cons.res((self.atoms + self.dummies).positions))
 
     @property
     def drdx(self):
-        drdx = self.cons.drdx(self.atoms.positions)
+        drdx = self.cons.drdx((self.atoms + self.dummies).positions)
         return self.int.Binv(self.atoms.positions).T @ drdx
 
     @property
     def Ufree(self):
         # This is a bit convoluted.
         # There might be a better way to accomplish this.
-        Ufree = self.cons.Ufree(self.atoms.positions)
+        Ufree = self.cons.Ufree((self.atoms + self.dummies).positions)
         B = self.int.B(self.atoms.positions)
         B = B @ (Ufree @ Ufree.T)
         G = B @ B.T
@@ -284,18 +295,18 @@ class IntPES(BasePES):
             return
         g = self.last['g']
         xint = self.int.q(self.atoms.positions)
-        gint = self.int.Binv(self.atoms.positions).T @ g
-        #h = gint - (self.drdx @ self.Ucons.T) @ gint
-        h = g - self.int.B(self.atoms.positions).T @ self.drdx @ self.Ucons.T @ gint
-        hint = self.int.Binv(self.atoms.positions).T @ h
+        gint = self.int.Binv(self.atoms.positions)[:3*len(self.atoms)].T @ g
+        #h = g - self.int.B(self.atoms.positions).T @ self.drdx @ self.Ucons.T @ gint
+        #hint = self.int.Binv(self.atoms.positions).T @ h
 
-        self.last.update(xint=xint, gint=gint, h=h, hint=hint)
-        if (self.lastlast['xint'] is not None
-                and self.H is not None
-                and len(xint) != len(self.lastlast['xint'])):
-            P = self.int.B(self.lastlast['x']) @ self.Binvlast
-            self.H = P @ self.H @ P.T
-        self.Binvlast = self.Binv.copy()
+        #self.last.update(xint=xint, gint=gint, h=h, hint=hint)
+        self.last.update(xint=xint, gint=gint)
+        #if (self.lastlast['xint'] is not None
+        #        and self.H is not None
+        #        and len(xint) != len(self.lastlast['xint'])):
+        #    P = self.int.B(self.lastlast['x']) @ self.Binvlast
+        #    self.H = P @ self.H @ P.T
+        #self.Binvlast = self.Binv.copy()
 
     @property
     def x(self):
@@ -303,31 +314,57 @@ class IntPES(BasePES):
 
     @x.setter
     def x(self, target):
-        pos0 = self.atoms.positions.ravel().copy()
         dq = self.int.q_wrap(target - self.x)
-        nx = len(pos0)
-        y0 = np.zeros(2 * nx)
-        y0[:nx] = pos0
-        y0[nx:] = self.int.Binv(self.atoms.positions) @ dq
-        ode = LSODA(self._q_ode, 0., y0, t_bound=1., atol=1e-9)
-        while ode.status == 'running':
-            ode.step()
-            if ode.nfev > 200:
-                raise RuntimeError("Geometry update ODE is taking "
-                                   "too long to converge!")
+        pos0 = self.atoms.positions.ravel().copy()
+        dpos0 = self.dummies.positions.ravel().copy()
+        B0 = self.B.copy()
+
+        t0 = 0.
+        running = True
+        while running:
+            pos = self.atoms.positions.ravel().copy()
+            dpos = self.dummies.positions.ravel().copy()
+            nx = len(pos)
+            ndx = len(dpos)
+            y0 = np.zeros(2 * (nx + ndx))
+            y0[:nx] = pos
+            y0[nx:nx+ndx] = dpos
+            y0[nx+ndx:] = self.Binv @ dq
+            ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-9)
+            while ode.status == 'running':
+                ode.step()
+                t0 = ode.t
+                if self.int.check_for_bad_internal(self.x):
+                    if self.int_last is None:
+                        self.int_last = self.int
+                    self.int = Internal(self.atoms,
+                                        self.int_last.use_angles,
+                                        self.int_last.use_dihedrals,
+                                        self.int_last.extra_bonds,
+                                        self.int_last.dummies)
+                    dq = self.B[:, :nx+ndx] @ ode.y[nx+ndx:]
+                    break
+                if ode.nfev > 200:
+                    raise RuntimeError("Geometry update ODE is taking "
+                                       "too long to converge!")
+            else:
+                running = False
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
         self.atoms.positions = ode.y[:nx].reshape((-1, 3))
+        self.int.dummies.positions = ode.y[nx:nx+ndx].reshape((-1, 3))
 
     def _q_ode(self, t, y):
-        nx = len(y) // 2
-        x = y[:nx]
-        dxdt = y[nx:]
+        nx = 3 * len(self.atoms)
+        ndx = 3 * len(self.int.dummies)
+        x = y[:nx+ndx]
+        dxdt = y[nx+ndx:]
 
         dydt = np.zeros_like(y)
-        dydt[:nx] = dxdt
+        dydt[:nx+ndx] = dxdt
 
-        self.atoms.positions = x.reshape((-1, 3)).copy()
+        self.atoms.positions = x[:nx].reshape((-1, 3)).copy()
+        self.int.dummies.positions = x[nx:].reshape((-1, 3)).copy()
         D = self.int.D(self.atoms.positions)
         Binv = self.int.Binv(self.atoms.positions)
         dydt[nx:] = -Binv @ D.ddot(dxdt, dxdt)
@@ -348,7 +385,7 @@ class IntPES(BasePES):
     def glast(self):
         self._update()
         Binvlast = self.int.Binv(self.lastlast['x'].reshape((-1, 3)))
-        return Binvlast.T @ self.lastlast['g']
+        return Binvlast[:3*len(self.atoms)].T @ self.lastlast['g']
 
     @property
     def h(self):
@@ -378,7 +415,8 @@ class IntPES(BasePES):
         return forces_cart.reshape((-1, 3))
 
     def dx(self, pos0):
-        return self.int.q_wrap(BasePES.dx(self, pos0))
+        x0 = self.int.q(pos0)
+        return self.int.q_wrap(self.x - x0)
 
     @property
     def B(self):
@@ -395,6 +433,41 @@ class IntPES(BasePES):
         return Winv / np.linalg.det(Winv)**(1./len(Winv))
 
     def update_H(self):
+        if self.int_last is not None:
+            # TODO: This logic should be moved out of update_H
+            #
+            # Internal coordinate definitions changed.
+            # Update the Hessian using the old internal coordinate definition,
+            # then transform to the new internal coordinates.
+            nd0 = len(self.int_last.dummies)
+            self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
+            q1 = self.int_last.q(self.atoms.positions)
+            dx = self.int_last.q_wrap(q1 - self.lastlast['xint'])
+            nx = 3 * len(self.atoms)
+
+            dg = self.int_last.Binv(self.atoms.positions).T @ self.last['g'] - self.lastlast['gint']
+            if self.H is not None:
+                H = self.int_last.guess_hessian(self.atoms)
+            else:
+                H = self.H
+            Blast = self.int_last.B(self.atoms.positions)
+            Binvlast = self.int_last.Binv(self.atoms.positions)
+            P = Blast @ Binvlast
+            H = update_H(P @ H @ P.T, dx, dg)
+            P2 = self.B[:, :nx + 3*nd0] @ Binvlast
+            self.H = P2 @ H @ P2.T
+            self.int_last = None
+
+            # now create new constraints
+            if self._conin is None:
+                con = dict()
+            else:
+                con = self._conin.copy()
+            for key, val in self.int.cons.items():
+                con[key] = con.get(key, []) + val
+            self.cons = Constraints(self.atoms + self.dummies, con, p_t=False, p_r=False)
+            return
+
         dx = self.int.q_wrap(self.x - self.int.q(self.lastlast['x']))
         dg = self.g - self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
         if self.H is None:

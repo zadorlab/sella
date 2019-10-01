@@ -66,7 +66,8 @@ cdef void flood_fill(size_t idx, size_t[:] nbonds, int[:, :] c10y, int[:] labels
             labels[j] = label
             flood_fill(j, nbonds, c10y, labels, label)
 
-def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, list add_bonds=None):
+def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, list add_bonds=None,
+                 object dummies=None, double linear_thresh=1e-2):
     """Find bonding (and optionally angle bend/dihedral) internal
     coordinates of a molecule.
 
@@ -75,9 +76,15 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
     use_angles -- Include angle bends in internal coordinate search
     use_dihedrals -- Include dihedral angles
     """
-    cdef size_t i, j, k
+
+    if dummies is None:
+        dummies = Atoms()
+    cdef size_t ndummies = len(dummies)
+
+    cdef size_t i, j, k, l, m, n, a
     cdef size_t natoms = len(atoms)
 
+    cdef double[:, :] pos = memoryview(atoms.positions)
     cdef double[:, :] rij = memoryview(atoms.get_all_distances())
     cdef double[:] rcov = memoryview((1.335 * np.array([covalent_radii[atom.number] for atom in atoms])))
 
@@ -153,229 +160,240 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
 
         scale *= 1.05
 
+    angles_np = -np.ones((nbonds_tot**2, 3), dtype=np.int32)
+    cdef int[:, :] angles = memoryview(angles_np)
+
+
+    cdef size_t nangles_tot = 0
+    for i in range(natoms):
+        nb = nbonds[i]
+        for n in range(nb):
+            j = c10y[i, n]
+            for m in range(n+1, nb):
+                k = c10y[i, m]
+                angles[nangles_tot, 0] = j
+                angles[nangles_tot, 1] = i
+                angles[nangles_tot, 2] = k
+                nangles_tot += 1
+    angles_np = np.resize(angles_np, (nangles_tot, 3))
+    assert np.all(angles_np >= 0)
+
+    angles_good_np = -np.ones((_MAX_BONDS * nbonds_tot // 2, 3), dtype=np.int32)
+    angles_bad_np = -np.ones_like(angles_np)
+    cdef int[:, :] angles_good = memoryview(angles_good_np)
+    cdef int[:, :] angles_bad = memoryview(angles_bad_np)
+
+    # Variables for calculating angle
+    cdef double[:] xji = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double[:] xjk = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double[:] xji_xjk = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double rjidjk, rjixjk, angle
+
+    # Variables for dummy atom search
+    cdef double[:] xik = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double[:] xjl = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double[:] d1 = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double[:] d2 = array(shape=(3,), itemsize=sizeof(double), format="d")
+    cdef double rik, rjl, dimmin, rd1, rd2, rd1djl
+    cdef int dim1
+
+    cdef int ndummies_max = natoms
+    pos_dummies_np = np.zeros((ndummies_max, 3), dtype=np.float64)
+    pos_dummies_np[:ndummies] = dummies.positions.copy()
+    cdef double[:, :] pos_dummies = memoryview(pos_dummies_np)
+
+    # Loop over naive angles looking for collinear cases.
+    # In those cases, check to see whether any dummy atoms need to be added,
+    # and add them.
+    cdef size_t nangles_good = 0
+    cdef size_t nangles_bad = 0
+    for n in range(nangles_tot):
+        i = angles[n, 0]
+        j = angles[n, 1]
+        k = angles[n, 2]
+        # Calculate the angle
+        for m in range(3):
+            xji[m] = pos[i, m] - pos[j, m]
+            xjk[m] = pos[k, m] - pos[j, m]
+            xik[m] = pos[k, m] - pos[i, m]
+        rjidjk = ddot(&THREE, &xji[0], &UNITY, &xjk[0], &UNITY)
+        cross(xji, xjk, xji_xjk)
+        rjixjk = dnrm2(&THREE, &xji_xjk[0], &UNITY)
+        angle = atan2(rjixjk, -rjidjk)
+        # If the system is *not* collinear, the angle 
+        if linear_thresh < angle < pi - linear_thresh:
+            angles_good[nangles_good, 0] = i
+            angles_good[nangles_good, 1] = j
+            angles_good[nangles_good, 2] = k
+            nangles_good += 1
+            continue
+        # Angle is collinear
+        angles_bad[nangles_bad, 0] = i
+        angles_bad[nangles_bad, 1] = j
+        angles_bad[nangles_bad, 2] = k
+        nangles_bad += 1
+        # Determine whether any dummy atoms are needed
+        rik = dnrm2(&THREE, &xik[0], &UNITY)
+        # Align dummy atom along cartesian direction that is maximally
+        # orthogonal to the xik vector, and then orthogonalize.
+        dim1 = -1
+        dimmin = 2.
+        for m in range(3):
+            d1[m] = 0.
+            xik[m] / rik
+            if abs(xik[m]) < dimmin:
+                dim1 = m
+                dimmin = abs(xik[m])
+        assert dim1 == 0 or dim1 == 1 or dim1 == 2
+        d1[dim1] = 1.
+        for m in range(3):
+            d1[m] -= xik[m] * xik[dim1]
+        rd1 = dnrm2(&THREE, &d1[0], &UNITY)
+        for m in range(3):
+            d1[m] /= rd1
+        # If the central atom (j) has only two bonding partners (which are
+        # necessarily i and k), then we will need to add *two* dummy atoms.
+        if nbonds[j] == 2:
+            cross(xik, d1, d2)
+            # d2 should be normalized already, but just to be safe:
+            rd2 = dnrm2(&THREE, &d2[0], &UNITY)
+            for m in range(3):
+                d2[m] /= rd2
+            for m in range(3):
+                pos_dummies[ndummies, m] = pos[j, m] + d1[m]
+                pos_dummies[ndummies + 1, m] = pos[j, m] + d2[m]
+            bonds[nbonds_tot, 0] = j
+            bonds[nbonds_tot, 1] = natoms + ndummies
+
+            bonds[nbonds_tot + 1, 0] = j
+            bonds[nbonds_tot + 1, 1] = natoms + ndummies + 1
+            nbonds_tot += 2
+
+            c10y[j, nbonds[j]] = natoms + ndummies
+            c10y[j, nbonds[j] + 1] = natoms + ndummies + 1
+            nbonds[j] += 2
+            angles_good[nangles_good, 0] = i
+            angles_good[nangles_good, 1] = j
+            angles_good[nangles_good, 2] = natoms + ndummies
+
+            angles_good[nangles_good + 1, 0] = i
+            angles_good[nangles_good + 1, 1] = j
+            angles_good[nangles_good + 1, 2] = natoms + ndummies + 1
+
+            angles_good[nangles_good + 2, 0] = k
+            angles_good[nangles_good + 2, 1] = j
+            angles_good[nangles_good + 2, 2] = natoms + ndummies
+
+            angles_good[nangles_good + 3, 0] = k
+            angles_good[nangles_good + 3, 1] = j
+            angles_good[nangles_good + 3, 2] = natoms + ndummies + 1
+
+            angles_good[nangles_good + 4, 0] = natoms + ndummies
+            angles_good[nangles_good + 4, 1] = j
+            angles_good[nangles_good + 4, 2] = natoms + ndummies + 1
+            nangles_good += 5
+            ndummies += 2
+        # If the central atom (j) has more than two bonding partners, then
+        # we need at most one dummy atom. Orthogonalize d1 against the vectors
+        # between the central atom and all of its bonding partners. If the
+        # magnitude of d1 becomes equal to 0 at any point in this process,
+        # then no dummy atoms are needed. Otherwise, add a dummy atom in the
+        # direction of d1 after orthonormalization.
+        else:
+            for a in range(nbonds[j]):
+                l = c10y[j, a]
+                # Project out the components of d1 in the direction of the
+                # xlj bonding vector.
+                for m in range(3):
+                    xjl[m] = pos[l, m] - pos[j, m]
+                rlj2 = ddot(&THREE, &xjl[0], &UNITY, &xjl[0], &UNITY)
+                rd1djl = ddot(&THREE, &xjl[0], &UNITY, &d1[0], &UNITY) / rlj2
+                for m in range(3):
+                    d1[m] -= xjl[m] * rd1djl
+                rd1 = dnrm2(&THREE, &d1[0], &UNITY)
+                if rd1 < 1e-4:
+                    # If the magnitude of d1 is very small after one
+                    # orthogonalization step, then we don't need to add
+                    # a dummy atom.
+                    break
+                for m in range(3):
+                    d1[m] /= rd1
+            else:
+                c10y[j, nbonds[j]] = natoms + ndummies
+                nbonds[j] += 1
+                for m in range(3):
+                    pos_dummies[ndummies, m] = pos[j, m] + d1[m]
+                for m in range(nbonds[j]):
+                    l = c10y[j, m]
+                    angles_good[nangles_good, 0] = l
+                    angles_good[nangles_good, 1] = j
+                    angles_good[nangles_good, 2] = natoms + ndummies
+                    nangles_good += 1
+                ndummies += 1
+
     bonds_np = np.resize(bonds_np, (nbonds_tot, 2))
     assert np.all(bonds_np >= 0)
 
-    cdef size_t nangles_tot = 0
-    # TODO: nbonds_tot**2 is certainly overkill, find a more reasonable
-    # upper bound for the number of angles
-    if use_angles:
-        angles_np = -np.ones((nbonds_tot**2, 3), dtype=np.int32)
-    else:
-        angles_np = np.empty((0, 3), dtype=np.int32)
-    cdef int[:, :] angles = memoryview(angles_np)
+    angles_good_np = np.resize(angles_good_np, (nangles_good, 3))
+    assert np.all(angles_good_np >= 0)
 
-    cdef size_t ndihedrals_tot = 0
-    # TODO: nbonds_tot**3 is certainly overkill, find a more reasonable
-    # upper bound for the number of dihedrals
-    if use_dihedrals:
-        dihedrals_np = -np.ones((nbonds_tot**3, 4), dtype=np.int32)
-    else:
-        dihedrals_np = np.empty((0, 4), dtype=np.int32)
+    angles_bad_np = np.resize(angles_bad_np, (nangles_bad, 3))
+    assert np.all(angles_bad_np >= 0)
+
+    pos_dummies_np = np.resize(pos_dummies_np, (ndummies, 3))
+    dummies = Atoms(['X'] * ndummies, pos_dummies_np)
+
+    cdef bint bad_dihedral
+    dihedrals_np = -np.ones((nangles_good * _MAX_BONDS // 2, 4), dtype=np.int32)
     cdef int[:, :] dihedrals = memoryview(dihedrals_np)
-
-    if not (use_angles or use_dihedrals):
-        return c10y_np, nbonds_np, bonds_np, angles_np, dihedrals_np
-
-    nangles_tot, ndihedrals_tot = get_angles_dihedrals(use_angles, use_dihedrals, c10y, nbonds, bonds, angles, dihedrals)
-
-    angles_np = np.resize(angles_np, (nangles_tot, 3))
-    assert np.all(angles_np >= 0)
+    cdef size_t ndihedrals_tot = 0
+    for n in range(nangles_good):
+        i = angles_good[n, 0]
+        j = angles_good[n, 1]
+        k = angles_good[n, 2]
+        if i < natoms:
+            for a in range(nbonds[i]):
+                l = c10y[i, a]
+                if l == j or l >= k:
+                    continue
+                bad_dihedral = False
+                for m in range(nangles_bad):
+                    if (i == angles_bad[m, 1] and
+                            ((l == angles_bad[m, 0] and j == angles_bad[m, 2])
+                                or (j == angles_bad[m, 0] and l == angles_bad[m, 2]))):
+                        bad_dihedral = True
+                        break
+                if bad_dihedral:
+                    continue
+                dihedrals[ndihedrals_tot, 0] = l
+                dihedrals[ndihedrals_tot, 1] = i
+                dihedrals[ndihedrals_tot, 2] = j
+                dihedrals[ndihedrals_tot, 3] = k
+                ndihedrals_tot += 1
+        if k < natoms:
+            for a in range(nbonds[k]):
+                l = c10y[k, a]
+                if l == j or l >= i:
+                    continue
+                bad_dihedral = False
+                for m in range(nangles_bad):
+                    if (k == angles_bad[m, 1] and
+                            ((l == angles_bad[m, 0] and j == angles_bad[m, 2])
+                                or (j == angles_bad[m, 0] and l == angles_bad[m, 2]))):
+                        bad_dihedral = True
+                        break
+                if bad_dihedral:
+                    continue
+                dihedrals[ndihedrals_tot, 0] = l
+                dihedrals[ndihedrals_tot, 1] = k
+                dihedrals[ndihedrals_tot, 2] = j
+                dihedrals[ndihedrals_tot, 3] = i
+                ndihedrals_tot += 1
 
     dihedrals_np = np.resize(dihedrals_np, (ndihedrals_tot, 4))
     assert np.all(dihedrals_np >= 0)
 
-    return c10y_np, nbonds_np, bonds_np, angles_np, dihedrals_np
-
-cdef (size_t, size_t) get_angles_dihedrals(bint use_angles,
-                                           bint use_dihedrals,
-                                           int[:, :] c10y,
-                                           size_t[:] nbonds,
-                                           int[:, :] bonds,
-                                           int[:, :] angles,
-                                           int[:, :] dihedrals):
-
-    cdef size_t natoms = len(nbonds)
-    cdef size_t i, j, k, jj, kk, m, mm
-
-    cdef size_t nangles_max = len(angles)
-    cdef size_t ndihedrals_max = len(dihedrals)
-
-    cdef size_t nangles_tot = 0
-    cdef size_t ndihedrals_tot = 0
-
-    for i in range(natoms):
-        for jj in range(nbonds[i]):
-            j = c10y[i, jj]
-            for kk in range(nbonds[j]):
-                k = c10y[j, kk]
-                # (i, j, i) is not a valid angle
-                if k == i:
-                    continue
-                # to avoid double-counting angles, only consider triplets
-                # (i, j, k) where k > i
-                elif use_angles and k>i:
-                    assert nangles_tot <= nangles_max
-                    angles[nangles_tot, 0] = i
-                    angles[nangles_tot, 1] = j
-                    angles[nangles_tot, 2] = k
-                    nangles_tot += 1
-                if not use_dihedrals:
-                    continue
-                for mm in range(nbonds[k]):
-                    m = c10y[k, mm]
-                    # similar to before, only consider quadruplets
-                    # (i, j, k, m) where m > i
-                    if m == j or m <= i:
-                        continue
-                    assert ndihedrals_tot <= ndihedrals_max
-
-                    dihedrals[ndihedrals_tot, 0] = i
-                    dihedrals[ndihedrals_tot, 1] = j
-                    dihedrals[ndihedrals_tot, 2] = k
-                    dihedrals[ndihedrals_tot, 3] = m
-                    ndihedrals_tot += 1
-
-    return nangles_tot, ndihedrals_tot
-
-
-def expand_internal(object atoms,
-                    bint use_angles,
-                    bint use_dihedrals,
-                    np.ndarray[np.int32_t, ndim=2] c10y_np,
-                    np.ndarray[np.uintp_t, ndim=1] nbonds_np,
-                    np.ndarray[np.int32_t, ndim=2] bonds_np,
-                    np.ndarray[np.uintp_t, ndim=1] problem_np):
-    """Given the information provided by get_internal and a list of
-    "problematic" atoms, expand the list of bonds (and dihedrals/angles,
-    if requested) such that the problematic atoms are bonded to the
-    next-closest atom to which they are not currently bonded."""
-
-    cdef size_t natoms = len(atoms)
-    cdef size_t nproblem = len(problem_np)
-    cdef double[:, :] pos = memoryview(atoms.positions)
-    cdef size_t nbonds_tot = len(bonds_np)
-
-    nbonds_orig_np = nbonds_np.copy()
-    cdef size_t[:] nbonds_orig = memoryview(nbonds_orig_np)
-
-    bonds_new_np = np.zeros((nbonds_tot + nproblem, 2), dtype=np.int32)
-    bonds_new_np[:nbonds_tot] = bonds_np
-
-    cdef int[:, :] c10y = memoryview(c10y_np)
-    cdef size_t[:] nbonds = memoryview(nbonds_np)
-    cdef int[:, :] bonds_new = memoryview(bonds_new_np)
-    cdef size_t[:] problem = memoryview(problem_np)
-
-    cdef size_t i, j, k, a, b, c
-
-    cdef size_t near
-    cdef double dist, near_dist
-
-    cdef bint bonded
-
-    rab_np = np.zeros(3, dtype=np.float64)
-    rac_np = np.zeros(3, dtype=np.float64)
-    cdef double[:] rab = memoryview(rab_np)
-    cdef double[:] rac = memoryview(rac_np)
-
-    cdef double costheta, theta
-    cdef bint bad_angle
-
-    for i in range(nproblem):
-        a = problem[i]
-        # Don't bother adding a new bond to a if a previous iteration
-        # of this loop already did so
-        if nbonds[a] > nbonds_orig[a]:
-            continue
-
-        assert nbonds[a] + 1 < _MAX_BONDS
-        near = a
-        near_dist = HUGE_VAL
-        for b in range(natoms):
-            # a can't be bonded to itself (currently)
-            if b == a:
-                continue
-
-            # Ignore b if a is already bonded to it
-            bonded = False
-            for j in range(nbonds[a]):
-                c = c10y[a, j]
-                if c == b:
-                    bonded = True
-                    break
-            if bonded:
-                continue
-
-            # Calculate a-b distance
-            for j in range(3):
-                rab[j] = pos[b, j] - pos[a, j]
-            dist = dnrm2(&THREE, &rab[0], &UNITY)
-
-            if dist > near_dist:
-                continue
-
-            # now verify that this wouldn't make a very short angle with any other bonds
-            bad_angle = False
-            for j in range(nbonds[a]):
-                c = c10y[a, j]
-                for k in range(3):
-                    rac[k] = pos[c, k] - pos[a, k]
-                costheta = ddot(&THREE, &rab[0], &UNITY, &rac[0], &UNITY)
-                costheta /= dist * dnrm2(&THREE, &rac[0], &UNITY)
-                theta = abs(acos(costheta))
-                if theta < pi / 36 or theta + pi / 36 > pi:
-                    bad_angle = True
-                    break
-
-            if not bad_angle:
-                near = b
-                near_dist = dist
-        if near == a:
-            continue
-        assert nbonds[b] + 1 < _MAX_BONDS
-        c10y[a, nbonds[a]] = near
-        c10y[near, nbonds[near]] = a
-        bonds_new[nbonds_tot, 0] = min(a, near)
-        bonds_new[nbonds_tot, 1] = max(a, near)
-        nbonds[a] += 1
-        nbonds[near] += 1
-        nbonds_tot += 1
-    assert nbonds_tot > len(bonds_np)
-
-    bonds_new_np = np.resize(bonds_new_np, (nbonds_tot, 2))
-    assert np.all(bonds_new_np >= 0)
-
-    # TODO: nbonds_tot**2 is certainly overkill, find a more reasonable
-    # upper bound for the number of angles
-    if use_angles:
-        angles_np = -np.ones((nbonds_tot**2, 3), dtype=np.int32)
-    else:
-        angles_np = np.empty((0, 3), dtype=np.int32)
-    cdef int[:, :] angles = memoryview(angles_np)
-
-    # TODO: nbonds_tot**3 is certainly overkill, find a more reasonable
-    # upper bound for the number of dihedrals
-    if use_dihedrals:
-        dihedrals_np = -np.ones((nbonds_tot**3, 4), dtype=np.int32)
-    else:
-        dihedrals_np = np.empty((0, 4), dtype=np.int32)
-    cdef int[:, :] dihedrals = memoryview(dihedrals_np)
-
-    if not (use_angles or use_dihedrals):
-        return c10y_np, nbonds_np, bonds_new_np, angles_np, dihedrals_np
-
-
-    cdef size_t nangles_tot, ndihedrals_tot
-    nangles_tot, ndihedrals_tot = get_angles_dihedrals(use_angles, use_dihedrals, c10y, nbonds, bonds_new, angles, dihedrals)
-
-    angles_np = np.resize(angles_np, (nangles_tot, 3))
-    assert np.all(angles_np >= 0)
-
-    dihedrals_np = np.resize(dihedrals_np, (ndihedrals_tot, 4))
-    assert np.all(dihedrals_np >= 0)
-
-    return c10y_np, nbonds_np, bonds_new_np, angles_np, dihedrals_np
+    return c10y_np, nbonds_np, bonds_np, angles_good_np, dihedrals_np, dummies
 
 def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
                      np.ndarray[np.int32_t, ndim=2] bonds_np,
