@@ -83,7 +83,10 @@ class IRC(Optimizer):
             self.pes = atoms
             atoms = self.pes.atoms
         else:
-            self.pes = PESWrapper(atoms, atoms.calc, **kwargs)
+            self.pes = PESWrapper(atoms, atoms.calc,
+                                  project_rotations=False,
+                                  project_translations=False,
+                                  **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, trajectory, master,
                            force_consistent)
         self.irctol = irctol
@@ -166,8 +169,12 @@ class IRC(Optimizer):
             g1m = ((Tm @ Tm.T) @ g1) / self.sqrtm
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
-            if bound_clip and abs(1 - dot) < self.irctol:
-                break
+            if bound_clip:
+                if abs(1 - dot) < self.irctol:
+                    break
+            else:
+                if self.converged():
+                    break
         else:
             raise RuntimeError("Inner IRC loop failed to converge")
 
