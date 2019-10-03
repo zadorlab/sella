@@ -78,7 +78,7 @@ def rs_newton_irc(pes, sqrtm, g, d1, dx, xi=1.):
 class IRC(Optimizer):
     def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
                  master=None, force_consistent=False, irctol=1e-2, dx=0.1,
-                 eta=1e-4, gamma=0.4, peskwargs=None, **kwargs):
+                 eta=1e-4, gamma=0.4, peskwargs=None, H0=None, **kwargs):
         if isinstance(atoms, PESWrapper):
             self.pes = atoms
             atoms = self.pes.atoms
@@ -107,13 +107,22 @@ class IRC(Optimizer):
         self.sqrtm = np.sqrt(self.atoms.get_masses()[:, np.newaxis]
                              * np.ones_like(self.atoms.positions)).ravel()
 
-        self.lastrun = None
         self.x0 = self.pes.x.copy()
-        self.v0ts = None
-        self.H0 = None
+        self.lastrun = None
+
         self.peslast = None
         self.xi = 1.
         self.first = True
+
+        self.H0 = H0
+        self._calc_v0ts()
+
+    def _calc_v0ts(self):
+        if self.H0 is None:
+            return None
+        Hw = self.H0 / np.outer(self.sqrtm, self.sqrtm)
+        _, vecs = eigh(Hw)
+        self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
 
     def irun(self, fmax=0.05, steps=None, direction='forward'):
         if direction not in ['forward', 'reverse']:
@@ -123,16 +132,15 @@ class IRC(Optimizer):
         if self.v0ts is None:
             # Initial diagonalization
             self.pes.diag(**self.peskwargs)
-            Hw = self.pes.H / np.outer(self.sqrtm, self.sqrtm)
-            _, vecs = eigh(Hw)
-            self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
             self.H0 = self.pes.H.copy()
+            self._calc_v0ts()
             self.peslast = self.pes.last.copy()
         else:
             # Or, restore from last diagonalization for new direction
             self.pes.x = self.x0.copy()
             self.pes.H = self.H0.copy()
-            self.pes.last = self.peslast.copy()
+            if self.peslast is not None:
+                self.pes.last = self.peslast.copy()
 
         if direction == 'forward':
             self.d1 = self.v0ts.copy()

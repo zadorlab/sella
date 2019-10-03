@@ -32,7 +32,7 @@ class Sella(Optimizer):
                  master=None, force_consistent=False, delta0=None,
                  sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
                  order=1, eig=None, eta=1e-4, peskwargs=None, method=None,
-                 gamma=0.4, constraints_tol=1e-5, **kwargs):
+                 gamma=0.4, constraints_tol=1e-5, H0=None, **kwargs):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
@@ -107,6 +107,9 @@ class Sella(Optimizer):
         self.xi = 1.
         if self.method not in ['gmtrm', 'rsrfo', 'rsprfo']:
             raise ValueError('Unknown method:', self.method)
+
+        if H0 is not None:
+            self.pes.H = H0.copy()
 
     def step(self):
         if not self.initialized:
