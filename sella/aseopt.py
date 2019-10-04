@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 
 from ase.optimize.optimize import Optimizer
+from ase.utils import basestring
 
 from sella.optimize import rs_newton, rs_rfo, rs_prfo
 from sella.peswrapper import BasePES, CartPES, IntPES

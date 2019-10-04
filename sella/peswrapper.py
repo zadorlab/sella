@@ -1,6 +1,7 @@
 import numpy as np
 
 from ase.io import Trajectory
+from ase.utils import basestring
 
 from scipy.linalg import eigh
 from scipy.integrate import LSODA
