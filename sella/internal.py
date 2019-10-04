@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-
-from __future__ import division
-
 import numpy as np
 from scipy.linalg import eigh
 #from .internal_cython import get_internal, cart_to_internal, expand_internal
@@ -159,6 +155,7 @@ class Internal:
         return False
 
     def guess_hessian(self, atoms):
+        atoms = atoms + self.dummies
         rcov = covalent_radii[atoms.numbers] / Bohr
 
         # Stretch parameters

@@ -31,11 +31,17 @@ class Sella(Optimizer):
                  sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
                  order=1, eig=None, eta=1e-4, method=None, gamma=0.4,
                  threepoint=False, constraints=None, constraints_tol=1e-5,
-                 v0=None, internal=False):
+                 v0=None, internal=False, append_trajectory=False):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
             default = _default_kwargs['saddle']
+
+        if trajectory is not None:
+            if isinstance(trajectory, basestring):
+                mode = "a" if append_trajectory else "w"
+                trajectory = Trajectory(trajectory, mode=mode,
+                                        atoms=atoms, master=master)
 
         if isinstance(atoms, BasePES):
             asetraj = trajectory

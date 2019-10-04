@@ -26,15 +26,22 @@ class BasePES:
         self.lastlast = dict(x=None, f=None, g=None)
         self.neval = 0
         if trajectory is not None:
-            self.traj = Trajectory(trajectory, 'w', self.atoms)
+            if isinstance(trajectory, basestring):
+                self.traj = Trajectory(trajectory, 'w', self.atoms)
+            else:
+                self.traj = trajectory
         else:
             self.traj = DummyTrajectory()
+        self._test_traj = Trajectory('test.traj', 'w', self.atoms)
         self.H = None
         self.eigensolver = eigensolver
         self.eta = eta
         self.v0 = v0
 
     calls = property(lambda self: self.neval)
+
+    def _project_H(self):
+        return self.H
 
     @property
     def H(self):
@@ -65,6 +72,7 @@ class BasePES:
 
         self.neval += 1
         self.traj.write()
+        self._test_traj.write(self.atoms + self.int.dummies)
         return True
 
     def converged(self, fmax, maxres=1e-5):
@@ -105,7 +113,8 @@ class BasePES:
 
         dx = self.dx(pos0)
         if self.H is not None:
-            df_pred = g0.T @ dx + (dx.T @ self.H @ dx) / 2.
+            H = self._project_H()
+            df_pred = g0.T @ dx + (dx.T @ H @ dx) / 2.
 
         if self.H is not None:
             ratio = df_pred / df_actual
@@ -335,6 +344,7 @@ class IntPES(BasePES):
                 ode.step()
                 t0 = ode.t
                 if self.int.check_for_bad_internal(self.x):
+                    print("Bad internals found")
                     if self.int_last is None:
                         self.int_last = self.int
                     self.int = Internal(self.atoms,
@@ -367,7 +377,7 @@ class IntPES(BasePES):
         self.int.dummies.positions = x[nx:].reshape((-1, 3)).copy()
         D = self.int.D(self.atoms.positions)
         Binv = self.int.Binv(self.atoms.positions)
-        dydt[nx:] = -Binv @ D.ddot(dxdt, dxdt)
+        dydt[nx+ndx:] = -Binv @ D.ddot(dxdt, dxdt)
 
         return dydt
 
@@ -432,6 +442,17 @@ class IntPES(BasePES):
         Winv = self.Ufree.T @ np.diag(1./np.sqrt(h0)) @ self.Ufree
         return Winv / np.linalg.det(Winv)**(1./len(Winv))
 
+    def _project_H(self):
+        if self.int_last is None:
+            return self.H
+        nd0 = len(self.int_last.dummies)
+        nold = 3 * (len(self.atoms) + nd0)
+        self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
+        Binv = self.int_last.Binv(self.atoms.positions)
+        B = self.int.B(self.atoms.positions)
+        P = B[:, :nold] @ Binv
+        return P @ self.H @ P.T
+
     def update_H(self):
         if self.int_last is not None:
             # TODO: This logic should be moved out of update_H
@@ -469,7 +490,8 @@ class IntPES(BasePES):
             return
 
         dx = self.int.q_wrap(self.x - self.int.q(self.lastlast['x']))
-        dg = self.g - self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
+        #dg = self.g - self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
+        dg = self.g - self.glast
         if self.H is None:
             H = self.int.guess_hessian(self.atoms)
         else:

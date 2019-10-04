@@ -14,6 +14,8 @@ from libc.string cimport memset
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dger, dscal, dcopy, dsyr, dsyr2
 from scipy.linalg.cython_lapack cimport dlacpy, dlaset, dlascl
 
+from sella.cython_routines import simple_ortho
+
 cdef int UNITY = 1
 cdef int THREE = 3
 cdef double DUNITY = 1.
@@ -201,6 +203,14 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
     pos_dummies_np = np.zeros((ndummies_max, 3), dtype=np.float64)
     pos_dummies_np[:ndummies] = dummies.positions.copy()
     cdef double[:, :] pos_dummies = memoryview(pos_dummies_np)
+    cdef double[:] posl
+
+    I_np = np.eye(3, dtype=np.float64)
+    Y_np = np.zeros((3, _MAX_BONDS), dtype=np.float64)
+    cdef double[:, :] Y = memoryview(Y_np)
+    cdef double[:, :] I = memoryview(I_np)
+    cdef double[:, :] X
+    cdef int nx
 
     # Loop over naive angles looking for collinear cases.
     # In those cases, check to see whether any dummy atoms need to be added,
@@ -232,104 +242,33 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
         angles_bad[nangles_bad, 1] = j
         angles_bad[nangles_bad, 2] = k
         nangles_bad += 1
-        # Determine whether any dummy atoms are needed
-        rik = dnrm2(&THREE, &xik[0], &UNITY)
-        # Align dummy atom along cartesian direction that is maximally
-        # orthogonal to the xik vector, and then orthogonalize.
-        dim1 = -1
-        dimmin = 2.
-        for m in range(3):
-            d1[m] = 0.
-            xik[m] / rik
-            if abs(xik[m]) < dimmin:
-                dim1 = m
-                dimmin = abs(xik[m])
-        assert dim1 == 0 or dim1 == 1 or dim1 == 2
-        d1[dim1] = 1.
-        for m in range(3):
-            d1[m] -= xik[m] * xik[dim1]
-        rd1 = dnrm2(&THREE, &d1[0], &UNITY)
-        for m in range(3):
-            d1[m] /= rd1
-        # If the central atom (j) has only two bonding partners (which are
-        # necessarily i and k), then we will need to add *two* dummy atoms.
-        if nbonds[j] == 2:
-            cross(xik, d1, d2)
-            # d2 should be normalized already, but just to be safe:
-            rd2 = dnrm2(&THREE, &d2[0], &UNITY)
+
+        TEST = atoms.positions[np.newaxis, j] - atoms.positions[c10y_np[j, :nbonds[j]]]
+        for a in range(nbonds[j]):
+            l = c10y[j, a]
+            if l < natoms:
+                posl = pos[l]
+            else:
+                posl = pos_dummies[l - natoms]
             for m in range(3):
-                d2[m] /= rd2
+                Y[m, a] = posl[m] - pos[j, m]
+        X_np = simple_ortho(I_np, Y_np[:, :nbonds[j]], eps=1e-2).T
+        X = memoryview(X_np)
+        nx = len(X)
+        for i in range(nx):
             for m in range(3):
-                pos_dummies[ndummies, m] = pos[j, m] + d1[m]
-                pos_dummies[ndummies + 1, m] = pos[j, m] + d2[m]
+                pos_dummies[ndummies, m] = pos[j, m] + X[i, m]
             bonds[nbonds_tot, 0] = j
             bonds[nbonds_tot, 1] = natoms + ndummies
-
-            bonds[nbonds_tot + 1, 0] = j
-            bonds[nbonds_tot + 1, 1] = natoms + ndummies + 1
-            nbonds_tot += 2
-
+            for m in range(nbonds[j]):
+                k = c10y[j, m]
+                angles_good[nangles_good, 0] = k
+                angles_good[nangles_good, 1] = j
+                angles_good[nangles_good, 2] = natoms + ndummies
+                nangles_good += 1
             c10y[j, nbonds[j]] = natoms + ndummies
-            c10y[j, nbonds[j] + 1] = natoms + ndummies + 1
-            nbonds[j] += 2
-            angles_good[nangles_good, 0] = i
-            angles_good[nangles_good, 1] = j
-            angles_good[nangles_good, 2] = natoms + ndummies
-
-            angles_good[nangles_good + 1, 0] = i
-            angles_good[nangles_good + 1, 1] = j
-            angles_good[nangles_good + 1, 2] = natoms + ndummies + 1
-
-            angles_good[nangles_good + 2, 0] = k
-            angles_good[nangles_good + 2, 1] = j
-            angles_good[nangles_good + 2, 2] = natoms + ndummies
-
-            angles_good[nangles_good + 3, 0] = k
-            angles_good[nangles_good + 3, 1] = j
-            angles_good[nangles_good + 3, 2] = natoms + ndummies + 1
-
-            angles_good[nangles_good + 4, 0] = natoms + ndummies
-            angles_good[nangles_good + 4, 1] = j
-            angles_good[nangles_good + 4, 2] = natoms + ndummies + 1
-            nangles_good += 5
-            ndummies += 2
-        # If the central atom (j) has more than two bonding partners, then
-        # we need at most one dummy atom. Orthogonalize d1 against the vectors
-        # between the central atom and all of its bonding partners. If the
-        # magnitude of d1 becomes equal to 0 at any point in this process,
-        # then no dummy atoms are needed. Otherwise, add a dummy atom in the
-        # direction of d1 after orthonormalization.
-        else:
-            for a in range(nbonds[j]):
-                l = c10y[j, a]
-                # Project out the components of d1 in the direction of the
-                # xlj bonding vector.
-                for m in range(3):
-                    xjl[m] = pos[l, m] - pos[j, m]
-                rlj2 = ddot(&THREE, &xjl[0], &UNITY, &xjl[0], &UNITY)
-                rd1djl = ddot(&THREE, &xjl[0], &UNITY, &d1[0], &UNITY) / rlj2
-                for m in range(3):
-                    d1[m] -= xjl[m] * rd1djl
-                rd1 = dnrm2(&THREE, &d1[0], &UNITY)
-                if rd1 < 1e-4:
-                    # If the magnitude of d1 is very small after one
-                    # orthogonalization step, then we don't need to add
-                    # a dummy atom.
-                    break
-                for m in range(3):
-                    d1[m] /= rd1
-            else:
-                c10y[j, nbonds[j]] = natoms + ndummies
-                nbonds[j] += 1
-                for m in range(3):
-                    pos_dummies[ndummies, m] = pos[j, m] + d1[m]
-                for m in range(nbonds[j]):
-                    l = c10y[j, m]
-                    angles_good[nangles_good, 0] = l
-                    angles_good[nangles_good, 1] = j
-                    angles_good[nangles_good, 2] = natoms + ndummies
-                    nangles_good += 1
-                ndummies += 1
+            nbonds[j] += 1
+            ndummies += 1
 
     bonds_np = np.resize(bonds_np, (nbonds_tot, 2))
     assert np.all(bonds_np >= 0)
