@@ -6,6 +6,7 @@ import numpy as np
 from scipy.linalg import eigh, lstsq
 
 from ase.io import Trajectory
+from ase.utils import basestring
 
 from .eigensolvers import rayleigh_ritz
 from .linalg import NumericalHessian, ProjectedMatrix
@@ -54,7 +55,10 @@ class PESWrapper(object):
         self.d = 3 * len(self.atoms)
 
         if trajectory is not None:
-            self.trajectory = Trajectory(trajectory, 'w', self.atoms)
+            if isinstance(trajectory, basestring):
+                self.trajectory = Trajectory(trajectory, 'w', self.atoms)
+            else:
+                self.trajectory = trajectory
         else:
             self.trajectory = None
 

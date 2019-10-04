@@ -6,7 +6,9 @@ import numpy as np
 
 from scipy.optimize.linesearch import scalar_search_wolfe1
 
+from ase.io.trajectory import Trajectory
 from ase.optimize.optimize import Optimizer
+from ase.utils import basestring
 
 from .peswrapper import PESWrapper
 from .optimize import rs_newton, rs_rfo, rs_prfo
@@ -32,11 +34,18 @@ class Sella(Optimizer):
                  master=None, force_consistent=False, delta0=None,
                  sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
                  order=1, eig=None, eta=1e-4, peskwargs=None, method=None,
-                 gamma=0.4, constraints_tol=1e-5, H0=None, **kwargs):
+                 gamma=0.4, constraints_tol=1e-5, H0=None,
+                 append_trajectory=None, **kwargs):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
             default = _default_kwargs['saddle']
+
+        if trajectory is not None:
+            if isinstance(trajectory, basestring):
+                mode = "a" if append_trajectory else "w"
+                trajectory = Trajectory(trajectory, mode=mode,
+                                        atoms=atoms, master=master)
 
         if isinstance(atoms, PESWrapper):
             asetraj = trajectory
