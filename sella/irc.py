@@ -119,7 +119,8 @@ class IRC(Optimizer):
 
     def _calc_v0ts(self):
         if self.H0 is None:
-            return None
+            self.v0ts = None
+            return
         Hw = self.H0 / np.outer(self.sqrtm, self.sqrtm)
         _, vecs = eigh(Hw)
         self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
