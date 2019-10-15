@@ -4,6 +4,7 @@ import numpy as np
 from scipy.linalg import eigh
 
 from sella.peswrapper import PESWrapper
+from sella.constraints import initialize_constraints, calc_constr_basis
 
 from ase.optimize.optimize import Optimizer
 
@@ -87,6 +88,10 @@ class IRC(Optimizer):
                                   project_rotations=False,
                                   project_translations=False,
                                   **kwargs)
+        self.pes_cons = PESWrapper(atoms, atoms.calc,
+                                   project_rotations=True,
+                                   project_translations=True,
+                                   **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, trajectory, master,
                            force_consistent)
         self.irctol = irctol
@@ -192,4 +197,6 @@ class IRC(Optimizer):
         self.d1 = d1w / self.sqrtm
 
     def converged(self, forces=None):
-        return Optimizer.converged(self, forces) and self.pes.lams[0] > 0
+        Hproj = self.pes_cons.Tm.T @ self.pes.H @ self.pes_cons.Tm
+        lams, _ = np.linalg.eigh(Hproj)
+        return Optimizer.converged(self, forces) and lams[0] > 0
