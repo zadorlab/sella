@@ -4,8 +4,9 @@ from libc.stdint cimport uint8_t
 
 cdef class CartToInternal:
     cdef bint grad, curv
-    cdef int natoms, nbonds, nangles, ndihedrals, nangle_sums
-    cdef int nangle_diffs, nq, nx, ncart, nint, next
+    cdef public int natoms, nbonds, nangles, ndihedrals, nangle_sums
+    cdef public int nangle_diffs, ncart
+    cdef int nq, nx, nint, next
     cdef public int[:] dinds
     cdef public int[:, :] cart, bonds, angles, dihedrals, angle_sums
     cdef public int[:, :] angle_diffs

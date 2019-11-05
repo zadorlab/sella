@@ -8,7 +8,7 @@ from libc.math cimport fabs, exp, pi, sqrt
 from libc.string cimport memset
 from libc.stdint cimport uint8_t
 
-from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dcopy, dgemv
+from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dgemv, dcopy
 
 from sella.utilities.math cimport my_daxpy, vec_sum, mgs, cross
 from sella.internal.int_eval cimport (cart_to_bond, cart_to_angle,
@@ -120,7 +120,7 @@ cdef class CartToInternal:
                                                     4, 3), dtype=np.float64))
         self.work1 = memoryview(np.zeros((11, 3, 3, 3), dtype=np.float64))
         self.work2 = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
-        self.Uint = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
+        self.Uint = memoryview(np.zeros((self.nx, self.nq), dtype=np.float64))
         self.Uext = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
         self.grad = False
         self.curv = False
@@ -164,10 +164,10 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return D2q(self.natoms, self.bonds, self.angles, self.dihedrals,
-                   self.angle_sums, self.angle_diffs, self.d2q_bonds,
-                   self.d2q_angles, self.d2q_dihedrals, self.d2q_angle_sums,
-                   self.d2q_angle_diffs)
+        return D2q(self.natoms, self.ncart, self.bonds, self.angles,
+                   self.dihedrals, self.angle_sums, self.angle_diffs,
+                   self.d2q_bonds, self.d2q_angles, self.d2q_dihedrals,
+                   self.d2q_angle_sums, self.d2q_angle_diffs)
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -197,7 +197,7 @@ cdef class CartToInternal:
             if (self.grad or not grad) and (self.curv or not curv):
                 if not self.geom_changed(pos):
                     return 0
-        self.grad = grad
+        self.grad = grad or curv
         self.curv = curv
         cdef size_t n, m, i, j, k, l
         cdef int info, err
@@ -205,12 +205,12 @@ cdef class CartToInternal:
 
         # Zero out our arrays
         memset(&self.q1[0], 0, self.nq * sd)
-        memset(&self.dq[0, 0, 0], 0, self.nq * self.natoms * 3 * sd)
+        memset(&self.dq[0, 0, 0], 0, self.nq * self.nx * sd)
 
         # I'm not sure why these "> 0" checks are necessary; according to the
-        # C standard, a length of 0 is valid (though it results in a no-op),
-        # but Cython keeps giving out-of-bounds errors. Maybe it's because
-        # indexing memoryviews of size 0 doesn't work?
+        # C standard, memset accepts a length of 0 (though it results in a
+        # no-op), but Cython keeps giving out-of-bounds errors. Maybe it's
+        # because indexing memoryviews of size 0 doesn't work?
         if self.nbonds > 0:
             memset(&self.d2q_bonds[0, 0, 0, 0, 0], 0,
                    self.nbonds * 36 * sd)
@@ -229,7 +229,7 @@ cdef class CartToInternal:
         memset(&self.work1[0, 0, 0, 0], 0, 297 * sd)
         memset(&self.work2[0, 0], 0, self.nx * sd)
 
-        dcopy(&self.nx, &pos[0, 0], &UNITY, &self.pos[0, 0], &UNITY)
+        self.pos[:, :] = pos
 
         for n in range(self.ncart):
             i = self.cart[n, 0]
@@ -289,7 +289,6 @@ cdef class CartToInternal:
             if info < 0:
                 return info
 
-
         m += self.nangle_sums
         for n in range(self.nangle_diffs):
             info = self._angle_sum_diff(self.angle_diffs[n], -1.,
@@ -298,18 +297,30 @@ cdef class CartToInternal:
             if info < 0:
                 return info
 
+        if not self.grad:
+            return 0
+
         cdef int sddq = self.dq.strides[2] >> 3
-        cdef int sdu = self.Uint.strides[1] >> 3
-        memset(&self.Uint[0, 0], 0, self.nx * self.nx * sizeof(double))
+        cdef int sdu = self.Uint.strides[0] >> 3
+        memset(&self.Uint[0, 0], 0, self.nq * self.nx * sizeof(double))
         memset(&self.Uext[0, 0], 0, self.nx * self.nx * sizeof(double))
         for n in range(self.nq):
-            dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[n, 0], &sdu)
+            dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[0, n], &sdu)
         for n in range(self.nx):
             self.Uext[n, n] = 1.
-        self.nint = mgs(self.Uint[:self.nq], None)
-        self.next = mgs(self.Uext, self.Uint[:self.nint])
+
+        self.nint = mgs(self.Uint[:, :self.nq], None)
+        if self.nint < 0:
+            return self.nint
+        if self.nint > self.nx:
+            return -1
+        self.next = mgs(self.Uext, self.Uint[:, :self.nint])
+        if self.next < 0:
+            return self.next
 
         if self.nint + self.next != self.nx:
+            with gil:
+                print(self.nint, self.next, self.nx)
             return -1
 
         return 0
@@ -344,7 +355,7 @@ cdef class CartToInternal:
                              q, dq, self.work1[4:7], self.work1,
                              grad, curv)
         # Second part
-        dcopy(&THREE, &self.pos[j, 0], &UNITY, &self.dx1[0], &UNITY)
+        self.dx1[:] = self.pos[j, :]
         daxpy(&THREE, &DNUNITY, &self.pos[k, 0], &UNITY, &self.dx1[0], &UNITY)
         err = cart_to_angle(k, j, l, self.dx1, self.dx2,
                             &self.work1[3, 0, 0, 0], self.work2,
@@ -359,52 +370,31 @@ cdef class CartToInternal:
                   &dq[0, 0], &UNITY)
 
         # Combine second derivatives
-        # This is a mess.
-        # Maybe this could be cleaned up with my_daxpy and/or vec_sum,
-        # but doing this sounds annoying and difficult.
         for i in range(3):
-            dcopy(&THREE, &self.work1[4, i, 0, 0], &UNITY,
-                  &d2q[0, i, 0, 0], &UNITY)
-            dcopy(&THREE, &self.work1[4, i, 1, 0], &UNITY,
-                  &d2q[0, i, 1, 0], &UNITY)
-            dcopy(&THREE, &self.work1[4, i, 2, 0], &UNITY,
-                  &d2q[0, i, 3, 0], &UNITY)
+            d2q[0, i, 0, :] = self.work1[4, i, 0, :]
+            d2q[0, i, 1, :] = self.work1[4, i, 1, :]
+            d2q[0, i, 3, :] = self.work1[4, i, 2, :]
 
-            dcopy(&THREE, &self.work1[5, i, 0, 0], &UNITY,
-                  &d2q[1, i, 0, 0], &UNITY)
-            dcopy(&THREE, &self.work1[5, i, 1, 0], &UNITY,
-                  &d2q[1, i, 1, 0], &UNITY)
-            dcopy(&THREE, &self.work1[5, i, 2, 0], &UNITY,
-                  &d2q[1, i, 3, 0], &UNITY)
+            d2q[1, i, 0, :] = self.work1[5, i, 0, :]
+            d2q[1, i, 1, :] = self.work1[5, i, 1, :]
+            d2q[1, i, 3, :] = self.work1[5, i, 2, :]
 
-            dcopy(&THREE, &self.work1[6, i, 0, 0], &UNITY,
-                  &d2q[3, i, 0, 0], &UNITY)
-            dcopy(&THREE, &self.work1[6, i, 1, 0], &UNITY,
-                  &d2q[3, i, 1, 0], &UNITY)
-            dcopy(&THREE, &self.work1[6, i, 2, 0], &UNITY,
-                  &d2q[3, i, 3, 0], &UNITY)
+            d2q[3, i, 0, :] = self.work1[6, i, 0, :]
+            d2q[3, i, 1, :] = self.work1[6, i, 1, :]
+            d2q[3, i, 3, :] = self.work1[6, i, 2, :]
 
         for i in range(3):
-            daxpy(&THREE, &sign, &self.work1[7, i, 0, 0], &UNITY,
-                  &d2q[2, i, 2, 0], &UNITY)
-            daxpy(&THREE, &sign, &self.work1[7, i, 1, 0], &UNITY,
-                  &d2q[2, i, 1, 0], &UNITY)
-            daxpy(&THREE, &sign, &self.work1[7, i, 2, 0], &UNITY,
-                  &d2q[2, i, 3, 0], &UNITY)
+            my_daxpy(sign, self.work1[7, i, 0], d2q[2, i, 2])
+            my_daxpy(sign, self.work1[7, i, 1], d2q[2, i, 1])
+            my_daxpy(sign, self.work1[7, i, 2], d2q[2, i, 3])
 
-            daxpy(&THREE, &sign, &self.work1[8, i, 0, 0], &UNITY,
-                  &d2q[1, i, 2, 0], &UNITY)
-            daxpy(&THREE, &sign, &self.work1[8, i, 1, 0], &UNITY,
-                  &d2q[1, i, 1, 0], &UNITY)
-            daxpy(&THREE, &sign, &self.work1[8, i, 2, 0], &UNITY,
-                  &d2q[1, i, 3, 0], &UNITY)
+            my_daxpy(sign, self.work1[8, i, 0], d2q[1, i, 2])
+            my_daxpy(sign, self.work1[8, i, 1], d2q[1, i, 1])
+            my_daxpy(sign, self.work1[8, i, 2], d2q[1, i, 3])
 
-            daxpy(&THREE, &sign, &self.work1[9, i, 0, 0], &UNITY,
-                  &d2q[3, i, 2, 0], &UNITY)
-            daxpy(&THREE, &sign, &self.work1[9, i, 1, 0], &UNITY,
-                  &d2q[3, i, 1, 0], &UNITY)
-            daxpy(&THREE, &sign, &self.work1[9, i, 2, 0], &UNITY,
-                  &d2q[3, i, 3, 0], &UNITY)
+            my_daxpy(sign, self.work1[9, i, 0], d2q[3, i, 2])
+            my_daxpy(sign, self.work1[9, i, 1], d2q[3, i, 1])
+            my_daxpy(sign, self.work1[9, i, 2], d2q[3, i, 3])
         return 0
 
     @cython.boundscheck(False)
@@ -531,7 +521,7 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return np.array(self.Uext[:self.next])
+        return np.array(self.Uext[:, :self.next])
 
 
     @cython.boundscheck(False)
@@ -545,7 +535,7 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return np.array(self.Uint[:self.nint])
+        return np.array(self.Uint[:, :self.nint])
 
 
 cdef class Constraints(CartToInternal):
@@ -608,7 +598,7 @@ cdef class Constraints(CartToInternal):
                         self.tvecs[self.ntrans, 3 * i + j] = invsqrtnat
                     self.ntrans += 1
 
-        self.nint = self.nq
+        self.ninternal = self.nq
         self.nq += self.ntrans + self.nrot
 
         self.q1 = memoryview(np.zeros(self.nq, dtype=np.float64))
@@ -651,24 +641,21 @@ cdef class Constraints(CartToInternal):
         cdef int sddq = self.dq.strides[2] >> 3
         cdef int sdu = self.Uint.strides[1] >> 3
         for i in range(self.ntrans):
-            dcopy(&self.nx, &self.tvecs[i, 0], &sdt,
-                  &self.dq[self.nint + i, 0, 0], &sddq)
-            dcopy(&self.nx, &self.tvecs[i, 0], &sdt,
-                  &self.Uint[self.nint + i, 0], &sdu)
+            self.dq[self.ninternal + i, ...] = self.tvecs[i, :]
+            self.Uint[self.ninternal + i, ...] = self.tvecs[i, :]
 
         err = self.project_rotation()
         if err != 0: return err
 
         cdef int sdr = self.rvecs.strides[1] >> 3
         for i in range(self.nrot):
-            dcopy(&self.nx, &self.rvecs[i, 0], &sdr,
-                  &self.dq[self.nint + self.ntrans + i, 0, 0], &sddq)
-            dcopy(&self.nx, &self.rvecs[i, 0], &sdr,
-                  &self.Uint[self.nint + self.ntrans + i, 0], &sdu)
+            self.dq[self.ninternal + self.ntrans + i, ...] = self.rvecs[i, :]
+            self.Uint[self.ninternal + self.ntrans + i, ...] = self.rvecs[i, :]
 
         # Another rounds of MGS. This is a bit wasteful, but I can't think
         # of a better way to do this right now.
-        self.nint = mgs(self.Uint[:self.nint + self.ntrans + self.nrot], None)
+        self.nint = mgs(self.Uint[:self.ninternal + self.ntrans + self.nrot],
+                        None)
         self.next = mgs(self.Uext[:self.next], self.Uint[:self.nint])
         if self.nint + self.next != self.nx:
             return -1
@@ -768,11 +755,25 @@ cdef class D2q:
         self.nq = (self.nbonds + self.nangles + self.ndihedrals
                    + self.nangle_sums + self.nangle_diffs)
 
-        self.Dbonds = Dbonds
-        self.Dangles = Dangles
-        self.Ddihedrals = Ddihedrals
-        self.Dangle_sums = Dangle_sums
-        self.Dangle_diffs = Dangle_diffs
+        self.Dbonds = memoryview(np.zeros((self.nbonds, 2, 3, 2, 3),
+                                          dtype=np.float64))
+        self.Dbonds[...] = Dbonds
+
+        self.Dangles = memoryview(np.zeros((self.nangles, 3, 3, 3, 3),
+                                           dtype=np.float64))
+        self.Dangles[...] = Dangles
+
+        self.Ddihedrals = memoryview(np.zeros((self.ndihedrals, 4, 3, 4, 3),
+                                              dtype=np.float64))
+        self.Ddihedrals[...] = Ddihedrals
+
+        self.Dangle_sums = memoryview(np.zeros((self.nangle_sums, 4, 3, 4, 3),
+                                               dtype=np.float64))
+        self.Dangle_sums[...] = Dangle_sums
+
+        self.Dangle_diffs = memoryview(np.zeros((self.nangle_diffs, 4, 3, 4, 3),
+                                                dtype=np.float64))
+        self.Dangle_diffs[...] = Dangle_diffs
 
         self.work1 = memoryview(np.zeros((4, 3), dtype=np.float64))
         self.work2 = memoryview(np.zeros((4, 3), dtype=np.float64))
@@ -877,14 +878,13 @@ cdef class D2q:
         for n in range(nq):
             for a in range(nind):
                 ai = q[n, a]
-                dcopy(&THREE, &v[3 * ai], &sv, &self.work1[a, 0], &self.sw1)
+                self.work1[a, :] = v[3*ai : 3*(ai+1)]
             dgemv('N', &dim, &dim, &DUNITY, &D2[n, 0, 0, 0, 0], &ldD2,
                   &self.work1[0, 0], &self.sw1, &DZERO,
                   &self.work2[0, 0], &self.sw2)
             for a in range(nind):
                 ai = q[n, a]
-                dcopy(&THREE, &self.work2[a, 0], &self.sw2,
-                      &res[start + n, ai, 0], &sres)
+                res[start + n, ai, :] = self.work2[a, :]
         return 0
 
 
@@ -935,8 +935,8 @@ cdef class D2q:
         for n in range(nq):
             for a in range(nind):
                 ai = q[n, a]
-                dcopy(&THREE, &v1[3 * ai], &sv1, &self.work1[a, 0], &self.sw1)
-                dcopy(&THREE, &v2[3 * ai], &sv2, &self.work2[a, 0], &self.sw2)
+                self.work1[a, :] = v1[3*ai : 3*(ai+1)]
+                self.work2[a, :] = v2[3*ai : 3*(ai+1)]
             dgemv('N', &dim, &dim, &DUNITY, &D2[n, 0, 0, 0, 0], &sD2,
                   &self.work1[0, 0], &self.sw1, &DZERO,
                   &self.work3[0, 0], &self.sw3)
