@@ -92,7 +92,7 @@ def ortho(X, Y=None, M=None, double eps=1e-15):
     cdef double YjTMXi
     cdef double XoutjTMXi
     cdef double scale
-    
+
     for i in range(nx):
         while True:
             for j in range(ny):
@@ -134,7 +134,7 @@ def modified_gram_schmidt(X_np, double eps=1e-15):
     cdef double dot, scale, scale_tot
 
     cdef int sd = X.strides[0] // 8
-    
+
     with nogil:
         for i in range(n):
             scale = dnrm2(&d, &X[0, i], &sd)
@@ -283,7 +283,7 @@ def symmetrize_Y2(S, Y):
     cdef int i
     cdef int j
     cdef int k
-    
+
     cdef int lwork
     cdef int info
 
@@ -329,7 +329,7 @@ def symmetrize_Y2(S, Y):
 
         # dY = S @ LHS
         dgemv('T', &i, &n, &DNONE, &S_mv[0, 0], &nvecs, &RHS_mv[0], &ONE, &DZERO, &dY_mv[0, i], &nvecs)
-        
+
         # dYTS = dY.T @ S (or rather, dYTS.T = S.T @ dY)
         dgemv('N', &nvecs, &i, &DNONE, &STS_mv[0, 0], &nvecs, &RHS_mv[0], &ONE, &DZERO, &dYTS_mv[i, 0], &ONE)
 

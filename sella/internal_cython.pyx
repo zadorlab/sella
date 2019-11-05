@@ -14,7 +14,7 @@ from libc.string cimport memset
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dger, dscal, dcopy, dsyr, dsyr2
 from scipy.linalg.cython_lapack cimport dlacpy, dlaset, dlascl
 
-from sella.cython_routines import simple_ortho
+from sella.cython_routines import simple_ortho, modified_gram_schmidt
 
 cdef int UNITY = 1
 cdef int THREE = 3
@@ -83,7 +83,7 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
         dummies = Atoms()
     cdef size_t ndummies = len(dummies)
 
-    cdef size_t i, j, k, l, m, n, a
+    cdef size_t i, j, k, l, m, n, a, b
     cdef size_t natoms = len(atoms)
 
     cdef double[:, :] pos = memoryview(atoms.positions)
@@ -206,11 +206,12 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
     cdef double[:] posl
 
     I_np = np.eye(3, dtype=np.float64)
-    Y_np = np.zeros((3, _MAX_BONDS), dtype=np.float64)
+    Y_np = np.zeros((_MAX_BONDS, 3), dtype=np.float64)
     cdef double[:, :] Y = memoryview(Y_np)
     cdef double[:, :] I = memoryview(I_np)
     cdef double[:, :] X
     cdef int nx
+    cdef double Ydot, Ynorm
 
     # Loop over naive angles looking for collinear cases.
     # In those cases, check to see whether any dummy atoms need to be added,
@@ -243,7 +244,7 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
         angles_bad[nangles_bad, 2] = k
         nangles_bad += 1
 
-        TEST = atoms.positions[np.newaxis, j] - atoms.positions[c10y_np[j, :nbonds[j]]]
+        nx = 0
         for a in range(nbonds[j]):
             l = c10y[j, a]
             if l < natoms:
@@ -251,8 +252,21 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
             else:
                 posl = pos_dummies[l - natoms]
             for m in range(3):
-                Y[m, a] = posl[m] - pos[j, m]
-        X_np = simple_ortho(I_np, Y_np[:, :nbonds[j]], eps=1e-2).T
+                Y[nx, m] = posl[m] - pos[j, m]
+            Ynorm = dnrm2(&THREE, &Y[nx, 0], &UNITY)
+            for m in range(3):
+                Y[nx, m] /= Ynorm
+            for b in range(nx):
+                Ydot = ddot(&THREE, &Y[nx, 0], &UNITY, &Y[b, 0], &UNITY)
+                for m in range(3):
+                    Y[nx, m] -= Y[b, m] * Ydot
+            Ynorm = dnrm2(&THREE, &Y[nx, 0], &UNITY)
+            if Ynorm > 1e-1:
+                for m in range(3):
+                    Y[nx, m] /= Ynorm
+                nx += 1
+
+        X_np = simple_ortho(I_np, Y_np[:nx].T).T
         X = memoryview(X_np)
         nx = len(X)
         for i in range(nx):
@@ -260,6 +274,7 @@ def get_internal(object atoms, bint use_angles=True, bint use_dihedrals=True, li
                 pos_dummies[ndummies, m] = pos[j, m] + X[i, m]
             bonds[nbonds_tot, 0] = j
             bonds[nbonds_tot, 1] = natoms + ndummies
+            nbonds_tot += 1
             for m in range(nbonds[j]):
                 k = c10y[j, m]
                 angles_good[nangles_good, 0] = k
@@ -338,14 +353,12 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
                      np.ndarray[np.int32_t, ndim=2] bonds_np,
                      np.ndarray[np.int32_t, ndim=2] angles_np,
                      np.ndarray[np.int32_t, ndim=2] dihedrals_np,
-                     np.ndarray[np.uint8_t, ndim=1] mask_np,
                      bint gradient=False,
                      bint curvature=False):
     cdef double[:, :] pos = memoryview(pos_np)
     cdef int[:, :] bonds = memoryview(bonds_np)
     cdef int[:, :] angles = memoryview(angles_np)
     cdef int[:, :] dihedrals = memoryview(dihedrals_np)
-    cdef np.uint8_t[:] mask = memoryview(mask_np)
 
     cdef size_t i
     cdef size_t natoms = len(pos_np)
@@ -353,30 +366,18 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
     cdef size_t nangles = len(angles_np)
     cdef size_t ndihedrals = len(dihedrals_np)
     cdef size_t ninternal = nbonds + nangles + ndihedrals
-    cdef size_t nmaskb = 0, nmaska = 0, nmaskd = 0, nmasktot = 0
-
-    for i in range(nbonds):
-        nmaskb += 1 - mask[i]
-
-    for i in range(nangles):
-        nmaska += 1 - mask[nbonds + i]
-
-    for i in range(ndihedrals):
-        nmaskd += 1 - mask[nbonds + nangles + i]
-
-    nmasktot = nmaskb + nmaska + nmaskd
 
     # Arrays for internal coordinates and their derivatives
-    q_np = np.zeros(ninternal - nmasktot, dtype=np.float64)
+    q_np = np.zeros(ninternal, dtype=np.float64)
     if gradient:
-        dq_np = np.zeros((ninternal - nmasktot, natoms, 3), dtype=np.float64)
+        dq_np = np.zeros((ninternal, natoms, 3), dtype=np.float64)
     else:
-        dq_np = np.zeros((ninternal - nmasktot, 0, 0), dtype=np.float64)
+        dq_np = np.zeros((ninternal, 0, 0), dtype=np.float64)
 
     if curvature:
-        d2q_np = np.zeros((ninternal - nmasktot, natoms, 3, natoms, 3), dtype=np.float64)
+        d2q_np = np.zeros((ninternal, natoms, 3, natoms, 3), dtype=np.float64)
     else:
-        d2q_np = np.zeros((ninternal - nmasktot, 0, 0, 0, 0), dtype=np.float64)
+        d2q_np = np.zeros((ninternal, 0, 0, 0, 0), dtype=np.float64)
 
     # Arrays for displacement vectors between bonded atoms
     dx_bonds_np = np.zeros((nbonds, 3), dtype=np.float64)
@@ -390,14 +391,10 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
 
     # Calculate displacement vectors
     for i in range(nbonds):
-        if not mask[i]:
-            continue
         dcopy(&THREE, &pos[bonds[i, 1], 0], &UNITY, &dx_bonds[i, 0], &UNITY)
         daxpy(&THREE, &DNUNITY, &pos[bonds[i, 0], 0], &UNITY, &dx_bonds[i, 0], &UNITY)
 
     for i in range(nangles):
-        if not mask[nbonds + i]:
-            continue
         dcopy(&THREE, &pos[angles[i, 1], 0], &UNITY, &dx_angles[i, 0, 0], &UNITY)
         dcopy(&THREE, &pos[angles[i, 2], 0], &UNITY, &dx_angles[i, 1, 0], &UNITY)
 
@@ -405,8 +402,6 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
         daxpy(&THREE, &DNUNITY, &pos[angles[i, 1], 0], &UNITY, &dx_angles[i, 1, 0], &UNITY)
 
     for i in range(ndihedrals):
-        if not mask[nbonds + nangles + i]:
-            continue
         dcopy(&THREE, &pos[dihedrals[i, 1], 0], &UNITY, &dx_dihedrals[i, 0, 0], &UNITY)
         dcopy(&THREE, &pos[dihedrals[i, 2], 0], &UNITY, &dx_dihedrals[i, 1, 0], &UNITY)
         dcopy(&THREE, &pos[dihedrals[i, 3], 0], &UNITY, &dx_dihedrals[i, 2, 0], &UNITY)
@@ -417,34 +412,34 @@ def cart_to_internal(np.ndarray[np.float64_t, ndim=2] pos_np,
 
     cdef size_t n = 0
 
-    cdef double[:] q = memoryview(q_np[n : n+nbonds-nmaskb])
-    cdef double[:, :, :] dq = memoryview(dq_np[n : n+nbonds-nmaskb])
-    cdef double[:, :, :, :, :] d2q = memoryview(d2q_np[n : n+nbonds-nmaskb])
+    cdef double[:] q = memoryview(q_np[n : n+nbonds])
+    cdef double[:, :, :] dq = memoryview(dq_np[n : n+nbonds])
+    cdef double[:, :, :, :, :] d2q = memoryview(d2q_np[n : n+nbonds])
 
-    d2q_bonds_np = np.zeros((nbonds-nmaskb, 2, 3, 2, 3), dtype=np.float64)
-    d2q_angles_np = np.zeros((nangles-nmaska, 3, 3, 3, 3), dtype=np.float64)
-    d2q_dihedrals_np = np.zeros((ndihedrals-nmaskd, 4, 3, 4, 3), dtype=np.float64)
+    d2q_bonds_np = np.zeros((nbonds, 2, 3, 2, 3), dtype=np.float64)
+    d2q_angles_np = np.zeros((nangles, 3, 3, 3, 3), dtype=np.float64)
+    d2q_dihedrals_np = np.zeros((ndihedrals, 4, 3, 4, 3), dtype=np.float64)
 
     cdef double[:, :, :, :, :] d2q_bonds = memoryview(d2q_bonds_np)
     cdef double[:, :, :, :, :] d2q_angles = memoryview(d2q_angles_np)
     cdef double[:, :, :, :, :] d2q_dihedrals = memoryview(d2q_dihedrals_np)
 
-    cart_to_bond_sparse(bonds, dx_bonds, q, dq, d2q_bonds, mask[:nbonds], gradient, curvature)
-    n += nbonds - nmaskb
+    cart_to_bond_sparse(bonds, dx_bonds, q, dq, d2q_bonds, gradient, curvature)
+    n += nbonds
 
-    q = memoryview(q_np[n : n+nangles-nmaska])
-    dq = memoryview(dq_np[n : n+nangles-nmaska])
+    q = memoryview(q_np[n : n+nangles])
+    dq = memoryview(dq_np[n : n+nangles])
 
-    cart_to_angle_sparse(angles, dx_angles, q, dq, d2q_angles, mask[nbonds:nbonds+nangles], gradient, curvature)
-    n += nangles - nmaska
+    cart_to_angle_sparse(angles, dx_angles, q, dq, d2q_angles, gradient, curvature)
+    n += nangles
 
-    q = memoryview(q_np[n : n+ndihedrals-nmaskd])
-    dq = memoryview(dq_np[n : n+ndihedrals-nmaskd])
+    q = memoryview(q_np[n : n+ndihedrals])
+    dq = memoryview(dq_np[n : n+ndihedrals])
 
-    cart_to_dihedral_sparse(dihedrals, dx_dihedrals, q, dq, d2q_dihedrals, mask[nbonds+nangles:], gradient, curvature)
-    n += ndihedrals - nmaskd
+    cart_to_dihedral_sparse(dihedrals, dx_dihedrals, q, dq, d2q_dihedrals, gradient, curvature)
+    n += ndihedrals
 
-    D = GradB(natoms, bonds, angles, dihedrals, d2q_bonds, d2q_angles, d2q_dihedrals, mask)
+    D = GradB(natoms, bonds, angles, dihedrals, d2q_bonds, d2q_angles, d2q_dihedrals)
 
     return q_np, dq_np.reshape((-1, 3 * natoms)), D
 
@@ -456,7 +451,6 @@ cdef void cart_to_bond_sparse(int[:, :] bonds,
                               double[:] q,
                               double[:, :, :] dq,
                               double[:, :, :, :, :] d2q,
-                              np.uint8_t[:] mask,
                               bint gradient=False,
                               bint curvature=False):
     cdef size_t nbonds = len(bonds)
@@ -469,8 +463,6 @@ cdef void cart_to_bond_sparse(int[:, :] bonds,
     cdef int info
 
     for i in range(nbonds):
-        if not mask[i]:
-            continue
         a1 = bonds[i, 0]
         a2 = bonds[i, 1]
 
@@ -507,7 +499,6 @@ cdef void cart_to_angle_sparse(int[:, :] angles,
                                double[:] q,
                                double[:, :, :] dq,
                                double[:, :, :, :, :] d2q,
-                               np.uint8_t[:] mask,
                                bint gradient=False,
                                bint curvature=False):
     cdef size_t nangles = len(angles)
@@ -539,8 +530,6 @@ cdef void cart_to_angle_sparse(int[:, :] angles,
     
     n = 0
     for i in range(nangles):
-        if not mask[i]:
-            continue
         a1 = angles[i, 0]
         a2 = angles[i, 1]
         a3 = angles[i, 2]
@@ -636,7 +625,6 @@ cdef void cart_to_dihedral_sparse(int[:, :] dihedrals,
                                   double[:] q,
                                   double[:, :, :] dq,
                                   double[:, :, :, :, :] d2q,
-                                  np.uint8_t[:] mask,
                                   bint gradient=False,
                                   bint curvature=False):
     cdef size_t ndihedrals = len(dihedrals)
@@ -680,8 +668,6 @@ cdef void cart_to_dihedral_sparse(int[:, :] dihedrals,
 
     n = 0
     for i in range(ndihedrals):
-        if not mask[i]:
-            continue
         a1 = dihedrals[i, 0]
         a2 = dihedrals[i, 1]
         a3 = dihedrals[i, 2]
@@ -817,15 +803,14 @@ cdef void cart_to_dihedral_sparse(int[:, :] dihedrals,
         n += 1
 
 cdef class GradB:
-    cdef size_t natoms, nbonds, nangles, ndihedrals, ninternal, nmasked
-    cdef np.uint8_t[:] mask
+    cdef size_t natoms, nbonds, nangles, ndihedrals, ninternal
     cdef int[:, :] bonds, angles, dihedrals
-    cdef double[:, :, :, :, :] Dbonds, Dangles, Ddihedrals
+    cdef public double[:, :, :, :, :] Dbonds, Dangles, Ddihedrals
 
     def __cinit__(self, size_t natoms, int[:, :] bonds, int[:, :] angles,
                   int[:, :] dihedrals, double[:, :, :, :, :] Dbonds,
                   double[:, :, :, :, :] Dangles,
-                  double[:, :, :, :, :] Ddihedrals, np.uint8_t[:] mask):
+                  double[:, :, :, :, :] Ddihedrals):
         self.natoms = natoms
 
         self.nbonds = len(bonds)
@@ -840,25 +825,18 @@ cdef class GradB:
         self.Dbonds = Dbonds
         self.Dangles = Dangles
         self.Ddihedrals = Ddihedrals
-        self.mask = mask
         cdef np.uint8_t i
-        self.nmasked = 0
-
-        for i in mask:
-            self.nmasked += 1 - i
 
     def ddot(self, np.ndarray[np.float64_t, ndim=1] v1_np, np.ndarray[np.float64_t, ndim=1] v2_np):
         cdef size_t i, j, k, a, b, ai, bi
         cdef size_t start = 0
         cdef size_t n = 0, m = 0
-        result_np = np.zeros(self.ninternal - self.nmasked, dtype=np.float64)
+        result_np = np.zeros(self.ninternal, dtype=np.float64)
         cdef double[:] result = memoryview(result_np)
         cdef double[:] v1 = memoryview(v1_np)
         cdef double[:] v2 = memoryview(v2_np)
 
         for i in range(self.nbonds):
-            if not self.mask[i]:
-                continue
             for a in range(2):
                 ai = self.bonds[i, a]
                 for b in range(2):
@@ -872,8 +850,6 @@ cdef class GradB:
         m = 0
         start += self.nbonds
         for i in range(self.nangles):
-            if not self.mask[start + i]:
-                continue
             for a in range(3):
                 ai = self.angles[i, a]
                 for b in range(3):
@@ -887,8 +863,6 @@ cdef class GradB:
         m = 0
         start += self.nangles
         for i in range(self.ndihedrals):
-            if not self.mask[start + i]:
-                continue
             for a in range(4):
                 ai = self.dihedrals[i, a]
                 for b in range(4):
@@ -910,8 +884,6 @@ cdef class GradB:
         cdef double[:] v = memoryview(v_np)
 
         for i in range(self.nbonds):
-            if not self.mask[i]:
-                continue
             for a in range(2):
                 ai = self.bonds[i, a]
                 for b in range(2):
@@ -925,8 +897,6 @@ cdef class GradB:
         m = 0
         start += self.nbonds
         for i in range(self.nangles):
-            if not self.mask[start + i]:
-                continue
             for a in range(3):
                 ai = self.angles[i, a]
                 for b in range(3):
@@ -940,8 +910,6 @@ cdef class GradB:
         m = 0
         start += self.nangles
         for i in range(self.ndihedrals):
-            if not self.mask[start + i]:
-                continue
             for a in range(4):
                 ai = self.dihedrals[i, a]
                 for b in range(4):
@@ -958,13 +926,11 @@ cdef class GradB:
         cdef size_t i, j, k, a, b, ai, bi
         cdef size_t start = 0
         cdef size_t n = 0, m = 0
-        result_np = np.zeros((self.ninternal - self.nmasked, 3 * self.natoms), dtype=np.float64)
+        result_np = np.zeros((self.ninternal, 3 * self.natoms), dtype=np.float64)
         cdef double[:, :] result = memoryview(result_np)
         cdef double[:] v = memoryview(v_np)
 
         for i in range(self.nbonds):
-            if not self.mask[i]:
-                continue
             for a in range(2):
                 ai = self.bonds[i, a]
                 for b in range(2):
@@ -978,8 +944,6 @@ cdef class GradB:
         m = 0
         start += self.nbonds
         for i in range(self.nangles):
-            if not self.mask[start + i]:
-                continue
             for a in range(3):
                 ai = self.angles[i, a]
                 for b in range(3):
@@ -993,8 +957,6 @@ cdef class GradB:
         m = 0
         start += self.nangles
         for i in range(self.ndihedrals):
-            if not self.mask[start + i]:
-                continue
             for a in range(4):
                 ai = self.dihedrals[i, a]
                 for b in range(4):

@@ -7,7 +7,8 @@ from scipy.linalg import eigh
 from scipy.integrate import LSODA
 
 from sella.constraints import Constraints
-from sella.internal import Internal
+#from sella.internal import Internal
+from sella.internal import get_internal
 from sella.cython_routines import modified_gram_schmidt
 from sella.hessian_update import update_H, symmetrize_Y
 from sella.linalg import NumericalHessian, ProjectedMatrix
@@ -33,7 +34,7 @@ class BasePES:
                 self.traj = trajectory
         else:
             self.traj = DummyTrajectory()
-        self._test_traj = Trajectory('test.traj', 'w', self.atoms)
+        #self._test_traj = Trajectory('test.traj', 'w', self.atoms)
         self.H = None
         self.eigensolver = eigensolver
         self.eta = eta
@@ -73,7 +74,7 @@ class BasePES:
 
         self.neval += 1
         self.traj.write()
-        self._test_traj.write(self.atoms + self.int.dummies)
+        #self._test_traj.write(self.atoms + self.int.dummies)
         return True
 
     def converged(self, fmax, maxres=1e-5):
@@ -260,7 +261,7 @@ class IntPES(BasePES):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
         self.last.update(xint=None, gint=None, hint=None)
         self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
-        
+
         self._conin = constraints
         if self._conin is None:
             con = dict()
@@ -449,10 +450,22 @@ class IntPES(BasePES):
         nd0 = len(self.int_last.dummies)
         nold = 3 * (len(self.atoms) + nd0)
         self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
-        Binv = self.int_last.Binv(self.atoms.positions)
+        Blast = self.int_last.B(self.atoms.positions)
+        Binvlast = self.int_last.Binv(self.atoms.positions)
         B = self.int.B(self.atoms.positions)
-        P = B[:, :nold] @ Binv
-        return P @ self.H @ P.T
+        Binv = self.int.Binv(self.atoms.positions)
+        P = B[:, :nold] @ Binvlast
+
+        if self._conin is None:
+            con = dict()
+        else:
+            con = self._conin.copy()
+        for key, val in self.int.cons.items():
+            con[key] = con.get(key, []) + val
+        self.cons = Constraints(self.atoms + self.dummies, con, p_t=False, p_r=False)
+        P2 = B[:, nold:] @ Binv[nold:, :]
+
+        return P @ self.H @ P.T + P2 @ self.int.guess_hessian(self.atoms) @ P2.T
 
     def update_H(self):
         if self.int_last is not None:

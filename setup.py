@@ -19,6 +19,14 @@ if use_cython:
                              ['sella/cython_routines.pyx']),
                    Extension('sella.internal_cython',
                              ['sella/internal_cython.pyx']),
+                   Extension('sella.internal.int_eval',
+                             ['sella/internal/int_eval.pyx']),
+                   Extension('sella.internal.int_find',
+                             ['sella/internal/int_find.pyx']),
+                   Extension('sella.internal.int_classes',
+                             ['sella/internal/int_classes.pyx']),
+                   Extension('sella.utilities.math',
+                             ['sella/utilities/math.pyx']),
                    ]
     cmdclass['build_ext'] = build_ext
 else:
@@ -28,6 +36,14 @@ else:
                              ['sella/cython_routines.c']),
                    Extension('sella.internal_cython',
                              ['sella/internal_cython.c']),
+                   Extension('sella.internal.int_eval',
+                             ['sella/internal/int_eval.c']),
+                   Extension('sella.internal.int_find',
+                             ['sella/internal/int_find.pyx']),
+                   Extension('sella.internal.int_classes',
+                             ['sella/internal/int_classes.pyx']),
+                   Extension('sella.utilities.math',
+                             ['sella/utilities/math.c']),
                    ]
 
 with open('README.md', 'r') as f:
@@ -43,6 +59,9 @@ setup(name='Sella',
       long_description=long_description,
       long_description_content_type='text/markdown',
       packages=find_packages(),
+#      package_data={'sella/utilities': ['*.pxd'],
+#                    'sella/internal': ['*.pxd'],
+#                    },
       cmdclass=cmdclass,
       ext_modules=ext_modules,
       include_dirs=[np.get_include()],

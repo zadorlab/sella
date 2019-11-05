@@ -6,6 +6,7 @@ import numpy as np
 
 from ase.optimize.optimize import Optimizer
 from ase.utils import basestring
+from ase.io.trajectory import Trajectory
 
 from sella.optimize import rs_newton, rs_rfo, rs_prfo
 from sella.peswrapper import BasePES, CartPES, IntPES
@@ -32,7 +33,8 @@ class Sella(Optimizer):
                  sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
                  order=1, eig=None, eta=1e-4, method=None, gamma=0.4,
                  threepoint=False, constraints=None, constraints_tol=1e-5,
-                 v0=None, internal=False, append_trajectory=False):
+                 v0=None, internal=False, append_trajectory=False,
+                 **kwargs):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
@@ -52,10 +54,12 @@ class Sella(Optimizer):
             asetraj = None
             if internal:
                 self.pes = IntPES(atoms, constraints=constraints,
-                                  trajectory=trajectory, eta=eta, v0=v0)
+                                  trajectory=trajectory, eta=eta, v0=v0,
+                                  **kwargs)
             else:
                 self.pes = CartPES(atoms, constraints=constraints,
-                                   trajectory=trajectory, eta=eta, v0=v0)
+                                   trajectory=trajectory, eta=eta, v0=v0,
+                                   **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
 
