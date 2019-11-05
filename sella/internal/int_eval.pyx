@@ -274,6 +274,7 @@ cdef int cart_to_dihedral(int a,
 
     if not (gradient or curvature):
         return 0
+
     cdef double[:, :] dnumer = work[1, 0, :, :]
     cdef double[:, :] ddenom = work[1, 1, :, :]
     cdef double[:, :] dq_int = work[1, 2, :, :]
@@ -281,13 +282,12 @@ cdef int cart_to_dihedral(int a,
     cdef int sd_dq = dq.strides[1] >> 3
     cdef int sd_dint = dq_int.strides[1] >> 3
 
-
     cross(dx1, dx3, dx1_cross_dx3)
 
     cross(dx2_cross_dx3, dx2, ddenom[0])
     cross(dx1, dx2_cross_dx3, ddenom[1])
     cross(dx1_cross_dx2, dx3, tmpar1)
-    err = my_daxpy(-1., tmpar1, ddenom[1])
+    err = my_daxpy(1., tmpar1, ddenom[1])
     if err != 0: return err
     cross(dx2, dx1_cross_dx2, ddenom[2])
 
@@ -305,7 +305,7 @@ cdef int cart_to_dihedral(int a,
 
     tmp1 = numer * numer + denom * denom
     tmp2 = denom / tmp1
-    tmp3 = -numer/ tmp1
+    tmp3 = -numer / tmp1
 
     for i in range(3):
         err = my_daxpy(tmp2, dnumer[i], dq_int[i])
