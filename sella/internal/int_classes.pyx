@@ -319,8 +319,6 @@ cdef class CartToInternal:
             return self.next
 
         if self.nint + self.next != self.nx:
-            with gil:
-                print(self.nint, self.next, self.nx)
             return -1
 
         return 0
