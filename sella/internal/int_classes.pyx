@@ -120,6 +120,8 @@ cdef class CartToInternal:
                                                     4, 3), dtype=np.float64))
         self.work1 = memoryview(np.zeros((11, 3, 3, 3), dtype=np.float64))
         self.work2 = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
+        self.Uint = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
+        self.Uext = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
         self.grad = False
         self.curv = False
         if dummies is None:
@@ -128,6 +130,9 @@ cdef class CartToInternal:
         else:
             self.dummies = dummies
             self.dinds = dinds
+        self.nint = -1
+        self.next = -1
+
 
     def q(self, atoms):
         cdef double[:, :] pos = memoryview(atoms.positions)
@@ -292,6 +297,22 @@ cdef class CartToInternal:
                                         self.d2q_angle_diffs[n], grad, curv)
             if info < 0:
                 return info
+
+        cdef int sddq = self.dq.strides[2] >> 3
+        cdef int sdu = self.Uint.strides[1] >> 3
+        memset(&self.Uint[0, 0], 0, self.nx * self.nx * sizeof(double))
+        memset(&self.Uext[0, 0], 0, self.nx * self.nx * sizeof(double))
+        for n in range(self.nq):
+            dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[n, 0], &sdu)
+        for n in range(self.nx):
+            self.Uext[n, n] = 1.
+        self.nint = mgs(self.Uint[:self.nq], None)
+        self.next = mgs(self.Uext, self.Uint[:self.nint])
+
+        if self.nint + self.next != self.nx:
+            return -1
+
+        return 0
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -498,6 +519,35 @@ cdef class CartToInternal:
         return ((At + Bt * L**Dt * exp(-Ct * (rij[b, c] - rcovbc))
                  / (rij[b, c] * rcovbc)**Et) * conv)
 
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    def get_Uext(self, atoms):
+        cdef double[:, :] pos = memoryview(atoms.positions)
+        with nogil:
+            info = self._update(pos, True, False)
+        if info < 0:
+            raise RuntimeError("Internal update failed with error code {}"
+                               "".format(info))
+
+        return np.array(self.Uext[:self.next])
+
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    def get_Uint(self, atoms):
+        cdef double[:, :] pos = memoryview(atoms.positions)
+        with nogil:
+            info = self._update(pos, True, False)
+        if info < 0:
+            raise RuntimeError("Internal update failed with error code {}"
+                               "".format(info))
+
+        return np.array(self.Uint[:self.nint])
+
+
 cdef class Constraints(CartToInternal):
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -519,8 +569,6 @@ cdef class Constraints(CartToInternal):
             self.proj_rot = False
         self.nrot = 0
 
-        self.Ucons = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
-        self.Ufree = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
         self.Ured = memoryview(np.zeros((self.nx, self.nx - self.ncart),
                                         dtype=np.float64))
         self.trans_dirs = memoryview(np.zeros(3, dtype=np.uint8))
@@ -529,8 +577,6 @@ cdef class Constraints(CartToInternal):
         self.tvecs = memoryview(np.zeros((3, self.nx), dtype=np.float64))
         self.rvecs = memoryview(np.zeros((3, self.nx), dtype=np.float64))
         self.calc_res = False
-        self.ncons = -1
-        self.nfree = -1
 
         # Ured is fixed, so we initialize it here
         fixed_np = np.zeros((self.natoms, 3), dtype=np.uint8)
@@ -593,11 +639,7 @@ cdef class Constraints(CartToInternal):
                     return 0
 
         self.calc_res = False
-        self.ncons = -1
-        self.nfree = -1
         memset(&self.res[0], 0, self.nq * sizeof(double))
-        memset(&self.Ucons[0, 0], 0, self.nx * self.nx * sizeof(double))
-        memset(&self.Ufree[0, 0], 0, self.nx * self.nx * sizeof(double))
         cdef int err = CartToInternal._update(self, pos, grad, curv, True)
         if err != 0: return err
 
@@ -607,9 +649,12 @@ cdef class Constraints(CartToInternal):
         cdef int i
         cdef int sdt = self.tvecs.strides[1] >> 3
         cdef int sddq = self.dq.strides[2] >> 3
+        cdef int sdu = self.Uint.strides[1] >> 3
         for i in range(self.ntrans):
             dcopy(&self.nx, &self.tvecs[i, 0], &sdt,
                   &self.dq[self.nint + i, 0, 0], &sddq)
+            dcopy(&self.nx, &self.tvecs[i, 0], &sdt,
+                  &self.Uint[self.nint + i, 0], &sdu)
 
         err = self.project_rotation()
         if err != 0: return err
@@ -618,6 +663,17 @@ cdef class Constraints(CartToInternal):
         for i in range(self.nrot):
             dcopy(&self.nx, &self.rvecs[i, 0], &sdr,
                   &self.dq[self.nint + self.ntrans + i, 0, 0], &sddq)
+            dcopy(&self.nx, &self.rvecs[i, 0], &sdr,
+                  &self.Uint[self.nint + self.ntrans + i, 0], &sdu)
+
+        # Another rounds of MGS. This is a bit wasteful, but I can't think
+        # of a better way to do this right now.
+        self.nint = mgs(self.Uint[:self.nint + self.ntrans + self.nrot], None)
+        self.next = mgs(self.Uext[:self.next], self.Uint[:self.nint])
+        if self.nint + self.next != self.nx:
+            return -1
+
+        return 0
 
 
     @cython.boundscheck(False)
@@ -661,112 +717,11 @@ cdef class Constraints(CartToInternal):
     def get_Ured(self, atoms):
         return np.asarray(self.Ured)
 
+    def get_Ucons(self, atoms):
+        return self.get_Uint(self, atoms)
 
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
-    @cython.cdivision(True)
-    def get_Ucons(self, atoms, double eps=1e-15):
-        cdef int err
-        err = self._update(atoms.positions, True, False)
-        if self.ncons != -1:
-            return np.asarray(self.Ucons[:, :self.ncons])
-
-        B_np = self.drdx(atoms)
-        cdef double[:, :] B = memoryview(B_np)
-        cdef int i, j, k, m
-        cdef int n = 0
-        cdef int sdb = B.stride[1] >> 3
-        cdef int sdu = self.Ucons.stride[0] >> 3
-        cdef double norm, normtot, dot
-        with nogil:
-            for i in range(self.nq):
-                dcopy(&self.nx, &B[i, 0], &sdb, &self.Ucons[0, n], &sdu)
-                norm = dnrm2(&self.nx, &self.Ucons[0, n], &sdu)
-                for k in range(self.nx):
-                    self.Ucons[k, n] /= norm
-                while True:
-                    normtot = 1.
-                    for m in range(n):
-                        dot = -ddot(&self.nx, &self.Ucons[0, m], &sdu,
-                                    &self.Ucons[0, n], &sdu)
-                        daxpy(&self.nx, &dot, &self.Ucons[0, m], &sdu,
-                              &self.Ucons[0, n], &sdu)
-                        norm = dnrm2(&self.nx, &self.Ucons[0, n], &sdu)
-                        normtot *= norm
-                        if normtot < eps:
-                            break
-                        for k in range(self.nx):
-                            self.Ucons[k, n] /= norm
-                    if normtot < eps:
-                        break
-                    elif fabs(1. - normtot) < eps:
-                        n += 1
-                        break
-        self.ncons = n
-        return np.asarray(self.Ucons[:, :self.ncons])
-
-
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
-    @cython.cdivision(True)
-    def get_Ufree(self, atoms, double eps=1e-15):
-        cdef int err
-        err = self._update(atoms.positions, True, False)
-        if self.nfree != -1:
-            return np.asarray(self.Ufree[:, :self.nfree])
-        cdef int i, j
-        cdef int n = 0
-        cdef double norm, normtot, dot
-
-        # This is basically a no-op if Ucons has already been constructed
-        self.get_Ucons(atoms, eps)
-        cdef int sdu = self.Ucons.strides[0] >> 3
-        with nogil:
-            for i in range(self.nx):
-                for k in range(self.nx):
-                    self.Ufree[k, n] = 0.
-                self.Ufree[i, n] = 1.
-                while True:
-                    normtot = 1.
-                    # Orthogonalize against Ucons
-                    for j in range(self.ncons):
-                        dot = -ddot(&self.nx, &self.Ucons[0, j], &sdu,
-                                    &self.Ufree[0, n], &sdu)
-                        daxpy(&self.nx, &dot, &self.Ucons[0, j], &sdu,
-                              &self.Ufree[0, n], &sdu)
-                        norm = dnrm2(&self.nx, &self.Ufree[0, n], &sdu)
-                        normtot *= norm
-                        if normtot < eps:
-                            break
-                        for k in range(self.nx):
-                            self.Ufree[k, n] /= norm
-                    if normtot < eps:
-                        break
-                    # Orthogonalize against other vectors in Ufree
-                    for j in range(n):
-                        dot = -ddot(&self.nx, &self.Ufree[0, j], &sdu,
-                                    &self.Ufree[0, n], &sdu)
-                        daxpy(&self.nx, &dot, &self.Ufree[0, j], &sdu,
-                              &self.Ufree[0, n], &sdu)
-                        norm = dnrm2(&self.nx, &self.Ufree[0, n], &sdu)
-                        normtot *= norm
-                        if normtot < eps:
-                            break
-                        for k in range(self.nx):
-                            self.Ufree[k, n] /= norm
-                    if normtot < eps:
-                        break
-                    elif fabs(1. - normtot) < eps:
-                        n += 1
-                        break
-        self.nfree = n
-        if self.nfree + self.ncons != self.nx:
-            raise RuntimeError("Number of degrees of freedom ({}) plus number "
-                               "of linearly independent constraints ({}) not "
-                               "equal to the total system dimensions ({})!"
-                               "".format(self.nfree, self.ncons, self.nx))
-        return np.asarray(self.Ufree[:, :self.nfree])
-
+    def get_Ufree(self, atoms):
+        return self.get_Uext(self, atoms)
 
     def D(self, atoms):
         raise NotImplementedError

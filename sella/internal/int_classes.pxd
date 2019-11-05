@@ -5,7 +5,7 @@ from libc.stdint cimport uint8_t
 cdef class CartToInternal:
     cdef bint grad, curv
     cdef int natoms, nbonds, nangles, ndihedrals, nangle_sums
-    cdef int nangle_diffs, nq, nx, ncart
+    cdef int nangle_diffs, nq, nx, ncart, nint, next
     cdef public int[:] dinds
     cdef public int[:, :] cart, bonds, angles, dihedrals, angle_sums
     cdef public int[:, :] angle_diffs
@@ -16,6 +16,7 @@ cdef class CartToInternal:
     cdef double[:, :, :, :] work1
     cdef double[:, :, :, :, :] d2q_bonds, d2q_angles, d2q_dihedrals
     cdef double[:, :, :, :, :] d2q_angle_sums, d2q_angle_diffs
+    cdef double[:, :] Uint, Uext
     cdef dict __dict__
 
     cdef bint geom_changed(CartToInternal self, double[:, :] pos) nogil
@@ -44,10 +45,10 @@ cdef class CartToInternal:
 
 cdef class Constraints(CartToInternal):
     cdef bint proj_trans, proj_rot, calc_res
-    cdef int ncons, nfree, ntrans, nrot, nint
+    cdef int ntrans, nrot, ninternal
     cdef public double[:] res, target
     cdef double[:] center
-    cdef double[:, :] Ucons, Ufree, Ured
+    cdef double[:, :] Ured
     cdef uint8_t[:] trans_dirs
     cdef double[:, :] rot_axes
     cdef double[:, :] tvecs
