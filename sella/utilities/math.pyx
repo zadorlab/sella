@@ -128,7 +128,8 @@ cdef (int, double) inner(double[:, :] M, double[:] x, double[:] y,
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps=1e-15) nogil:
+cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
+             double eps2=1e-6, int maxiter=100) nogil:
     """Orthonormalizes X in-place against itself and Y. To accomplish this, Y
     is first orthonormalized in-place."""
 
@@ -148,7 +149,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps=1e-15) nogil:
         sdy = Y.strides[0] >> 3
 
     if ny != 0:
-        ny = mgs(Y, None, eps=eps)
+        ny = mgs(Y, None, eps1=eps1, eps2=eps2, maxiter=maxiter)
         if ny < 0:
             return ny
 
@@ -156,39 +157,43 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps=1e-15) nogil:
 
     # Now orthonormalize X
     cdef int m = 0
+    cdef int niter
     for i in range(nx):
         if i != m:
-            dcopy(&n, &X[0, i], &sdx, &X[0, m], &sdx)
+            X[:, m] = X[:, i]
+            #dcopy(&n, &X[0, i], &sdx, &X[0, m], &sdx)
         norm = dnrm2(&n, &X[0, m], &sdx)
         for k in range(n):
             X[k, m] /= norm
-        while True:
+        for niter in range(maxiter):
             normtot = 1.
             for j in range(ny):
                 dot = -ddot(&n, &Y[0, j], &sdy, &X[0, m], &sdx)
                 daxpy(&n, &dot, &Y[0, j], &sdy, &X[0, m], &sdx)
                 norm = dnrm2(&n, &X[0, m], &sdx)
                 normtot *= norm
-                if normtot < eps:
+                if normtot < eps2:
                     break
                 for k in range(n):
                     X[k, m] /= norm
-            if normtot < eps:
+            if normtot < eps2:
                 break
             for j in range(m):
                 dot = -ddot(&n, &X[0, j], &sdx, &X[0, m], &sdx)
                 daxpy(&n, &dot, &X[0, j], &sdx, &X[0, m], &sdx)
                 norm = dnrm2(&n, &X[0, m], &sdx)
-                normtot *- norm
-                if normtot < eps:
+                normtot *= norm
+                if normtot < eps2:
                     break
                 for k in range(n):
                     X[k, m] /= norm
-            if normtot < eps:
+            if normtot < eps2:
                 break
-            elif 0. <= 1. - normtot <= eps:
+            elif 0. <= 1. - normtot <= eps1:
                 m += 1
                 break
+        else:
+            return -1
 
     # Just for good measure, zero out any leftover bits of X
     for i in range(m, nx):
@@ -197,12 +202,13 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps=1e-15) nogil:
 
     return m
 
-def modified_gram_schmidt(Xin, Yin=None, eps=1.e-15):
+def modified_gram_schmidt(Xin, Yin=None, eps1=1.e-15, eps2=1.e-6,
+                          maxiter=100):
     Xout_np = Xin.copy()
     cdef double[:, :] Xout = memoryview(Xout_np)
 
     if Yin is None:
-        nx = mgs(Xout, None, eps=eps)
+        nx = mgs(Xout, None, eps1=eps1, eps2=eps2, maxiter=maxiter)
         if nx < 0:
             raise RuntimeError("MGS failed.")
         return Xout_np[:, :nx]
@@ -210,7 +216,7 @@ def modified_gram_schmidt(Xin, Yin=None, eps=1.e-15):
     Y_np = Yin.copy()
     cdef double[:, :] Y = memoryview(Y_np)
 
-    nx = mgs(Xout, Y, eps)
+    nx = mgs(Xout, Y, eps1=eps1, eps2=eps2, maxiter=maxiter)
     if nx < 0:
         raise RuntimeError("MGS failed: Mismatched matrix sizes!")
     return Xout_np[:, :nx]
