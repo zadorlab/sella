@@ -4,9 +4,13 @@ cimport cython
 from cython.view cimport array as cva
 
 from libc.math cimport sqrt, fabs
+from libc.string cimport memset
 from scipy.linalg.cython_blas cimport daxpy, dnrm2, dcopy, dgemv, ddot
+from scipy.linalg.cython_lapack cimport dgesvd
 
 import numpy as np
+
+cdef int UNITY = 1
 
 cdef double DUNITY = 1.
 cdef double DZERO = 0.
@@ -148,11 +152,6 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
         ny = Y.shape[1]
         sdy = Y.strides[0] >> 3
 
-    if ny != 0:
-        ny = mgs(Y, None, eps1=eps1, eps2=eps2, maxiter=maxiter)
-        if ny < 0:
-            return ny
-
     cdef double norm, normtot, dot
 
     # Now orthonormalize X
@@ -202,6 +201,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
 
     return m
 
+
 def modified_gram_schmidt(Xin, Yin=None, eps1=1.e-15, eps2=1.e-6,
                           maxiter=100):
     Xout_np = Xin.copy()
@@ -220,3 +220,56 @@ def modified_gram_schmidt(Xin, Yin=None, eps1=1.e-15, eps2=1.e-6,
     if nx < 0:
         raise RuntimeError("MGS failed: Mismatched matrix sizes!")
     return Xout_np[:, :nx]
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef int svdr(int n, int m, double[:, :] A, double[:, :] VT, double[:] s,
+              double[:] work, double eps=1e-6) nogil:
+    """Computes the right singular vectors of matrix A. Singular vectors
+    are stored in VT. A will be populated with the columns of VT that
+    correspond to the null space of A on input."""
+    if A.shape[0] < n:
+        return -1
+    if A.shape[1] < m:
+        return -1
+    cdef int lda = A.strides[0] >> 3
+
+    cdef int ldvt = VT.strides[0] >> 3
+    if ldvt < n or VT.shape[1] < n:
+        return -1
+
+    cdef double utmp
+
+    cdef int ns = len(s)
+    if ns < min(n, m):
+        return -1
+
+    cdef int lwork = len(work)
+    cdef int info
+
+    memset(&s[0], 0, ns * sizeof(double))
+    memset(&VT[0, 0], 0, VT.shape[0] * VT.shape[1] * sizeof(double))
+    memset(&work[0], 0, work.shape[0] * sizeof(double))
+
+    dgesvd('A', 'N', &m, &n, &A[0, 0], &lda, &s[0], &VT[0, 0], &ldvt, &utmp,
+           &UNITY, &work[0], &lwork, &info)
+    if info != 0:
+        return -1
+
+    cdef int i
+    cdef int nsing = 0
+    for i in range(ns):
+        if fabs(s[i]) > eps:
+            nsing += 1
+
+    cdef int na = A.strides[1] >> 3
+    cdef int nvt = VT.strides[1] >> 3
+    for i in range(m):
+        dcopy(&m, &VT[i, 0], &nvt, &A[0, i], &lda)
+
+    for i in range(m - nsing):
+        dcopy(&m, &A[0, nsing + i], &lda, &VT[0, i], &ldvt)
+
+    return nsing

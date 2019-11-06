@@ -3,16 +3,16 @@
 from libc.stdint cimport uint8_t
 
 cdef class CartToInternal:
-    cdef bint grad, curv
+    cdef bint grad, curv, calc_required
     cdef public int natoms, nbonds, nangles, ndihedrals, nangle_sums
     cdef public int nangle_diffs, ncart
-    cdef int nq, nx, nint, next
+    cdef int nq, nx, nint, next, lwork, nmin, nmax
     cdef public int[:] dinds
     cdef public int[:, :] cart, bonds, angles, dihedrals, angle_sums
     cdef public int[:, :] angle_diffs
     cdef double[:] q1
     cdef double[:, :] pos, work2
-    cdef double[:] dx1, dx2, dx3
+    cdef double[:] dx1, dx2, dx3, work3, sing
     cdef double[:, :, :] dq
     cdef double[:, :, :, :] work1
     cdef double[:, :, :, :, :] d2q_bonds, d2q_angles, d2q_dihedrals
@@ -24,6 +24,9 @@ cdef class CartToInternal:
 
     cdef int _update(CartToInternal self, double[:, :] pos,
                      bint grad=?, bint curv=?, bint force=?) nogil
+
+    cdef int _U_update(CartToInternal self, double[:, :] pos,
+                       bint force=?) nogil
 
     cdef int _angle_sum_diff(CartToInternal self, int[:] indices, double sign,
                              double* q, double[:, :] dq,

@@ -6,7 +6,7 @@ from ase.utils import basestring
 from scipy.linalg import eigh
 from scipy.integrate import LSODA
 
-from sella.constraints import Constraints
+from sella.constraints import merge_user_constraints, get_constraints
 #from sella.internal import Internal
 from sella.internal import get_internal
 from sella.cython_routines import modified_gram_schmidt
@@ -169,7 +169,7 @@ class BasePES:
         theta, X = eigh(Atilde)
         Vs = Vs @ X
         AVs = AVs @ X
-        AVstilde = AVs - self.drdx @ self.Ucons.T @ AVs
+        AVstilde = AVs - self.drdx.T @ self.Ucons.T @ AVs
         self.H = update_H(self.H, Vs, AVstilde)
         self.lastlast = lastlast
         self.last = last
@@ -180,12 +180,14 @@ class CartPES(BasePES):
                  trajectory=None, eta=1e-4, v0=None):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
         self.last.update(gfree=None, h=None)
-        self.cons = Constraints(atoms, constraints)
+        self.con_user, self.target_user = merge_user_constraints(atoms,
+                                                                 constraints)
+        self.cons = get_constraints(atoms, self.con_user, self.target_user)
 
-    res = property(lambda self: self.cons.res(self.atoms.positions))
-    drdx = property(lambda self: self.cons.drdx(self.atoms.positions))
-    Ufree = property(lambda self: self.cons.Ufree(self.atoms.positions))
-    Ucons = property(lambda self: self.cons.Ucons(self.atoms.positions))
+    res = property(lambda self: self.cons.get_res(self.atoms))
+    drdx = property(lambda self: self.cons.get_drdx(self.atoms))
+    Ufree = property(lambda self: self.cons.get_Ufree(self.atoms))
+    Ucons = property(lambda self: self.cons.get_Ucons(self.atoms))
 
     def _update(self):
         if not BasePES._update(self):
@@ -193,7 +195,7 @@ class CartPES(BasePES):
         g = self.last['g']
 
         gfree = self.Ufree.T @ g
-        h = g - (self.drdx @ self.Ucons.T) @ g
+        h = g - (self.drdx.T @ self.Ucons.T) @ g
 
         self.last.update(gfree=gfree, h=h)
         return True
@@ -218,12 +220,12 @@ class CartPES(BasePES):
 
     @property
     def xfree(self):
-        Ufree = self.cons.Ufree(self.atoms.positions)
+        Ufree = self.cons.get_Ufree(self.atoms)
         return Ufree.T @ self.x
 
     @xfree.setter
     def xfree(self, target):
-        dx_cons = -np.linalg.pinv(self.drdx.T) @ self.res
+        dx_cons = -np.linalg.pinv(self.drdx) @ self.res
         dx_free = self.Ufree @ (target - self.xfree)
         self.x = self.x + dx_free + dx_cons
 

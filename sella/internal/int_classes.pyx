@@ -10,7 +10,8 @@ from libc.stdint cimport uint8_t
 
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dgemv, dcopy
 
-from sella.utilities.math cimport my_daxpy, vec_sum, mgs, cross
+from sella.utilities.math cimport (my_daxpy, vec_sum, mgs, cross, svdr,
+                                   normalize)
 from sella.internal.int_eval cimport (cart_to_bond, cart_to_angle,
                                       cart_to_dihedral)
 
@@ -29,11 +30,56 @@ cdef int UNITY = 1
 cdef int THREE = 3
 
 cdef class CartToInternal:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, atoms, *args, dummies=None, **kwargs):
         if self.natoms <= 0:
             raise ValueError("Must have at least 1 atom!")
-        if self.nq <= 0:
-            raise ValueError("Must have at least 1 internal coordinate!")
+        self.nmin = min(self.nq, self.nx)
+        self.nmax = max(self.nq, self.nx)
+
+        # Allocate arrays
+        #
+        # We use memoryview and numpy to initialize these arrays, because
+        # some of the arrays may have a dimension of size 0, which
+        # cython.view.array does not permit.
+        self.pos = memoryview(atoms.positions.copy())
+#        self.pos = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
+        self.dx1 = memoryview(np.zeros(3, dtype=np.float64))
+        self.dx2 = memoryview(np.zeros(3, dtype=np.float64))
+        self.dx3 = memoryview(np.zeros(3, dtype=np.float64))
+        self.q1 = memoryview(np.zeros(self.nq, dtype=np.float64))
+        self.dq = memoryview(np.zeros((self.nq, self.natoms, 3),
+                                      dtype=np.float64))
+        self.d2q_bonds = memoryview(np.zeros((self.nbonds, 2, 3, 2, 3),
+                                             dtype=np.float64))
+        self.d2q_angles = memoryview(np.zeros((self.nangles, 3, 3, 3, 3),
+                                              dtype=np.float64))
+        self.d2q_dihedrals = memoryview(np.zeros((self.ndihedrals, 4, 3, 4, 3),
+                                                 dtype=np.float64))
+        self.d2q_angle_sums = memoryview(np.zeros((self.nangle_sums, 4, 3,
+                                                   4, 3), dtype=np.float64))
+        self.d2q_angle_diffs = memoryview(np.zeros((self.nangle_diffs, 4, 3,
+                                                    4, 3), dtype=np.float64))
+        self.work1 = memoryview(np.zeros((11, 3, 3, 3), dtype=np.float64))
+        self.work2 = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
+
+        # Things for SVD
+        self.lwork = 2 * max(3 * self.nmin + self.nmax, 5 * self.nmin, 1)
+        self.work3 = memoryview(np.zeros(self.lwork, dtype=np.float64))
+
+        self.sing = memoryview(np.zeros(self.nmin, dtype=np.float64))
+        self.Uint = memoryview(np.zeros((self.nmax, self.nmax),
+                                        dtype=np.float64))
+        self.Uext = memoryview(np.zeros((self.nmax, self.nmax),
+                                        dtype=np.float64))
+        self.grad = False
+        self.curv = False
+        if dummies is None:
+            self.dummies = Atoms()
+        else:
+            self.dummies = dummies
+        self.nint = -1
+        self.next = -1
+        self.calc_required = True
 
     def __cinit__(CartToInternal self,
                   atoms,
@@ -91,47 +137,13 @@ cdef class CartToInternal:
             self.angle_diffs = angle_diffs
         self.nangle_diffs = len(self.angle_diffs)
 
-        self.nq = (self.ncart + self.nbonds + self.nangles
-                   + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
-        if self.nq <= 0:
-            return
-
-        # Allocate arrays
-        #
-        # We use memoryview and numpy to initialize these arrays, because
-        # some of the arrays may have a dimension of size 0, which
-        # cython.view.array does not permit.
-        self.pos = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
-        self.dx1 = memoryview(np.zeros(3, dtype=np.float64))
-        self.dx2 = memoryview(np.zeros(3, dtype=np.float64))
-        self.dx3 = memoryview(np.zeros(3, dtype=np.float64))
-        self.q1 = memoryview(np.zeros(self.nq, dtype=np.float64))
-        self.dq = memoryview(np.zeros((self.nq, self.natoms, 3),
-                                      dtype=np.float64))
-        self.d2q_bonds = memoryview(np.zeros((self.nbonds, 2, 3, 2, 3),
-                                             dtype=np.float64))
-        self.d2q_angles = memoryview(np.zeros((self.nangles, 3, 3, 3, 3),
-                                              dtype=np.float64))
-        self.d2q_dihedrals = memoryview(np.zeros((self.ndihedrals, 4, 3, 4, 3),
-                                                 dtype=np.float64))
-        self.d2q_angle_sums = memoryview(np.zeros((self.nangle_sums, 4, 3,
-                                                   4, 3), dtype=np.float64))
-        self.d2q_angle_diffs = memoryview(np.zeros((self.nangle_diffs, 4, 3,
-                                                    4, 3), dtype=np.float64))
-        self.work1 = memoryview(np.zeros((11, 3, 3, 3), dtype=np.float64))
-        self.work2 = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
-        self.Uint = memoryview(np.zeros((self.nx, self.nq), dtype=np.float64))
-        self.Uext = memoryview(np.zeros((self.nx, self.nx), dtype=np.float64))
-        self.grad = False
-        self.curv = False
-        if dummies is None:
-            self.dummies = Atoms()
+        if dinds is None:
             self.dinds = memoryview(-np.ones(self.natoms, dtype=np.int32))
         else:
-            self.dummies = dummies
             self.dinds = dinds
-        self.nint = -1
-        self.next = -1
+
+        self.nq = (self.ncart + self.nbonds + self.nangles
+                   + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
 
 
     def q(self, atoms):
@@ -169,7 +181,7 @@ cdef class CartToInternal:
                    self.d2q_bonds, self.d2q_angles, self.d2q_dihedrals,
                    self.d2q_angle_sums, self.d2q_angle_diffs)
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef bint geom_changed(CartToInternal self, double[:, :] pos) nogil:
@@ -181,7 +193,7 @@ cdef class CartToInternal:
                 return True
         return False
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _update(CartToInternal self,
@@ -193,10 +205,11 @@ cdef class CartToInternal:
         # array has been changed at all since the last internal coordinate
         # evaluation, which is why we are doing exact floating point
         # comparison with ==.
-        if not force:
+        if not self.calc_required and not force:
             if (self.grad or not grad) and (self.curv or not curv):
                 if not self.geom_changed(pos):
                     return 0
+        self.calc_required = True
         self.grad = grad or curv
         self.curv = curv
         cdef size_t n, m, i, j, k, l
@@ -297,33 +310,42 @@ cdef class CartToInternal:
             if info < 0:
                 return info
 
-        if not self.grad:
+        self.calc_required = False
+        self.nint = -1
+        return 0
+
+    @cython.boundscheck(True)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    cdef int _U_update(CartToInternal self,
+                       double[:, :] pos,
+                       bint force=False) nogil:
+        cdef int err = self._update(pos, True, False, force)
+        if err != 0:
+            return err
+
+        if self.nint > 0:
             return 0
 
         cdef int sddq = self.dq.strides[2] >> 3
-        cdef int sdu = self.Uint.strides[0] >> 3
-        memset(&self.Uint[0, 0], 0, self.nq * self.nx * sizeof(double))
-        memset(&self.Uext[0, 0], 0, self.nx * self.nx * sizeof(double))
-        for n in range(self.nq):
-            dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[0, n], &sdu)
-        for n in range(self.nx):
-            self.Uext[n, n] = 1.
+        cdef int sdu = self.Uint.strides[1] >> 3
+        memset(&self.Uint[0, 0], 0, self.nmax * self.nmax * sizeof(double))
+        memset(&self.Uext[0, 0], 0, self.nmax * self.nmax * sizeof(double))
 
-        self.nint = mgs(self.Uint[:, :self.nq], None)
+        for n in range(self.nq):
+            dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[n, 0], &sdu)
+
+        self.nint = svdr(self.nq, self.nx, self.Uint, self.Uext, self.sing,
+                         self.work3)
         if self.nint < 0:
             return self.nint
-        if self.nint > self.nx:
-            return -1
-        self.next = mgs(self.Uext, self.Uint[:, :self.nint])
-        if self.next < 0:
-            return self.next
+        self.next = self.nx - self.nint
 
-        if self.nint + self.next != self.nx:
-            return -1
-
+        self.calc_required = False
         return 0
 
-    @cython.boundscheck(False)
+
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _angle_sum_diff(CartToInternal self,
@@ -395,7 +417,7 @@ cdef class CartToInternal:
             my_daxpy(sign, self.work1[9, i, 2], d2q[3, i, 3])
         return 0
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def guess_hessian(self, atoms, double h0cart=70.):
@@ -472,7 +494,7 @@ cdef class CartToInternal:
         return np.diag(h0_np)
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef double _h0_bond(CartToInternal self, int a, int b, double[:, :] rij,
@@ -481,7 +503,7 @@ cdef class CartToInternal:
         return Ab * exp(-Bb * (rij[a, b] - rcov[a] - rcov[b])) * conv
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef double _h0_angle(CartToInternal self, int a, int b, int c,
@@ -494,7 +516,7 @@ cdef class CartToInternal:
                  / (rcovab * rcovbc)**Da) * conv)
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef double _h0_dihedral(CartToInternal self, int a, int b, int c, int d,
@@ -508,36 +530,36 @@ cdef class CartToInternal:
                  / (rij[b, c] * rcovbc)**Et) * conv)
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def get_Uext(self, atoms):
         cdef double[:, :] pos = memoryview(atoms.positions)
         with nogil:
-            info = self._update(pos, True, False)
+            info = self._U_update(pos)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return np.array(self.Uext[:, :self.next])
+        return np.array(self.Uext[:self.nx, :self.next])
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def get_Uint(self, atoms):
         cdef double[:, :] pos = memoryview(atoms.positions)
         with nogil:
-            info = self._update(pos, True, False)
+            info = self._U_update(pos)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return np.array(self.Uint[:, :self.nint])
+        return np.array(self.Uint[:self.nx, :self.nint])
 
 
 cdef class Constraints(CartToInternal):
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def __cinit__(Constraints self,
@@ -547,30 +569,48 @@ cdef class Constraints(CartToInternal):
                   bint proj_trans=True,
                   bint proj_rot=True,
                   **kwargs):
+        self.target = memoryview(np.zeros(self.nq, dtype=np.float64))
+        self.target[:] = target[:]
         self.proj_trans = proj_trans
         self.proj_rot = proj_rot
-        if self.proj_rot and self.ncart > 0:
+        self.rot_axes = memoryview(np.eye(3, dtype=np.float64))
+        self.rot_center = memoryview(atoms.positions.mean(0))
+
+        cdef int npbc = atoms.pbc.sum()
+        cdef int i
+        if self.proj_rot:
+            if npbc == 0:
+                self.nrot = 3
+            elif npbc == 1:
+                self.nrot = 1
+                for i, dim in enumerate(atoms.pbc):
+                    if dim:
+                        self.rot_axes[0, :] = atoms.cell[dim, :]
+                normalize(self.rot_axes[0])
+            else:
+                self.proj_rot = False
+                self.nrot = 0
+        else:
+            self.nrot = 0
+
+        if self.nrot > 0 and self.ncart > 0:
             warnings.warn("Projection of rotational degrees of freedom is not "
                           "currently implemented for systems with fixed atom "
                           "constraints. Disabling projection of rotational "
                           "degrees of freedom.")
             self.proj_rot = False
-        self.nrot = 0
-
-        self.Ured = memoryview(np.zeros((self.nx, self.nx - self.ncart),
-                                        dtype=np.float64))
-        self.trans_dirs = memoryview(np.zeros(3, dtype=np.uint8))
-        self.rot_vecs = memoryview(np.zeros((3, 3), dtype=np.float64))
-
-        self.tvecs = memoryview(np.zeros((3, self.nx), dtype=np.float64))
-        self.rvecs = memoryview(np.zeros((3, self.nx), dtype=np.float64))
-        self.calc_res = False
+            self.nrot = 0
 
         # Ured is fixed, so we initialize it here
         fixed_np = np.zeros((self.natoms, 3), dtype=np.uint8)
         cdef uint8_t[:, :] fixed = memoryview(fixed_np)
 
-        cdef int n, i, j
+        self.Ured = memoryview(np.zeros((self.nx, self.nx - self.ncart),
+                                        dtype=np.float64))
+        self.trans_dirs = memoryview(np.zeros(3, dtype=np.uint8))
+        self.tvecs = memoryview(np.zeros((3, self.nx), dtype=np.float64))
+
+        cdef int n, j
         cdef double invsqrtnat = sqrt(1. / self.natoms)
         with nogil:
             if self.proj_trans:
@@ -599,21 +639,27 @@ cdef class Constraints(CartToInternal):
         self.ninternal = self.nq
         self.nq += self.ntrans + self.nrot
 
+    def __init__(Constraints self,
+                 atoms,
+                 double[:] target,
+                 *args,
+                 **kwargs):
+        CartToInternal.__init__(self, atoms, *args, **kwargs)
+        self.rot_vecs = memoryview(np.zeros((3, 3), dtype=np.float64))
+
+        self.rvecs = memoryview(np.zeros((3, self.nx), dtype=np.float64))
+        self.calc_res = False
+
         self.q1 = memoryview(np.zeros(self.nq, dtype=np.float64))
         self.dq = memoryview(np.zeros((self.nq, self.natoms, 3),
                                       dtype=np.float64))
         self.res = memoryview(np.zeros(self.nq, dtype=np.float64))
-        self.target = memoryview(np.zeros(self.nq, dtype=np.float64))
-        with nogil:
-            for i in range(len(target)):
-                self.target[i] = target[i]
 
         if self.proj_rot:
             self.rot_axes = memoryview(np.eye(3, dtype=np.float64))
             self.center = memoryview(atoms.positions.mean(0))
 
-
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _update(Constraints self,
@@ -621,7 +667,7 @@ cdef class Constraints(CartToInternal):
                      bint grad=False,
                      bint curv=False,
                      bint force=False) nogil:
-        if not force:
+        if not self.calc_required and not force:
             if (self.grad or not grad) and (self.curv or not curv):
                 if not self.geom_changed(pos):
                     return 0
@@ -629,39 +675,32 @@ cdef class Constraints(CartToInternal):
         self.calc_res = False
         memset(&self.res[0], 0, self.nq * sizeof(double))
         cdef int err = CartToInternal._update(self, pos, grad, curv, True)
-        if err != 0: return err
+        if err != 0:
+            self.calc_required = True
+            return err
 
         if not self.grad:
             return 0
 
         cdef int i
-        cdef int sdt = self.tvecs.strides[1] >> 3
         cdef int sddq = self.dq.strides[2] >> 3
-        cdef int sdu = self.Uint.strides[1] >> 3
-        for i in range(self.ntrans):
-            self.dq[self.ninternal + i, ...] = self.tvecs[i, :]
-            self.Uint[self.ninternal + i, ...] = self.tvecs[i, :]
+        cdef int sdt = self.tvecs.strides[1] >> 3
+        cdef int ntot = self.ntrans * self.nx
+        dcopy(&ntot, &self.tvecs[0, 0], &sdt,
+              &self.dq[self.ninternal, 0, 0], &sddq)
 
         err = self.project_rotation()
         if err != 0: return err
 
         cdef int sdr = self.rvecs.strides[1] >> 3
-        for i in range(self.nrot):
-            self.dq[self.ninternal + self.ntrans + i, ...] = self.rvecs[i, :]
-            self.Uint[self.ninternal + self.ntrans + i, ...] = self.rvecs[i, :]
-
-        # Another rounds of MGS. This is a bit wasteful, but I can't think
-        # of a better way to do this right now.
-        self.nint = mgs(self.Uint[:self.ninternal + self.ntrans + self.nrot],
-                        None)
-        self.next = mgs(self.Uext[:self.next], self.Uint[:self.nint])
-        if self.nint + self.next != self.nx:
-            return -1
+        ntot = self.nrot * self.nx
+        dcopy(&ntot, &self.rvecs[0, 0], &sdr,
+              &self.dq[self.ninternal + self.ntrans, 0, 0], &sddq)
 
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int project_rotation(Constraints self) nogil:
@@ -669,14 +708,14 @@ cdef class Constraints(CartToInternal):
         for i in range(self.nrot):
             for j in range(self.natoms):
                 cross(self.rot_axes[i], self.pos[j],
-                      self.rvecs[i, 3*j:3*(j+1)])
-        cdef int err = mgs(self.rvecs[:self.nrot, :])
+                      self.rvecs[i, 3*j : 3*(j+1)])
+        cdef int err = mgs(self.rvecs[:self.nrot, :].T, self.tvecs.T)
         if err < 0: return err
         if err < self.nrot: return -1
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def get_res(self, atoms):
@@ -686,7 +725,7 @@ cdef class Constraints(CartToInternal):
             return np.asarray(self.res)
         cdef int i, n
         with nogil:
-            for i in range(self.nq):
+            for i in range(self.ninternal):
                 self.res[i] = self.q1[i] - self.target[i]
 
             n = self.ncart + self.nbonds + self.nangles
@@ -703,10 +742,10 @@ cdef class Constraints(CartToInternal):
         return np.asarray(self.Ured)
 
     def get_Ucons(self, atoms):
-        return self.get_Uint(self, atoms)
+        return self.get_Uint(atoms)
 
     def get_Ufree(self, atoms):
-        return self.get_Uext(self, atoms)
+        return self.get_Uext(atoms)
 
     def D(self, atoms):
         raise NotImplementedError
@@ -782,7 +821,7 @@ cdef class D2q:
         self.sw3 = self.work3.strides[1] >> 3
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def ldot(self, double[:] v1):
@@ -806,7 +845,7 @@ cdef class D2q:
                      self.Dangle_diffs, v1, res)
         return result_np.reshape((self.nx, self.nx))
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _ld(D2q self,
@@ -833,7 +872,7 @@ cdef class D2q:
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def rdot(self, double[:] v1):
@@ -857,7 +896,7 @@ cdef class D2q:
         return result_np.reshape((self.nq, self.nx))
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _rd(D2q self,
@@ -886,7 +925,7 @@ cdef class D2q:
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def ddot(self, double[:] v1, double[:] v2):
@@ -913,7 +952,7 @@ cdef class D2q:
     #def ddot(self, double[:] v1, v2):
     #    return self.rdot(v1) @ v2
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _dd(D2q self,

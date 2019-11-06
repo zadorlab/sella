@@ -150,7 +150,7 @@ def find_bonds(atoms):
 @cython.wraparound(False)
 @cython.cdivision(True)
 def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
-                int[:, :] c10y, int ndummies=0, int[:] dinds=None,
+                int[:, :] c10y, dummies=None, int[:] dinds=None,
                 int[:, :] angle_sums_old=None):
     cdef int i, j, k, l, nj, a, b
     cdef int ii, jj, kk, ll, n
@@ -160,10 +160,14 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
     cdef double[:, :] pos = memoryview(atoms.positions)
 
     cdef double angle
+
     # Dummy atoms
+    if dummies is None:
+        dummies = Atoms()
+    cdef int ndummies = len(dummies)
     dummypos_np = np.zeros((natoms, 3), dtype=np.float64)
+    dummypos_np[:ndummies] = dummies.positions
     cdef double[:, :] dummypos = memoryview(dummypos_np)
-    dummies = Atoms()
 
     # Bending angles
     cdef int nangles_max = nbonds_tot * _MAX_BONDS // 2
