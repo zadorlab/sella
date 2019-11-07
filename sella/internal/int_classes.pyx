@@ -31,7 +31,7 @@ cdef int THREE = 3
 
 cdef class CartToInternal:
     def __init__(self, atoms, *args, dummies=None, **kwargs):
-        if self.natoms <= 0:
+        if self.nreal <= 0:
             raise ValueError("Must have at least 1 atom!")
         self.nmin = min(self.nq, self.nx)
         self.nmax = max(self.nq, self.nx)
@@ -41,8 +41,7 @@ cdef class CartToInternal:
         # We use memoryview and numpy to initialize these arrays, because
         # some of the arrays may have a dimension of size 0, which
         # cython.view.array does not permit.
-        self.pos = memoryview(atoms.positions.copy())
-#        self.pos = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
+        self.pos = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
         self.dx1 = memoryview(np.zeros(3, dtype=np.float64))
         self.dx2 = memoryview(np.zeros(3, dtype=np.float64))
         self.dx3 = memoryview(np.zeros(3, dtype=np.float64))
@@ -76,10 +75,6 @@ cdef class CartToInternal:
                                         dtype=np.float64))
         self.grad = False
         self.curv = False
-        if dummies is None:
-            self.dummies = Atoms()
-        else:
-            self.dummies = dummies
         self.nint = -1
         self.next = -1
         self.calc_required = True
@@ -99,9 +94,17 @@ cdef class CartToInternal:
 
         cdef size_t sd = sizeof(double)
 
-        self.natoms = len(atoms)
-        if self.natoms <= 0:
+        self.nreal = len(atoms)
+        if self.nreal <= 0:
             return
+
+        if dummies is None:
+            self.ndummies = 0
+        else:
+            self.ndummies = len(dummies)
+
+        self.natoms = self.nreal + self.ndummies
+
         self.nx = 3 * self.natoms
 
         if cart is None:
@@ -141,7 +144,7 @@ cdef class CartToInternal:
         self.nangle_diffs = len(self.angle_diffs)
 
         if dinds is None:
-            self.dinds = memoryview(-np.ones(self.natoms, dtype=np.int32))
+            self.dinds = memoryview(-np.ones(self.nreal, dtype=np.int32))
         else:
             self.dinds = dinds
 
@@ -149,9 +152,10 @@ cdef class CartToInternal:
                    + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
 
 
-    def get_q(self, double[:, :] pos):
+    def get_q(self, double[:, :] pos, double[:, :] dummypos=None):
+        cdef int info
         with nogil:
-            info = self._update(pos, False, False)
+            info = self._update(pos, dummypos, False, False)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
@@ -160,18 +164,20 @@ cdef class CartToInternal:
         # return a copy.
         return np.array(self.q1)
 
-    def get_B(self, double[:, :] pos):
+    def get_B(self, double[:, :] pos, double[:, :] dummypos=None):
+        cdef int info
         with nogil:
-            info = self._update(pos, True, False)
+            info = self._update(pos, dummypos, True, False)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
         return np.array(self.dq).reshape((self.nq, self.nx))
 
-    def get_D(self, double[:, :] pos):
+    def get_D(self, double[:, :] pos, double[:, :] dummypos=None):
+        cdef int info
         with nogil:
-            info = self._update(pos, True, True)
+            info = self._update(pos, dummypos, True, True)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
@@ -181,16 +187,37 @@ cdef class CartToInternal:
                    self.d2q_bonds, self.d2q_angles, self.d2q_dihedrals,
                    self.d2q_angle_sums, self.d2q_angle_diffs)
 
+    cdef bint _validate_pos(CartToInternal self, double[:, :] pos,
+                            double[:, :] dummypos=None) nogil:
+        cdef int n_in = pos.shape[0]
+        if dummypos is not None:
+            if dummypos.shape[1] != 3:
+                return False
+            n_in += dummypos.shape[0]
+        else:
+            if self.ndummies > 0:
+                return False
+
+        if n_in != self.pos.shape[0] or pos.shape[1] != 3:
+            return False
+        return True
+
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    cdef bint geom_changed(CartToInternal self, double[:, :] pos) nogil:
-        cdef int n, i, j
-        for n in range(self.nx):
-            i = n // 3
-            j = n % 3
-            if self.pos[i, j] != pos[i, j]:
-                return True
+    cdef bint geom_changed(CartToInternal self, double[:, :] pos,
+                           double[:, :] dummypos=None) nogil:
+        cdef int i, j
+        for i in range(self.nreal):
+            for j in range(3):
+                if self.pos[i, j] != pos[i, j]:
+                    return True
+
+        for i in range(self.ndummies):
+            for j in range(3):
+                if self.pos[self.nreal + i, j] != dummypos[i, j]:
+                    return True
+
         return False
 
     @cython.boundscheck(True)
@@ -198,16 +225,19 @@ cdef class CartToInternal:
     @cython.cdivision(True)
     cdef int _update(CartToInternal self,
                      double[:, :] pos,
+                     double[:, :] dummypos=None,
                      bint grad=False,
                      bint curv=False,
-                     bint force=False) nogil:
+                     bint force=False) nogil except -1:
+        if not self._validate_pos(pos, dummypos):
+            return -1
         # The purpose of this check is to determine whether the positions
         # array has been changed at all since the last internal coordinate
         # evaluation, which is why we are doing exact floating point
         # comparison with ==.
         if not self.calc_required and not force:
             if (self.grad or not grad) and (self.curv or not curv):
-                if not self.geom_changed(pos):
+                if not self.geom_changed(pos, dummypos):
                     return 0
         self.calc_required = True
         self.grad = grad or curv
@@ -242,12 +272,14 @@ cdef class CartToInternal:
         memset(&self.work1[0, 0, 0, 0], 0, 297 * sd)
         memset(&self.work2[0, 0], 0, self.nx * sd)
 
-        self.pos[:, :] = pos
+        self.pos[:self.nreal, :] = pos
+        if dummypos is not None:
+            self.pos[self.nreal:, :] = dummypos
 
         for n in range(self.ncart):
             i = self.cart[n, 0]
             j = self.cart[n, 1]
-            self.q1[n] = pos[i, j]
+            self.q1[n] = self.pos[i, j]
             self.dq[n, i, j] = 1.
             # d2q is the 0 matrix for cartesian coords
 
@@ -255,7 +287,7 @@ cdef class CartToInternal:
         for n in range(self.nbonds):
             i = self.bonds[n, 0]
             j = self.bonds[n, 1]
-            err = vec_sum(pos[j], pos[i], self.dx1, -1.)
+            err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
             if err != 0: return err
             info = cart_to_bond(i, j, self.dx1, &self.q1[m + n],
                                 self.dq[m + n], self.d2q_bonds[n], grad, curv)
@@ -266,9 +298,9 @@ cdef class CartToInternal:
             i = self.angles[n, 0]
             j = self.angles[n, 1]
             k = self.angles[n, 2]
-            err = vec_sum(pos[k], pos[j], self.dx2, -1.)
+            err = vec_sum(self.pos[k], self.pos[j], self.dx2, -1.)
             if err != 0: return err
-            err = vec_sum(pos[j], pos[i], self.dx1, -1.)
+            err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
             if err != 0: return err
             info = cart_to_angle(i, j, k, self.dx1, self.dx2, &self.q1[m + n],
                                  self.dq[m + n], self.d2q_angles[n],
@@ -281,11 +313,11 @@ cdef class CartToInternal:
             j = self.dihedrals[n, 1]
             k = self.dihedrals[n, 2]
             l = self.dihedrals[n, 3]
-            err = vec_sum(pos[l], pos[k], self.dx3, -1.)
+            err = vec_sum(self.pos[l], self.pos[k], self.dx3, -1.)
             if err != 0: return err
-            err = vec_sum(pos[k], pos[j], self.dx2, -1.)
+            err = vec_sum(self.pos[k], self.pos[j], self.dx2, -1.)
             if err != 0: return err
-            err = vec_sum(pos[j], pos[i], self.dx1, -1.)
+            err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
             if err != 0: return err
             info = cart_to_dihedral(i, j, k, l, self.dx1, self.dx2, self.dx3,
                                     &self.q1[m + n], self.dq[m + n],
@@ -319,8 +351,9 @@ cdef class CartToInternal:
     @cython.cdivision(True)
     cdef int _U_update(CartToInternal self,
                        double[:, :] pos,
+                       double[:, :] dummypos=None,
                        bint force=False) nogil:
-        cdef int err = self._update(pos, True, False, force)
+        cdef int err = self._update(pos, dummypos, True, False, force)
         if err != 0:
             return err
 
@@ -331,6 +364,14 @@ cdef class CartToInternal:
         cdef int sdu = self.Uint.strides[1] >> 3
         memset(&self.Uint[0, 0], 0, self.nmax * self.nmax * sizeof(double))
         memset(&self.Uext[0, 0], 0, self.nmax * self.nmax * sizeof(double))
+
+        cdef int i
+        if self.nq == 0:
+            for i in range(self.nx):
+                self.Uext[i, i] = 1.
+            self.nint = 0
+            self.next = self.nx
+            return 0
 
         for n in range(self.nq):
             dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[n, 0], &sdu)
@@ -423,8 +464,9 @@ cdef class CartToInternal:
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def guess_hessian(self, atoms, double h0cart=70.):
-        atoms = atoms + self.dummies
+    def guess_hessian(self, atoms, dummies=None, double h0cart=70.):
+        if dummies is not None:
+            atoms = atoms + dummies
         rcov = covalent_radii[atoms.numbers] / units.Bohr
         rij_np = atoms.get_all_distances() / units.Bohr
         cdef double[:, :] rij = memoryview(rij_np)
@@ -448,6 +490,11 @@ cdef class CartToInternal:
         for i in range(self.nbonds):
             nbonds[self.bonds[i, 0]] += 1
             nbonds[self.bonds[i, 1]] += 1
+
+        for i in range(self.nreal):
+            if self.dinds[i] != -1:
+                nbonds[i] += 1
+                nbonds[self.dinds[i]] += 1
 
         n = 0
         for i in range(self.ncart):
@@ -496,7 +543,7 @@ cdef class CartToInternal:
                                     rij, rcov, conv)
             n += 1
 
-        return np.diag(h0_np)
+        return np.diag(np.abs(h0_np))
 
 
     @cython.boundscheck(True)
@@ -538,9 +585,9 @@ cdef class CartToInternal:
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_Uext(self, double[:, :] pos):
+    def get_Uext(self, double[:, :] pos, double[:, :] dummypos=None):
         with nogil:
-            info = self._U_update(pos)
+            info = self._U_update(pos, dummypos)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
@@ -551,9 +598,9 @@ cdef class CartToInternal:
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_Uint(self, double[:, :] pos):
+    def get_Uint(self, double[:, :] pos, double[:, :] dummypos=None):
         with nogil:
-            info = self._U_update(pos)
+            info = self._U_update(pos, dummypos)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
@@ -564,9 +611,9 @@ cdef class CartToInternal:
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_Binv(self, double[:, :] pos):
+    def get_Binv(self, double[:, :] pos, double[:, :] dummypos=None):
         with nogil:
-            info = self._U_update(pos)
+            info = self._U_update(pos, dummypos)
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
@@ -698,17 +745,24 @@ cdef class Constraints(CartToInternal):
     @cython.cdivision(True)
     cdef int _update(Constraints self,
                      double[:, :] pos,
+                     double[:, :] dummypos=None,
                      bint grad=False,
                      bint curv=False,
-                     bint force=False) nogil:
+                     bint force=False) nogil except -1:
+        if not self._validate_pos(pos, dummypos):
+            return -1
         if not self.calc_required and not force:
             if (self.grad or not grad) and (self.curv or not curv):
-                if not self.geom_changed(pos):
+                if not self.geom_changed(pos, dummypos):
                     return 0
 
+        cdef int i, err, sddq, sdt, ntot, sdr
         self.calc_res = False
+        if self.nq == 0:
+            return 0
         memset(&self.res[0], 0, self.nq * sizeof(double))
-        cdef int err = CartToInternal._update(self, pos, grad, curv, True)
+        err = CartToInternal._update(self, pos, dummypos, grad,
+                                     curv, True)
         if err != 0:
             self.calc_required = True
             return err
@@ -716,20 +770,21 @@ cdef class Constraints(CartToInternal):
         if not self.grad:
             return 0
 
-        cdef int i
-        cdef int sddq = self.dq.strides[2] >> 3
-        cdef int sdt = self.tvecs.strides[1] >> 3
-        cdef int ntot = self.ntrans * self.nx
-        dcopy(&ntot, &self.tvecs[0, 0], &sdt,
-              &self.dq[self.ninternal, 0, 0], &sddq)
+        if self.proj_trans:
+            sddq = self.dq.strides[2] >> 3
+            sdt = self.tvecs.strides[1] >> 3
+            ntot = self.ntrans * self.nx
+            dcopy(&ntot, &self.tvecs[0, 0], &sdt,
+                  &self.dq[self.ninternal, 0, 0], &sddq)
 
-        err = self.project_rotation()
-        if err != 0: return err
+        if self.proj_rot:
+            err = self.project_rotation()
+            if err != 0: return err
 
-        cdef int sdr = self.rvecs.strides[1] >> 3
-        ntot = self.nrot * self.nx
-        dcopy(&ntot, &self.rvecs[0, 0], &sdr,
-              &self.dq[self.ninternal + self.ntrans, 0, 0], &sddq)
+            sdr = self.rvecs.strides[1] >> 3
+            ntot = self.nrot * self.nx
+            dcopy(&ntot, &self.rvecs[0, 0], &sdr,
+                  &self.dq[self.ninternal + self.ntrans, 0, 0], &sddq)
 
         return 0
 
@@ -752,9 +807,13 @@ cdef class Constraints(CartToInternal):
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_res(self, double[:, :] pos):
-        cdef int err
-        err = self._update(pos, False, False)
+    def get_res(self, double[:, :] pos, double[:, :] dummypos=None):
+        cdef int info
+        with nogil:
+            info = self._update(pos, dummypos, False, False)
+        if info < 0:
+            raise RuntimeError("Internal update failed with error code {}",
+                               "".format(info))
         if self.calc_res:
             return np.asarray(self.res)
         cdef int i, n
@@ -769,19 +828,19 @@ cdef class Constraints(CartToInternal):
         self.calc_res = True
         return np.asarray(self.res)
 
-    def get_drdx(self, double[:, :] pos):
-        return self.get_B(pos)
+    def get_drdx(self, double[:, :] pos, double[:, :] dummypos=None):
+        return self.get_B(pos, dummypos)
 
     def get_Ured(self):
         return np.asarray(self.Ured)
 
-    def get_Ucons(self, double[:, :] pos):
-        return self.get_Uint(pos)
+    def get_Ucons(self, double[:, :] pos, double[:, :] dummypos=None):
+        return self.get_Uint(pos, dummypos)
 
-    def get_Ufree(self, double[:, :] pos):
-        return self.get_Uext(pos)
+    def get_Ufree(self, double[:, :] pos, double[:, :] dummypos=None):
+        return self.get_Uext(pos, dummypos)
 
-    def get_D(self, atoms):
+    def get_D(self, double[:, :] pos, double[:, :] dummypos=None):
         raise NotImplementedError
 
     def guess_hessian(self, atoms, double h0cart=70.):

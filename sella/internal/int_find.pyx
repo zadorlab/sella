@@ -390,8 +390,8 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
                         if err != 0: break
                         if nlinear_angles == 2:
                             continue
-                        dihedral_constraints[ndihedral_constraints, 0] = i
-                        dihedral_constraints[ndihedral_constraints, 1] = j
+                        dihedral_constraints[ndihedral_constraints, 0] = j
+                        dihedral_constraints[ndihedral_constraints, 1] = i
                         dihedral_constraints[ndihedral_constraints, 2] = dinds[j]
                         dihedral_constraints[ndihedral_constraints, 3] = k
                         ndihedral_constraints += 1
@@ -436,7 +436,7 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
                         continue
                     err = vec_sum(pos[i], pos[l], dx2, -1.)
                     if err != 0: break
-                    # Yes, dx1 and dx2 are supposed to be swapped here.
+                    # Yes, it's supposed to be dx2 then dx1
                     err = cart_to_angle(l, i, j, dx2, dx1, &angle, dq, d2q,
                                         work, False, False)
                     if err != 0: break
@@ -477,8 +477,8 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
                     if err != 0: break
 
                 if di_inds[0] == -1:
-                    di_inds[0] = i
-                    di_inds[1] = j
+                    di_inds[0] = j
+                    di_inds[1] = i
                     di_inds[2] = natoms + ndummies
                     di_inds[3] = k
                     min_dim_val = HUGE_VAL

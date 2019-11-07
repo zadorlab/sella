@@ -4,8 +4,8 @@ from libc.stdint cimport uint8_t
 
 cdef class CartToInternal:
     cdef bint grad, curv, calc_required
-    cdef public int natoms, nbonds, nangles, ndihedrals, nangle_sums
-    cdef public int nangle_diffs, ncart
+    cdef public int natoms, nreal, ndummies, nbonds, nangles, ndihedrals
+    cdef public int nangle_sums, nangle_diffs, ncart
     cdef int nq, nx, nint, next, lwork, nmin, nmax
     cdef public int[:] dinds
     cdef public int[:, :] cart, bonds, angles, dihedrals, angle_sums
@@ -20,13 +20,18 @@ cdef class CartToInternal:
     cdef double[:, :] Uint, Uext, Binv, Usvd
     cdef dict __dict__
 
-    cdef bint geom_changed(CartToInternal self, double[:, :] pos) nogil
+    cdef bint geom_changed(CartToInternal self, double[:, :] pos,
+                           double[:, :] dummypos=?) nogil
+
+    cdef bint _validate_pos(CartToInternal self, double[:, :] pos,
+                            double[:, :] dummypos=?) nogil
 
     cdef int _update(CartToInternal self, double[:, :] pos,
-                     bint grad=?, bint curv=?, bint force=?) nogil
+                     double[:, :] dummypos=?, bint grad=?, bint curv=?,
+                     bint force=?) nogil except -1
 
     cdef int _U_update(CartToInternal self, double[:, :] pos,
-                       bint force=?) nogil
+                       double[:, :] dummypos=?, bint force=?) nogil
 
     cdef int _angle_sum_diff(CartToInternal self, int[:] indices, double sign,
                              double* q, double[:, :] dq,
@@ -60,9 +65,10 @@ cdef class Constraints(CartToInternal):
 
     cdef int _update(Constraints self,
                      double[:, :] pos,
+                     double[:, :] dummypos=?,
                      bint grad=?,
                      bint curv=?,
-                     bint force=?) nogil
+                     bint force=?) nogil except -1
 
     cdef int project_rotation(Constraints self) nogil
 
