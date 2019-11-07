@@ -5,7 +5,7 @@ from cython.view cimport array as cva
 
 from libc.math cimport sqrt, fabs
 from libc.string cimport memset
-from scipy.linalg.cython_blas cimport daxpy, dnrm2, dcopy, dgemv, ddot
+from scipy.linalg.cython_blas cimport daxpy, dnrm2, dcopy, dgemv, ddot, dger
 from scipy.linalg.cython_lapack cimport dgesvd
 
 import numpy as np
@@ -242,16 +242,16 @@ cdef int svdr(int n, int m, double[:, :] A, double[:, :] VT, double[:] s,
 
     cdef double utmp
 
-    cdef int ns = len(s)
+    cdef int ns = s.shape[0]
     if ns < min(n, m):
         return -1
 
-    cdef int lwork = len(work)
+    cdef int lwork = work.shape[0]
     cdef int info
 
-    memset(&s[0], 0, ns * sizeof(double))
-    memset(&VT[0, 0], 0, VT.shape[0] * VT.shape[1] * sizeof(double))
-    memset(&work[0], 0, work.shape[0] * sizeof(double))
+    #memset(&s[0], 0, ns * sizeof(double))
+    #memset(&VT[0, 0], 0, VT.shape[0] * VT.shape[1] * sizeof(double))
+    #memset(&work[0], 0, work.shape[0] * sizeof(double))
 
     dgesvd('A', 'N', &m, &n, &A[0, 0], &lda, &s[0], &VT[0, 0], &ldvt, &utmp,
            &UNITY, &work[0], &lwork, &info)
@@ -273,3 +273,78 @@ cdef int svdr(int n, int m, double[:, :] A, double[:, :] VT, double[:] s,
         dcopy(&m, &A[0, nsing + i], &lda, &VT[0, i], &ldvt)
 
     return nsing
+
+def ortho_svd(A):
+    cdef int n, m, minnm, maxnm
+    n, m = A.shape
+    minnm = min(n, m)
+    maxnm = max(n, m)
+    VT = np.zeros((maxnm, maxnm))
+    s = np.zeros(minnm)
+    work = np.zeros(2 * max(3 * minnm + maxnm, 5 * minnm, 1))
+    Aout = np.zeros((maxnm, maxnm))
+    Aout[:n, :m] = A
+    nsing = svdr(n, m, Aout, VT, s, work)
+    nnull = m - nsing
+    return Aout[:, :nsing], VT[:, :nnull]
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
+              double[:] s, double[:, :] Ainv, double[:] work,
+              double eps=1e-6) nogil:
+    """Computes the Moore-Penrose pseudoinverse of A and stores the result in
+    Ainv. This is done using singular value decomposition. Additionally, saves
+    the right singular values in VT. A is then populated with the columns of
+    VT that correspond to the null space of the singular vectors."""
+    if A.shape[0] < n:
+        return -1
+    if A.shape[1] < m:
+        return -1
+
+    cdef int minnm = min(n, m)
+    cdef int lda = A.strides[0] >> 3
+    cdef int ldu = U.strides[0] >> 3
+    cdef int ldvt = VT.strides[0] >> 3
+
+    cdef int ns = s.shape[0]
+    if ns < minnm:
+        return -1
+
+    cdef int lwork = work.shape[0]
+    cdef int info
+
+    dgesvd('A', 'S', &m, &n, &A[0, 0], &lda, &s[0], &VT[0, 0], &ldvt,
+           &U[0, 0], &ldu, &work[0], &lwork, &info)
+    if info != 0:
+        return -1
+
+    memset(&Ainv[0, 0], 0, Ainv.shape[0] * Ainv.shape[1] * sizeof(double))
+
+    cdef int i
+    cdef double sinv
+    cdef int incvt = VT.strides[1] >> 3
+    cdef int ldainv = Ainv.strides[0] >> 3
+    cdef int nsing = 0
+
+    # Evaluate the pseudo-inverse
+    for i in range(minnm):
+        if fabs(s[i]) < eps:
+            continue
+        nsing += 1
+        sinv = 1. / s[i]
+        dger(&n, &m, &sinv, &U[0, i], &ldu, &VT[i, 0], &incvt,
+             &Ainv[0, 0], &ldainv)
+
+    # Populate the basis matrices
+    cdef int inca = A.strides[1] >> 3
+    for i in range(m):
+        dcopy(&m, &VT[i, 0], &incvt, &A[0, i], &lda)
+
+    for i in range(m - nsing):
+        dcopy(&m, &A[0, nsing + i], &lda, &VT[0, i], &ldvt)
+
+    return nsing
+

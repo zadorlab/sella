@@ -17,7 +17,7 @@ cdef class CartToInternal:
     cdef double[:, :, :, :] work1
     cdef double[:, :, :, :, :] d2q_bonds, d2q_angles, d2q_dihedrals
     cdef double[:, :, :, :, :] d2q_angle_sums, d2q_angle_diffs
-    cdef double[:, :] Uint, Uext
+    cdef double[:, :] Uint, Uext, Binv, Usvd
     cdef dict __dict__
 
     cdef bint geom_changed(CartToInternal self, double[:, :] pos) nogil

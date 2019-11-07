@@ -6,10 +6,10 @@ from ase.utils import basestring
 from scipy.linalg import eigh
 from scipy.integrate import LSODA
 
+from sella.utilities.math import modified_gram_schmidt
 from sella.constraints import merge_user_constraints, get_constraints
-#from sella.internal import Internal
-from sella.internal import get_internal
-from sella.cython_routines import modified_gram_schmidt
+from sella.internal.get_internal import get_internal
+#from sella.cython_routines import modified_gram_schmidt
 from sella.hessian_update import update_H, symmetrize_Y
 from sella.linalg import NumericalHessian, ProjectedMatrix
 from sella.eigensolvers import rayleigh_ritz
@@ -184,10 +184,10 @@ class CartPES(BasePES):
                                                                  constraints)
         self.cons = get_constraints(atoms, self.con_user, self.target_user)
 
-    res = property(lambda self: self.cons.get_res(self.atoms))
-    drdx = property(lambda self: self.cons.get_drdx(self.atoms))
-    Ufree = property(lambda self: self.cons.get_Ufree(self.atoms))
-    Ucons = property(lambda self: self.cons.get_Ucons(self.atoms))
+    res = property(lambda self: self.cons.get_res(self.atoms.positions))
+    drdx = property(lambda self: self.cons.get_drdx(self.atoms.positions))
+    Ufree = property(lambda self: self.cons.get_Ufree(self.atoms.positions))
+    Ucons = property(lambda self: self.cons.get_Ucons(self.atoms.positions))
 
     def _update(self):
         if not BasePES._update(self):
@@ -220,7 +220,7 @@ class CartPES(BasePES):
 
     @property
     def xfree(self):
-        Ufree = self.cons.get_Ufree(self.atoms)
+        Ufree = self.cons.get_Ufree(self.atoms.positions)
         return Ufree.T @ self.x
 
     @xfree.setter
@@ -262,16 +262,11 @@ class IntPES(BasePES):
                  dihedrals=True, extra_bonds=None):
         BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
         self.last.update(xint=None, gint=None, hint=None)
-        self.int = Internal(self.atoms, angles, dihedrals, extra_bonds)
+        self.con_user, self.target_user = merge_user_constraints(atoms,
+                                                                 constraints)
+        self.int, self.cons = get_internal(atoms, self.con_user,
+                                           self.target_user)
 
-        self._conin = constraints
-        if self._conin is None:
-            con = dict()
-        else:
-            con = self._conin.copy()
-        for key, val in self.int.cons.items():
-            con[key] = con.get(key, []) + val
-        self.cons = Constraints(self.atoms, con, p_t=False, p_r=False)
         self._H0 = self.int.guess_hessian(atoms)
         self.Binvlast = self.Binv.copy()
         self._natoms = len(atoms)
@@ -279,19 +274,19 @@ class IntPES(BasePES):
 
     dummies = property(lambda self: self.int.dummies)
 
-    res = property(lambda self: self.cons.res((self.atoms + self.dummies).positions))
+    res = property(lambda self: self.cons.get_res(self.atoms.positions))
 
     @property
     def drdx(self):
-        drdx = self.cons.drdx((self.atoms + self.dummies).positions)
-        return self.int.Binv(self.atoms.positions).T @ drdx
+        drdx = self.cons.get_drdx(self.atoms.positions)
+        return self.int.get_Binv(self.atoms.positions).T @ drdx.T
 
     @property
     def Ufree(self):
         # This is a bit convoluted.
         # There might be a better way to accomplish this.
-        Ufree = self.cons.Ufree((self.atoms + self.dummies).positions)
-        B = self.int.B(self.atoms.positions)
+        Ufree = self.cons.get_Ufree(self.atoms.positions)
+        B = self.int.get_B(self.atoms.positions)
         B = B @ (Ufree @ Ufree.T)
         G = B @ B.T
         lams, vecs = eigh(G)
@@ -307,8 +302,8 @@ class IntPES(BasePES):
             # The geometry has not changed, so nothing needs to be done
             return
         g = self.last['g']
-        xint = self.int.q(self.atoms.positions)
-        gint = self.int.Binv(self.atoms.positions)[:3*len(self.atoms)].T @ g
+        xint = self.int.get_q(self.atoms.positions)
+        gint = self.int.get_Binv(self.atoms.positions)[:3*len(self.atoms)].T @ g
         #h = g - self.int.B(self.atoms.positions).T @ self.drdx @ self.Ucons.T @ gint
         #hint = self.int.Binv(self.atoms.positions).T @ h
 
@@ -323,11 +318,11 @@ class IntPES(BasePES):
 
     @property
     def x(self):
-        return self.int.q(self.atoms.positions)
+        return self.int.get_q(self.atoms.positions)
 
     @x.setter
     def x(self, target):
-        dq = self.int.q_wrap(target - self.x)
+        dq = self.int.dq_wrap(target - self.x)
         pos0 = self.atoms.positions.ravel().copy()
         dpos0 = self.dummies.positions.ravel().copy()
         B0 = self.B.copy()
@@ -347,6 +342,7 @@ class IntPES(BasePES):
             while ode.status == 'running':
                 ode.step()
                 t0 = ode.t
+                # FIXME: This needs to be updated for the new internal stuff
                 if self.int.check_for_bad_internal(self.x):
                     print("Bad internals found")
                     if self.int_last is None:
@@ -379,8 +375,8 @@ class IntPES(BasePES):
 
         self.atoms.positions = x[:nx].reshape((-1, 3)).copy()
         self.int.dummies.positions = x[nx:].reshape((-1, 3)).copy()
-        D = self.int.D(self.atoms.positions)
-        Binv = self.int.Binv(self.atoms.positions)
+        D = self.int.get_D(self.atoms.positions)
+        Binv = self.int.get_Binv(self.atoms.positions)
         dydt[nx+ndx:] = -Binv @ D.ddot(dxdt, dxdt)
 
         return dydt
@@ -398,7 +394,7 @@ class IntPES(BasePES):
     @property
     def glast(self):
         self._update()
-        Binvlast = self.int.Binv(self.lastlast['x'].reshape((-1, 3)))
+        Binvlast = self.int.get_Binv(self.lastlast['x'].reshape((-1, 3)))
         return Binvlast[:3*len(self.atoms)].T @ self.lastlast['g']
 
     @property
@@ -414,7 +410,7 @@ class IntPES(BasePES):
     def xfree(self, target):
         dx_cons = -np.linalg.pinv(self.drdx.T) @ self.res
         dx_free = self.Ufree @ (target - self.xfree)
-        self.x = self.x + self.int.q_wrap(dx_free + dx_cons)
+        self.x = self.x + self.int.dq_wrap(dx_free + dx_cons)
 
     @property
     def gfree(self):
@@ -425,20 +421,20 @@ class IntPES(BasePES):
     def forces(self):
         self._update()
         forces_int = -((self.Ufree @ self.Ufree.T) @ self.g)
-        forces_cart = forces_int @ self.int.B(self.atoms.positions)
+        forces_cart = forces_int @ self.int.get_B(self.atoms.positions)
         return forces_cart.reshape((-1, 3))
 
     def dx(self, pos0):
-        x0 = self.int.q(pos0)
-        return self.int.q_wrap(self.x - x0)
+        x0 = self.int.get_q(pos0)
+        return self.int.dq_wrap(self.x - x0)
 
     @property
     def B(self):
-        return self.int.B(self.atoms.positions)
+        return self.int.get_B(self.atoms.positions)
 
     @property
     def Binv(self):
-        return self.int.Binv(self.atoms.positions)
+        return self.int.get_Binv(self.atoms.positions)
 
     @property
     def Winv(self):
@@ -452,10 +448,10 @@ class IntPES(BasePES):
         nd0 = len(self.int_last.dummies)
         nold = 3 * (len(self.atoms) + nd0)
         self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
-        Blast = self.int_last.B(self.atoms.positions)
-        Binvlast = self.int_last.Binv(self.atoms.positions)
-        B = self.int.B(self.atoms.positions)
-        Binv = self.int.Binv(self.atoms.positions)
+        Blast = self.int_last.get_B(self.atoms.positions)
+        Binvlast = self.int_last.get_Binv(self.atoms.positions)
+        B = self.int.get_B(self.atoms.positions)
+        Binv = self.int.get_Binv(self.atoms.positions)
         P = B[:, :nold] @ Binvlast
 
         if self._conin is None:
@@ -464,6 +460,7 @@ class IntPES(BasePES):
             con = self._conin.copy()
         for key, val in self.int.cons.items():
             con[key] = con.get(key, []) + val
+        # FIXME
         self.cons = Constraints(self.atoms + self.dummies, con, p_t=False, p_r=False)
         P2 = B[:, nold:] @ Binv[nold:, :]
 
@@ -478,23 +475,25 @@ class IntPES(BasePES):
             # then transform to the new internal coordinates.
             nd0 = len(self.int_last.dummies)
             self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
-            q1 = self.int_last.q(self.atoms.positions)
-            dx = self.int_last.q_wrap(q1 - self.lastlast['xint'])
+            q1 = self.int_last.get_q(self.atoms.positions)
+            dx = self.int_last.dq_wrap(q1 - self.lastlast['xint'])
             nx = 3 * len(self.atoms)
 
-            dg = self.int_last.Binv(self.atoms.positions).T @ self.last['g'] - self.lastlast['gint']
+            dg = self.int_last.get_Binv(self.atoms.positions).T @ self.last['g'] - self.lastlast['gint']
             if self.H is not None:
                 H = self.int_last.guess_hessian(self.atoms)
             else:
                 H = self.H
-            Blast = self.int_last.B(self.atoms.positions)
-            Binvlast = self.int_last.Binv(self.atoms.positions)
+            Blast = self.int_last.get_B(self.atoms.positions)
+            Binvlast = self.int_last.get_Binv(self.atoms.positions)
             P = Blast @ Binvlast
             H = update_H(P @ H @ P.T, dx, dg)
             P2 = self.B[:, :nx + 3*nd0] @ Binvlast
             self.H = P2 @ H @ P2.T
             self.int_last = None
 
+            # FIXME: constraints stuff has been completely changed, this needs
+            # to be entirely reworked
             # now create new constraints
             if self._conin is None:
                 con = dict()
@@ -502,10 +501,11 @@ class IntPES(BasePES):
                 con = self._conin.copy()
             for key, val in self.int.cons.items():
                 con[key] = con.get(key, []) + val
+            # FIXME
             self.cons = Constraints(self.atoms + self.dummies, con, p_t=False, p_r=False)
             return
 
-        dx = self.int.q_wrap(self.x - self.int.q(self.lastlast['x']))
+        dx = self.int.dq_wrap(self.x - self.int.get_q(self.lastlast['x'].reshape((-1, 3))))
         #dg = self.g - self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
         dg = self.g - self.glast
         if self.H is None:

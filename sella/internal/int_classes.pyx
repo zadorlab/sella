@@ -11,7 +11,7 @@ from libc.stdint cimport uint8_t
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dgemv, dcopy
 
 from sella.utilities.math cimport (my_daxpy, vec_sum, mgs, cross, svdr,
-                                   normalize)
+                                   normalize, mppi)
 from sella.internal.int_eval cimport (cart_to_bond, cart_to_angle,
                                       cart_to_dihedral)
 
@@ -70,6 +70,9 @@ cdef class CartToInternal:
         self.Uint = memoryview(np.zeros((self.nmax, self.nmax),
                                         dtype=np.float64))
         self.Uext = memoryview(np.zeros((self.nmax, self.nmax),
+                                        dtype=np.float64))
+        self.Binv = memoryview(np.zeros((self.nx, self.nq), dtype=np.float64))
+        self.Usvd = memoryview(np.zeros((self.nmax, self.nmax),
                                         dtype=np.float64))
         self.grad = False
         self.curv = False
@@ -146,8 +149,7 @@ cdef class CartToInternal:
                    + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
 
 
-    def q(self, atoms):
-        cdef double[:, :] pos = memoryview(atoms.positions)
+    def get_q(self, double[:, :] pos):
         with nogil:
             info = self._update(pos, False, False)
         if info < 0:
@@ -158,8 +160,7 @@ cdef class CartToInternal:
         # return a copy.
         return np.array(self.q1)
 
-    def B(self, atoms):
-        cdef double[:, :] pos = memoryview(atoms.positions)
+    def get_B(self, double[:, :] pos):
         with nogil:
             info = self._update(pos, True, False)
         if info < 0:
@@ -168,8 +169,7 @@ cdef class CartToInternal:
 
         return np.array(self.dq).reshape((self.nq, self.nx))
 
-    def D(self, atoms):
-        cdef double[:, :] pos = memoryview(atoms.positions)
+    def get_D(self, double[:, :] pos):
         with nogil:
             info = self._update(pos, True, True)
         if info < 0:
@@ -181,7 +181,7 @@ cdef class CartToInternal:
                    self.d2q_bonds, self.d2q_angles, self.d2q_dihedrals,
                    self.d2q_angle_sums, self.d2q_angle_diffs)
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef bint geom_changed(CartToInternal self, double[:, :] pos) nogil:
@@ -193,7 +193,7 @@ cdef class CartToInternal:
                 return True
         return False
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _update(CartToInternal self,
@@ -314,7 +314,7 @@ cdef class CartToInternal:
         self.nint = -1
         return 0
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _U_update(CartToInternal self,
@@ -335,8 +335,11 @@ cdef class CartToInternal:
         for n in range(self.nq):
             dcopy(&self.nx, &self.dq[n, 0, 0], &sddq, &self.Uint[n, 0], &sdu)
 
-        self.nint = svdr(self.nq, self.nx, self.Uint, self.Uext, self.sing,
-                         self.work3)
+        self.nint = mppi(self.nq, self.nx, self.Uint, self.Usvd, self.Uext,
+                         self.sing, self.Binv, self.work3)
+
+        #self.nint = svdr(self.nq, self.nx, self.Uint, self.Uext, self.sing,
+        #                 self.work3)
         if self.nint < 0:
             return self.nint
         self.next = self.nx - self.nint
@@ -345,7 +348,7 @@ cdef class CartToInternal:
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _angle_sum_diff(CartToInternal self,
@@ -417,7 +420,7 @@ cdef class CartToInternal:
             my_daxpy(sign, self.work1[9, i, 2], d2q[3, i, 3])
         return 0
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def guess_hessian(self, atoms, double h0cart=70.):
@@ -439,62 +442,64 @@ cdef class CartToInternal:
         cdef double rcovab, rcovbc
         cdef double conv
 
-        with nogil:
-            for i in range(self.nbonds):
-                nbonds[self.bonds[i, 0]] += 1
-                nbonds[self.bonds[i, 1]] += 1
+        # FIXME: for some reason, this fails at runtime when the gil
+        # has been released
+        #with nogil:
+        for i in range(self.nbonds):
+            nbonds[self.bonds[i, 0]] += 1
+            nbonds[self.bonds[i, 1]] += 1
 
-            n = 0
-            for i in range(self.ncart):
-                h0[n] = h0cart
-                n += 1
+        n = 0
+        for i in range(self.ncart):
+            h0[n] = h0cart
+            n += 1
 
-            conv = Hartree / Bohr**2
-            for i in range(self.nbonds):
-                h0[n] = self._h0_bond(self.bonds[i, 0], self.bonds[i, 1],
-                                      rij, rcov, conv)
-                n += 1
+        conv = Hartree / Bohr**2
+        for i in range(self.nbonds):
+            h0[n] = self._h0_bond(self.bonds[i, 0], self.bonds[i, 1],
+                                  rij, rcov, conv)
+            n += 1
 
-            conv = Hartree
-            for i in range(self.nangles):
-                h0[n] = self._h0_angle(self.angles[i, 0], self.angles[i, 1],
-                                       self.angles[i, 2], rij, rcov, conv)
-                n += 1
+        conv = Hartree
+        for i in range(self.nangles):
+            h0[n] = self._h0_angle(self.angles[i, 0], self.angles[i, 1],
+                                   self.angles[i, 2], rij, rcov, conv)
+            n += 1
 
-            for i in range(self.ndihedrals):
-                h0[n] = self._h0_dihedral(self.dihedrals[i, 0],
-                                          self.dihedrals[i, 1],
-                                          self.dihedrals[i, 2],
-                                          self.dihedrals[i, 3],
-                                          nbonds, rij, rcov, conv)
-                n += 1
+        for i in range(self.ndihedrals):
+            h0[n] = self._h0_dihedral(self.dihedrals[i, 0],
+                                      self.dihedrals[i, 1],
+                                      self.dihedrals[i, 2],
+                                      self.dihedrals[i, 3],
+                                      nbonds, rij, rcov, conv)
+            n += 1
 
-            for i in range(self.nangle_sums):
-                h0[n] = self._h0_angle(self.angle_sums[i, 0],
-                                       self.angle_sums[i, 1],
-                                       self.angle_sums[i, 3],
-                                       rij, rcov, conv)
-                h0[n] += self._h0_angle(self.angle_sums[i, 2],
-                                        self.angle_sums[i, 1],
-                                        self.angle_sums[i, 3],
-                                        rij, rcov, conv)
-                n += 1
+        for i in range(self.nangle_sums):
+            h0[n] = self._h0_angle(self.angle_sums[i, 0],
+                                   self.angle_sums[i, 1],
+                                   self.angle_sums[i, 3],
+                                   rij, rcov, conv)
+            h0[n] += self._h0_angle(self.angle_sums[i, 2],
+                                    self.angle_sums[i, 1],
+                                    self.angle_sums[i, 3],
+                                    rij, rcov, conv)
+            n += 1
 
-            for i in range(self.nangle_diffs):
-                h0[n] = self._h0_angle(self.angle_diffs[i, 0],
-                                       self.angle_diffs[i, 1],
-                                       self.angle_diffs[i, 3],
-                                       rij, rcov, conv)
-                h0[n] -= self._h0_angle(self.angle_diffs[i, 2],
-                                        self.angle_diffs[i, 1],
-                                        self.angle_diffs[i, 3],
-                                        rij, rcov, conv)
-                n += 1
+        for i in range(self.nangle_diffs):
+            h0[n] = self._h0_angle(self.angle_diffs[i, 0],
+                                   self.angle_diffs[i, 1],
+                                   self.angle_diffs[i, 3],
+                                   rij, rcov, conv)
+            h0[n] -= self._h0_angle(self.angle_diffs[i, 2],
+                                    self.angle_diffs[i, 1],
+                                    self.angle_diffs[i, 3],
+                                    rij, rcov, conv)
+            n += 1
 
         return np.diag(h0_np)
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef double _h0_bond(CartToInternal self, int a, int b, double[:, :] rij,
@@ -503,7 +508,7 @@ cdef class CartToInternal:
         return Ab * exp(-Bb * (rij[a, b] - rcov[a] - rcov[b])) * conv
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef double _h0_angle(CartToInternal self, int a, int b, int c,
@@ -516,7 +521,7 @@ cdef class CartToInternal:
                  / (rcovab * rcovbc)**Da) * conv)
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef double _h0_dihedral(CartToInternal self, int a, int b, int c, int d,
@@ -530,11 +535,10 @@ cdef class CartToInternal:
                  / (rij[b, c] * rcovbc)**Et) * conv)
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_Uext(self, atoms):
-        cdef double[:, :] pos = memoryview(atoms.positions)
+    def get_Uext(self, double[:, :] pos):
         with nogil:
             info = self._U_update(pos)
         if info < 0:
@@ -544,11 +548,10 @@ cdef class CartToInternal:
         return np.array(self.Uext[:self.nx, :self.next])
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_Uint(self, atoms):
-        cdef double[:, :] pos = memoryview(atoms.positions)
+    def get_Uint(self, double[:, :] pos):
         with nogil:
             info = self._U_update(pos)
         if info < 0:
@@ -558,8 +561,39 @@ cdef class CartToInternal:
         return np.array(self.Uint[:self.nx, :self.nint])
 
 
+    @cython.boundscheck(True)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    def get_Binv(self, double[:, :] pos):
+        with nogil:
+            info = self._U_update(pos)
+        if info < 0:
+            raise RuntimeError("Internal update failed with error code {}"
+                               "".format(info))
+
+        return np.array(self.Binv)
+
+    @cython.boundscheck(True)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    def dq_wrap(CartToInternal self, double[:] dq):
+        dq_out_np = np.zeros_like(dq)
+        cdef double[:] dq_out = memoryview(dq_out_np)
+        dq_out[:] = dq[:]
+        cdef int ncba = self.ncart + self.nbonds + self.nangles
+        cdef int i
+        with nogil:
+            for i in range(self.ndihedrals):
+                dq_out[ncba + i] = (dq_out[ncba + i] + pi) % (2 * pi) - pi
+        return dq_out_np
+
+    def check_for_bad_internal(CartToInternal self, double[:] q):
+        # FIXME: implement actual angle check
+        return False
+
+
 cdef class Constraints(CartToInternal):
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def __cinit__(Constraints self,
@@ -659,7 +693,7 @@ cdef class Constraints(CartToInternal):
             self.rot_axes = memoryview(np.eye(3, dtype=np.float64))
             self.center = memoryview(atoms.positions.mean(0))
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _update(Constraints self,
@@ -700,7 +734,7 @@ cdef class Constraints(CartToInternal):
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int project_rotation(Constraints self) nogil:
@@ -715,12 +749,12 @@ cdef class Constraints(CartToInternal):
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    def get_res(self, atoms):
+    def get_res(self, double[:, :] pos):
         cdef int err
-        err = self._update(atoms.positions, False, False)
+        err = self._update(pos, False, False)
         if self.calc_res:
             return np.asarray(self.res)
         cdef int i, n
@@ -735,21 +769,20 @@ cdef class Constraints(CartToInternal):
         self.calc_res = True
         return np.asarray(self.res)
 
-    def get_drdx(self, atoms):
-        return self.B(atoms)
+    def get_drdx(self, double[:, :] pos):
+        return self.get_B(pos)
 
-    def get_Ured(self, atoms):
+    def get_Ured(self):
         return np.asarray(self.Ured)
 
-    def get_Ucons(self, atoms):
-        return self.get_Uint(atoms)
+    def get_Ucons(self, double[:, :] pos):
+        return self.get_Uint(pos)
 
-    def get_Ufree(self, atoms):
-        return self.get_Uext(atoms)
+    def get_Ufree(self, double[:, :] pos):
+        return self.get_Uext(pos)
 
-    def D(self, atoms):
+    def get_D(self, atoms):
         raise NotImplementedError
-
 
     def guess_hessian(self, atoms, double h0cart=70.):
         raise NotImplementedError
@@ -821,7 +854,7 @@ cdef class D2q:
         self.sw3 = self.work3.strides[1] >> 3
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def ldot(self, double[:] v1):
@@ -845,7 +878,7 @@ cdef class D2q:
                      self.Dangle_diffs, v1, res)
         return result_np.reshape((self.nx, self.nx))
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _ld(D2q self,
@@ -872,7 +905,7 @@ cdef class D2q:
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def rdot(self, double[:] v1):
@@ -896,7 +929,7 @@ cdef class D2q:
         return result_np.reshape((self.nq, self.nx))
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _rd(D2q self,
@@ -925,7 +958,7 @@ cdef class D2q:
         return 0
 
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def ddot(self, double[:] v1, double[:] v2):
@@ -952,7 +985,7 @@ cdef class D2q:
     #def ddot(self, double[:] v1, v2):
     #    return self.rdot(v1) @ v2
 
-    @cython.boundscheck(False)
+    @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     cdef int _dd(D2q self,
