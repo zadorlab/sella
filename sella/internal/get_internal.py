@@ -13,7 +13,6 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
         target_user = dict()
 
     atol *= np.pi / 180.
-    natoms = len(atoms)
 
     bonds, nbonds, c10y = find_bonds(atoms)
     if intlast is None:
@@ -29,9 +28,6 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
     (angles, dummies, dinds, angle_sums,
             bcons, acons, dcons, adiffs) = find_angles(atoms, atol, bonds,
                     nbonds, c10y, dummies, dinds, angle_sums_old)
-
-    ndummies = len(dummies)
-
 
     dihedrals = find_dihedrals(atoms, atol, bonds, angles, nbonds,
                                c10y, dinds)

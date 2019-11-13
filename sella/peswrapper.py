@@ -104,7 +104,6 @@ class BasePES:
 
     def kick(self, dxfree, diag=False, **diag_kwargs):
         pos0 = self.atoms.positions.copy()
-        dpos0 = self.dummies.positions.copy()
         f0 = self.f
         #g0 = self.g.copy()
 
@@ -114,7 +113,7 @@ class BasePES:
         df_actual = self.f - f0
         g0 = self.glast.copy()
 
-        dx = self.dx(pos0, dpos0)
+        dx = self.dx(pos0)
         if self.H is not None:
             H = self._project_H()
             df_pred = g0.T @ dx + (dx.T @ H @ dx) / 2.
@@ -170,7 +169,8 @@ class BasePES:
         theta, X = eigh(Atilde)
         Vs = Vs @ X
         AVs = AVs @ X
-        AVstilde = AVs - self.drdx.T @ self.Ucons.T @ AVs
+        AVstilde = AVs
+        #AVstilde = AVs - self.drdx.T @ self.Ucons.T @ AVs
         self.H = update_H(self.H, Vs, AVstilde)
         self.lastlast = lastlast
         self.last = last

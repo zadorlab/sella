@@ -279,8 +279,8 @@ cdef class CartToInternal:
         for n in range(self.ncart):
             i = self.cart[n, 0]
             j = self.cart[n, 1]
-            self.q1[n] = self.pos[i, j]
-            self.dq[n, i, j] = 1.
+            self.q1[n] = self.pos[j, i]
+            self.dq[n, j, i] = 1.
             # d2q is the 0 matrix for cartesian coords
 
         m = self.ncart
@@ -700,8 +700,8 @@ cdef class Constraints(CartToInternal):
             for n in range(self.ncart):
                 i = self.cart[n, 0]
                 j = self.cart[n, 1]
-                fixed[i, j] = True
-                self.trans_dirs[j] = False
+                fixed[j, i] = True
+                self.trans_dirs[i] = False
             n = 0
             for i in range(self.natoms):
                 for j in range(3):
@@ -716,6 +716,9 @@ cdef class Constraints(CartToInternal):
                     for i in range(self.natoms):
                         self.tvecs[self.ntrans, 3 * i + j] = invsqrtnat
                     self.ntrans += 1
+
+        if self.ntrans == 0:
+            self.proj_trans = False
 
         self.ninternal = self.nq
         self.nq += self.ntrans + self.nrot

@@ -124,19 +124,20 @@ class Sella(Optimizer):
 
         # Find new search step
         if self.method == 'gmtrm':
-            s, smag, self.xi, bound_clip = rs_newton(self.pes, self.glast,
-                                                     self.delta,
-                                                     self.pes.Winv,
-                                                     self.ord, self.xi)
+            # TODO: Implement Winv for rs_newton
+            s, smag, self.xi, _ = rs_newton(self.pes, self.glast,
+                                            self.delta,
+        #                                    self.pes.Winv,
+                                            self.ord, self.xi)
         elif self.method == 'rsrfo':
-            s, smag, self.xi, bound_clip = rs_rfo(self.pes, self.glast,
-                                                  self.delta,
-                                                  self.pes.Winv,
-                                                  self.ord, self.xi)
+            s, smag, self.xi, _ = rs_rfo(self.pes, self.glast,
+                                         self.delta,
+                                         self.pes.Winv,
+                                         self.ord, self.xi)
         elif self.method == 'rsprfo':
-            s, smag, self.xi, bound_clip = rs_prfo(self.pes, self.glast,
-                                                   self.delta, self.pes.Winv,
-                                                   self.ord, self.xi)
+            s, smag, self.xi, _ = rs_prfo(self.pes, self.glast,
+                                          self.delta, self.pes.Winv,
+                                          self.ord, self.xi)
         else:
             raise RuntimeError("Don't know what to do for method", self.method)
 
@@ -148,7 +149,7 @@ class Sella(Optimizer):
         # Determine if we need to call the eigensolver, then step
         ev = (self.eig and self.pes.lams is not None
               and np.any(self.pes.lams[:self.ord] > 0))
-        f, self.glast, rho = self.pes.kick(s, ev, **self.peskwargs)
+        _, self.glast, rho = self.pes.kick(s, ev, **self.peskwargs)
         self.niter += 1
 
         # Update trust radius

@@ -1,5 +1,7 @@
 import warnings
 
+from collections import Sequence
+
 import numpy as np
 
 from ase.constraints import (FixCartesian, FixAtoms, FixBondLengths,

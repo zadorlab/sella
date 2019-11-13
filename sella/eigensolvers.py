@@ -315,10 +315,10 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
         # Davidson failed to find a new search direction
         if t.shape[1] == 0:
             # Do Lanczos instead
-            t = modified_gram_schmidt(AV[:, -1:], V)
-            #t = ortho(AV[:, -1], V)
-            # If Lanczos also fails to find a new search direction,
-            # just give up and return the current Ritz pairs
+            t = modified_gram_schmidt(ri[:, np.newaxis], V)
+            ##t = ortho(AV[:, -1], V)
+            ## If Lanczos also fails to find a new search direction,
+            ## just give up and return the current Ritz pairs
             if t.shape[1] == 0:
                 return lams, V, AV
 
