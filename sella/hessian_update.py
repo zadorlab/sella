@@ -36,7 +36,8 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
         # Approximate B as a scaled identity matrix, where the
         # scalar is the average Ritz value from S.T @ Y
         thetas, _ = eigh(S.T @ Ytilde, S.T @ S)
-        lam0 = np.average(np.abs(thetas))
+        #lam0 = np.average(np.abs(thetas))
+        lam0 = np.exp(np.average(np.log(np.abs(thetas))))
         d, _ = S.shape
         B = lam0 * np.eye(d)
 
