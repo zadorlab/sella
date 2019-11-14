@@ -171,6 +171,7 @@ class BasePES:
         AVs = AVs @ X
         AVstilde = AVs
         #AVstilde = AVs - self.drdx.T @ self.Ucons.T @ AVs
+        #AVstilde = symmetrize_Y(Vs, AVs, symm=2) - self.drdx.T @ self.Ucons.T @ AVs
         self.H = update_H(self.H, Vs, AVstilde)
         self.lastlast = lastlast
         self.last = last
@@ -322,6 +323,35 @@ class IntPES(BasePES):
         #    self.H = P @ self.H @ P.T
         #self.Binvlast = self.Binv.copy()
 
+    def kick(self, dxfree, diag=False, **diag_kwargs):
+        pos0 = self.atoms.positions.copy()
+        dpos0 = self.dummies.positions.copy()
+        f0 = self.f
+        #g0 = self.g.copy()
+
+        # Update "free" coordinates, which in turn will also update
+        # the "constrained" coordinates to reduce self.res
+        self.xfree = self.xfree + dxfree
+        df_actual = self.f - f0
+        g0 = self.glast.copy()
+
+        dx = self.dx(pos0, dpos0)
+        if self.H is not None:
+            H = self._project_H()
+            df_pred = g0.T @ dx + (dx.T @ H @ dx) / 2.
+
+        if self.H is not None:
+            ratio = df_pred / df_actual
+        else:
+            ratio = None
+
+        self.update_H()
+
+        if diag:
+            self.diag(**diag_kwargs)
+
+        return self.f, self.gfree, ratio
+
     @property
     def x(self):
         return self.int.get_q(self.apos, self.dpos)
@@ -335,6 +365,8 @@ class IntPES(BasePES):
 
         t0 = 0.
         running = True
+        self.int_last = None
+        self.dummies_last = None
         while running:
             pos = self.atoms.positions.ravel().copy()
             dpos = self.dummies.positions.ravel().copy()
@@ -349,13 +381,16 @@ class IntPES(BasePES):
                 ode.step()
                 t0 = ode.t
                 # FIXME: This needs to be updated for the new internal stuff
-                if self.int.check_for_bad_internal(self.x):
+                if self.int.check_for_bad_internal(self.atoms.positions,
+                                                   self.dummies.positions):
                     print("Bad internals found")
                     if self.int_last is None:
                         self.int_last = self.int
+                        self.dummies_last = self.dummies
                     out = get_internal(self.atoms, self.con_user,
                                        self.target_user,
-                                       intlast=self.int_last)
+                                       intlast=self.int_last,
+                                       dummies=self.dummies)
                     self.int, self.cons, self.dummies = out
                     dq = self.B[:, :nx+ndx] @ ode.y[nx+ndx:]
                     break
@@ -400,6 +435,8 @@ class IntPES(BasePES):
         self._update()
         x = self.lastlast['x'].reshape((-1, 3))
         xd = self.lastlast['xdummy'].reshape((-1, 3))
+        if len(xd) != len(self.dummies):
+            xd = self.dummies.positions.copy()
         Binvlast = self.int.get_Binv(x, xd)
         return Binvlast[:3*len(self.atoms)].T @ self.lastlast['g']
 
@@ -431,6 +468,8 @@ class IntPES(BasePES):
         return forces_cart.reshape((-1, 3))
 
     def dx(self, pos0, dpos0):
+        if len(dpos0) != len(self.dummies):
+            dpos0 = self.dummies.positions.copy()
         x0 = self.int.get_q(pos0, dpos0)
         return self.int.dq_wrap(self.x - x0)
 
@@ -444,39 +483,36 @@ class IntPES(BasePES):
 
     @property
     def Winv(self):
-        #h0 = []
-        #h0 += [1.] * self.int.ncart
-        #h0 += [1.] * self.int.nbonds
-        #h0 += [0.25] * self.int.nangles
-        #h0 += [0.10] * self.int.ndihedrals
-        #h0 += [0.25] * self.int.nangle_sums
-        #h0 += [0.25] * self.int.nangle_diffs
+        wb = 1.
+        wa = 0.5
+        wd = 0.1
+        h0 = []
+        h0 += [1.] * self.int.ncart
+        h0 += [wb] * self.int.nbonds
+        h0 += [wa] * self.int.nangles
+        h0 += [wd] * self.int.ndihedrals
+        h0 += [wa] * self.int.nangle_sums
+        h0 += [wa] * self.int.nangle_diffs
+        h0 = np.diag(h0)
         #h0 = np.array(h0)
         #h0 = np.ones(len(self.x))
-        h0 = np.diag(self.int.guess_hessian(self.atoms, self.dummies))
-        Winv = self.Ufree.T @ np.diag(1./np.sqrt(h0)) @ self.Ufree
+        #h0 = self.int.guess_hessian(self.atoms, self.dummies)
+        Winv = np.linalg.inv(self.Ufree.T @ h0 @ self.Ufree)
+        #h0 = np.diag(self.int.guess_hessian(self.atoms, self.dummies))
+        #Winv = self.Ufree.T @ np.diag(1./np.sqrt(h0)) @ self.Ufree
         return Winv / np.linalg.det(Winv)**(1./len(Winv))
 
     def _project_H(self):
         if self.int_last is None:
             return self.H
-        nd0 = len(self.int_last.dummies)
+        nd0 = len(self.dummies_last)
         nold = 3 * (len(self.atoms) + nd0)
-        self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
-        Blast = self.int_last.get_B(self.atoms.positions)
-        Binvlast = self.int_last.get_Binv(self.atoms.positions)
-        B = self.int.get_B(self.atoms.positions)
-        Binv = self.int.get_Binv(self.atoms.positions)
+        self.dummies_last.positions[:nd0] = self.dummies.positions[:nd0]
+        Blast = self.int_last.get_B(self.atoms.positions, self.dummies_last.positions)
+        Binvlast = self.int_last.get_Binv(self.atoms.positions, self.dummies_last.positions)
+        B = self.int.get_B(self.atoms.positions, self.dummies.positions)
+        Binv = self.int.get_Binv(self.atoms.positions, self.dummies.positions)
         P = B[:, :nold] @ Binvlast
-
-        if self._conin is None:
-            con = dict()
-        else:
-            con = self._conin.copy()
-        for key, val in self.int.cons.items():
-            con[key] = con.get(key, []) + val
-        # FIXME
-        self.cons = Constraints(self.atoms + self.dummies, con, p_t=False, p_r=False)
         P2 = B[:, nold:] @ Binv[nold:, :]
 
         return P @ self.H @ P.T + P2 @ self.int.guess_hessian(self.atoms, self.dummies) @ P2.T
@@ -488,36 +524,24 @@ class IntPES(BasePES):
             # Internal coordinate definitions changed.
             # Update the Hessian using the old internal coordinate definition,
             # then transform to the new internal coordinates.
-            nd0 = len(self.int_last.dummies)
-            self.int_last.dummies.positions[:nd0] = self.int.dummies.positions[:nd0]
-            q1 = self.int_last.get_q(self.atoms.positions)
+            nd0 = len(self.dummies_last)
+            self.dummies_last.positions[:nd0] = self.dummies.positions[:nd0]
+            q1 = self.int_last.get_q(self.atoms.positions, self.dummies_last.positions)
             dx = self.int_last.dq_wrap(q1 - self.lastlast['xint'])
             nx = 3 * len(self.atoms)
 
-            dg = self.int_last.get_Binv(self.atoms.positions).T @ self.last['g'] - self.lastlast['gint']
+            dg = self.int_last.get_Binv(self.atoms.positions, self.dummies_last.positions).T @ self.last['g'] - self.lastlast['gint']
             if self.H is not None:
-                H = self.int_last.guess_hessian(self.atoms, self.dummies)
+                H = self.int_last.guess_hessian(self.atoms, self.dummies_last)
             else:
                 H = self.H
-            Blast = self.int_last.get_B(self.atoms.positions)
-            Binvlast = self.int_last.get_Binv(self.atoms.positions)
+            Blast = self.int_last.get_B(self.atoms.positions, self.dummies_last.positions)
+            Binvlast = self.int_last.get_Binv(self.atoms.positions, self.dummies_last.positions)
             P = Blast @ Binvlast
             H = update_H(P @ H @ P.T, dx, dg)
             P2 = self.B[:, :nx + 3*nd0] @ Binvlast
             self.H = P2 @ H @ P2.T
             self.int_last = None
-
-            # FIXME: constraints stuff has been completely changed, this needs
-            # to be entirely reworked
-            # now create new constraints
-            if self._conin is None:
-                con = dict()
-            else:
-                con = self._conin.copy()
-            for key, val in self.int.cons.items():
-                con[key] = con.get(key, []) + val
-            # FIXME
-            self.cons = Constraints(self.atoms + self.dummies, con, p_t=False, p_r=False)
             return
 
         qlast = self.int.get_q(self.lastlast['x'].reshape((-1, 3)),

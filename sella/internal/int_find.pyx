@@ -50,8 +50,8 @@ def find_bonds(atoms):
     cdef int nbonds_tot = 0
     cdef double scale = 1.
 
-    bonds_np = np.zeros((natoms * _MAX_BONDS // 2, 2), dtype=np.int32)
-    cdef int[:, :] bonds = memoryview(bonds_np)
+    #bonds_np = np.zeros((natoms * _MAX_BONDS // 2, 2), dtype=np.int32)
+    #cdef int[:, :] bonds = memoryview(bonds_np)
 
     rcov_np = covalent_radii[atoms.numbers].copy()
     cdef double[:] rcov = memoryview(rcov_np)
@@ -110,8 +110,8 @@ def find_bonds(atoms):
 
                         # Add a bond between i and j and update all relevant
                         # quantities
-                        bonds[nbonds_tot, 0] = i
-                        bonds[nbonds_tot, 1] = j
+                        #bonds[nbonds_tot, 0] = i
+                        #bonds[nbonds_tot, 1] = j
                         nbonds_tot += 1
                         c10y[i, nbonds[i]] = j
                         nbonds[i] += 1
@@ -143,14 +143,30 @@ def find_bonds(atoms):
                     flood_fill(i, nbonds, c10y, labels, nlabels)
                     nlabels += 1
             scale *= 1.05
-    return bonds_np[:nbonds_tot], nbonds_np, c10y_np
+
+    bonds_np = np.zeros((nbonds_tot, 2), dtype=np.int32)
+    cdef int[:, :] bonds = memoryview(bonds_np)
+    cdef int n = 0
+    with nogil:
+        for i in range(natoms):
+            for j in range(nbonds[i]):
+                k = c10y[i, j]
+                if k <= i:  continue
+                if n >= nbonds_tot:
+                    err = 1
+                    break
+                bonds[n, 0] = i
+                bonds[n, 1] = k
+                n += 1
+            if err != 0: break
+    return bonds_np, nbonds_np, c10y_np
 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
 def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
-                int[:, :] c10y, dummies=None, int[:] dinds=None,
+                int[:, :] c10y, dummies=None, dinds_np=None,
                 int[:, :] angle_sums_old=None):
     cdef int i, j, k, l, nj, a, b
     cdef int ii, jj, kk, ll, n
@@ -209,9 +225,9 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
 
     # Which dummy atom corresponds to each real atom
     # A value of -1 means no dummy atom
-    if dinds is None:
+    if dinds_np is None:
         dinds_np = -np.ones(natoms, dtype=np.int32)
-        dinds = memoryview(dinds_np)
+    cdef int[:] dinds = memoryview(dinds_np)
 
     # Set of basis vectors for determining whether an atom is planar
     basis_np = np.zeros((3, 3), dtype=np.float64)

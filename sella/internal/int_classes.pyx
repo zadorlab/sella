@@ -29,6 +29,36 @@ cdef double DUNITY = 1.
 cdef int UNITY = 1
 cdef int THREE = 3
 
+@cython.boundscheck(True)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef inline double _h0_bond(double rab, double rcovab, double conv,
+                            double Ab=0.3601, double Bb=1.944) nogil:
+    return Ab * exp(-Bb * (rab - rcovab)) * conv
+
+
+@cython.boundscheck(True)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef inline double _h0_angle(double rab, double rbc, double rcovab,
+                             double rcovbc, double conv, double Aa=0.089,
+                             double Ba=0.11, double Ca=0.44,
+                             double Da=-0.42) nogil:
+    return ((Aa + Ba * exp(-Ca * (rab + rbc - rcovab - rcovbc))
+             / (rcovab * rcovbc)**Da) * conv)
+
+
+@cython.boundscheck(True)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef inline double _h0_dihedral(double rbc, double rcovbc, int L, double conv,
+                                double At=0.0015, double Bt=14.0,
+                                double Ct=2.85, double Dt=0.57,
+                                double Et=4.00) nogil:
+    return ((At + Bt * L**Dt * exp(-Ct * (rbc - rcovbc))
+             / (rbc * rcovbc)**Et) * conv)
+
+
 cdef class CartToInternal:
     def __init__(self, atoms, *args, dummies=None, **kwargs):
         if self.nreal <= 0:
@@ -90,6 +120,7 @@ cdef class CartToInternal:
                   int[:, :] angle_diffs=None,
                   dummies=None,
                   int[:] dinds=None,
+                  double atol=15,
                   **kwargs):
 
         cdef size_t sd = sizeof(double)
@@ -150,6 +181,8 @@ cdef class CartToInternal:
 
         self.nq = (self.ncart + self.nbonds + self.nangles
                    + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
+
+        self.atol = atol * pi / 180.
 
 
     def get_q(self, double[:, :] pos, double[:, :] dummypos=None):
@@ -352,7 +385,7 @@ cdef class CartToInternal:
     cdef int _U_update(CartToInternal self,
                        double[:, :] pos,
                        double[:, :] dummypos=None,
-                       bint force=False) nogil:
+                       bint force=False) nogil except -1:
         cdef int err = self._update(pos, dummypos, True, False, force)
         if err != 0:
             return err
@@ -465,9 +498,20 @@ cdef class CartToInternal:
     @cython.wraparound(False)
     @cython.cdivision(True)
     def guess_hessian(self, atoms, dummies=None, double h0cart=70.):
+        if (dummies is None or len(dummies) == 0) and self.ndummies > 0:
+            raise ValueError("Must provide dummy atoms!")
+        if len(atoms) != self.nreal:
+            raise ValueError("Provided atoms has the wrong number of atoms! "
+                             "Expected {}, got {}.".format(self.nreal,
+                                                           len(atoms)))
         if dummies is not None:
+            if len(dummies) != self.ndummies:
+                raise ValueError("Provided dummies has the wrong number of "
+                                 " atoms! Expected {}, got {}."
+                                 "".format(self.ndummies, len(dummies)))
             atoms = atoms + dummies
-        rcov = covalent_radii[atoms.numbers] / units.Bohr
+        rcov_np = covalent_radii[atoms.numbers].copy() / units.Bohr
+        cdef double[:] rcov = memoryview(rcov_np)
         rij_np = atoms.get_all_distances() / units.Bohr
         cdef double[:, :] rij = memoryview(rij_np)
 
@@ -479,6 +523,7 @@ cdef class CartToInternal:
 
         cdef int i
         cdef int n
+        cdef int a, b, c, d
         cdef double Hartree = units.Hartree
         cdef double Bohr = units.Bohr
         cdef double rcovab, rcovbc
@@ -486,62 +531,84 @@ cdef class CartToInternal:
 
         # FIXME: for some reason, this fails at runtime when the gil
         # has been released
-        #with nogil:
-        for i in range(self.nbonds):
-            nbonds[self.bonds[i, 0]] += 1
-            nbonds[self.bonds[i, 1]] += 1
+        with nogil:
+            for i in range(self.nbonds):
+                nbonds[self.bonds[i, 0]] += 1
+                nbonds[self.bonds[i, 1]] += 1
 
-        for i in range(self.nreal):
-            if self.dinds[i] != -1:
-                nbonds[i] += 1
-                nbonds[self.dinds[i]] += 1
+            for i in range(self.nreal):
+                if self.dinds[i] != -1:
+                    nbonds[i] += 1
+                    nbonds[self.dinds[i]] += 1
 
-        n = 0
-        for i in range(self.ncart):
-            h0[n] = h0cart
-            n += 1
+            n = 0
+            for i in range(self.ncart):
+                h0[n] = h0cart
+                n += 1
 
-        conv = Hartree / Bohr**2
-        for i in range(self.nbonds):
-            h0[n] = self._h0_bond(self.bonds[i, 0], self.bonds[i, 1],
-                                  rij, rcov, conv)
-            n += 1
+            conv = Hartree / Bohr**2
+            for i in range(self.nbonds):
+                a = self.bonds[i, 0]
+                b = self.bonds[i, 1]
+                h0[n] = _h0_bond(rij[a, b], rcov[a] + rcov[b], conv)
+                #h0[n] = self._h0_bond(self.bonds[i, 0], self.bonds[i, 1],
+                #                      rij, rcov, conv)
+                n += 1
 
-        conv = Hartree
-        for i in range(self.nangles):
-            h0[n] = self._h0_angle(self.angles[i, 0], self.angles[i, 1],
-                                   self.angles[i, 2], rij, rcov, conv)
-            n += 1
+            conv = Hartree
+            for i in range(self.nangles):
+                a = self.angles[i, 0]
+                b = self.angles[i, 1]
+                c = self.angles[i, 2]
+                h0[n] = _h0_angle(rij[a, b], rij[b, c], rcov[a] + rcov[b],
+                                  rcov[b] + rcov[c], conv)
+                #h0[n] = self._h0_angle(self.angles[i, 0], self.angles[i, 1],
+                #                       self.angles[i, 2], rij, rcov, conv)
+                n += 1
 
-        for i in range(self.ndihedrals):
-            h0[n] = self._h0_dihedral(self.dihedrals[i, 0],
-                                      self.dihedrals[i, 1],
-                                      self.dihedrals[i, 2],
-                                      self.dihedrals[i, 3],
-                                      nbonds, rij, rcov, conv)
-            n += 1
+            for i in range(self.ndihedrals):
+                b = self.dihedrals[i, 1]
+                c = self.dihedrals[i, 2]
+                h0[n] = _h0_dihedral(rij[b, c], rcov[b] + rcov[c],
+                                     nbonds[b] + nbonds[c] - 2, conv)
+                #h0[n] = self._h0_dihedral(self.dihedrals[i, 0],
+                #                          self.dihedrals[i, 1],
+                #                          self.dihedrals[i, 2],
+                #                          self.dihedrals[i, 3],
+                #                          nbonds, rij, rcov, conv)
+                n += 1
 
-        for i in range(self.nangle_sums):
-            h0[n] = self._h0_angle(self.angle_sums[i, 0],
-                                   self.angle_sums[i, 1],
-                                   self.angle_sums[i, 3],
-                                   rij, rcov, conv)
-            h0[n] += self._h0_angle(self.angle_sums[i, 2],
-                                    self.angle_sums[i, 1],
-                                    self.angle_sums[i, 3],
-                                    rij, rcov, conv)
-            n += 1
+            for i in range(self.nangle_sums):
+                a = self.angle_sums[i, 0]
+                b = self.angle_sums[i, 1]
+                c = self.angle_sums[i, 2]
+                h0[n] = _h0_angle(rij[a, b], rij[b, c], rcov[a] + rcov[b],
+                                  rcov[b] + rcov[c], conv)
+                #h0[n] = self._h0_angle(self.angle_sums[i, 0],
+                #                       self.angle_sums[i, 1],
+                #                       self.angle_sums[i, 3],
+                #                       rij, rcov, conv)
+                #h0[n] += self._h0_angle(self.angle_sums[i, 2],
+                #                        self.angle_sums[i, 1],
+                #                        self.angle_sums[i, 3],
+                #                        rij, rcov, conv)
+                n += 1
 
-        for i in range(self.nangle_diffs):
-            h0[n] = self._h0_angle(self.angle_diffs[i, 0],
-                                   self.angle_diffs[i, 1],
-                                   self.angle_diffs[i, 3],
-                                   rij, rcov, conv)
-            h0[n] -= self._h0_angle(self.angle_diffs[i, 2],
-                                    self.angle_diffs[i, 1],
-                                    self.angle_diffs[i, 3],
-                                    rij, rcov, conv)
-            n += 1
+            for i in range(self.nangle_diffs):
+                a = self.angle_diffs[i, 0]
+                b = self.angle_diffs[i, 1]
+                c = self.angle_diffs[i, 2]
+                h0[n] = _h0_angle(rij[a, b], rij[b, c], rcov[a] + rcov[b],
+                                  rcov[b] + rcov[c], conv)
+                #h0[n] = self._h0_angle(self.angle_diffs[i, 0],
+                #                       self.angle_diffs[i, 1],
+                #                       self.angle_diffs[i, 3],
+                #                       rij, rcov, conv)
+                #h0[n] -= self._h0_angle(self.angle_diffs[i, 2],
+                #                        self.angle_diffs[i, 1],
+                #                        self.angle_diffs[i, 3],
+                #                        rij, rcov, conv)
+                n += 1
 
         return np.diag(np.abs(h0_np))
 
@@ -634,9 +701,23 @@ cdef class CartToInternal:
                 dq_out[ncba + i] = (dq_out[ncba + i] + pi) % (2 * pi) - pi
         return dq_out_np
 
-    def check_for_bad_internal(CartToInternal self, double[:] q):
-        # FIXME: implement actual angle check
-        return False
+    def check_for_bad_internal(CartToInternal self, double[:, :] pos,
+                               double[:, :] dummypos):
+        cdef int info
+        with nogil:
+            info = self._update(pos, dummypos, False, False)
+        if info < 0:
+            raise RuntimeError("Internal update failed with error code {}"
+                               "".format(info))
+        cdef int ncb = self.ncart + self.nbonds
+        cdef int i
+        cdef bint bad = False
+        with nogil:
+            for i in range(self.nangles):
+                if not (self.atol < self.q1[ncb + i] < pi - self.atol):
+                    bad = True
+                    break
+        return bad
 
 
 cdef class Constraints(CartToInternal):

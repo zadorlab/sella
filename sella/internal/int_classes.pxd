@@ -18,6 +18,7 @@ cdef class CartToInternal:
     cdef double[:, :, :, :, :] d2q_bonds, d2q_angles, d2q_dihedrals
     cdef double[:, :, :, :, :] d2q_angle_sums, d2q_angle_diffs
     cdef double[:, :] Uint, Uext, Binv, Usvd
+    cdef double atol
     cdef dict __dict__
 
     cdef bint geom_changed(CartToInternal self, double[:, :] pos,
@@ -31,7 +32,7 @@ cdef class CartToInternal:
                      bint force=?) nogil except -1
 
     cdef int _U_update(CartToInternal self, double[:, :] pos,
-                       double[:, :] dummypos=?, bint force=?) nogil
+                       double[:, :] dummypos=?, bint force=?) nogil except -1
 
     cdef int _angle_sum_diff(CartToInternal self, int[:] indices, double sign,
                              double* q, double[:, :] dq,

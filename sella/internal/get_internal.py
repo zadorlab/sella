@@ -5,7 +5,7 @@ from sella.internal.int_find import find_bonds, find_angles, find_dihedrals
 from sella.internal.int_classes import CartToInternal
 
 def get_internal(atoms, con_user=None, target_user=None, atol=15.,
-                 intlast=None):
+                 dummies=None, intlast=None):
     if con_user is None:
         con_user = dict()
 
@@ -16,12 +16,10 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
 
     bonds, nbonds, c10y = find_bonds(atoms)
     if intlast is None:
-        dummies = None
         dinds = None
         angle_sums_old = None
     else:
-        dummies = intlast.dummies
-        dinds = intlast.dinds
+        dinds = np.array(intlast.dinds)
         angle_sums_old = intlast.angle_sums
 
     # FIXME: This looks hideous, can it be improved?
@@ -42,7 +40,8 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
                               dihedrals=dihedrals,
                               angle_sums=angle_sums,
                               angle_diffs=adiffs,
-                              dummies=dummies)
+                              dummies=dummies,
+                              atol=atol)
 
     # Merge user-provided constraints with dummy atom constraints
     con, target = merge_internal_constraints(con_user, target_user, bcons,
