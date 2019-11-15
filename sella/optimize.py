@@ -144,9 +144,12 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
     H0 = np.block([[Hmm, (g @ Winv)[:, np.newaxis]], [g @ Winv, 0]])
     l, V = eigh(H0)
 
-    s = Winv @ V[:-1, order] / V[-1, order]
-
-    smag = np.linalg.norm(s)
+    # FIXME: Temporary test
+    sW = V[:-1, order] / V[-1, order]
+    s = Winv @ sW
+    smag = np.linalg.norm(sW)
+    #s = Winv @ V[:-1, order] / V[-1, order]
+    #smag = np.linalg.norm(s)
 
     if smag <= r_tr:
         return s, smag, 1., False
@@ -167,8 +170,12 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
         H[:-1, :-1] *= alpha
         l, V = eigh(H)
 
-        s = Winv @ V[:-1, order] * alpha / V[-1, order]
-        smag = np.linalg.norm(s)
+        # FIXME: temporary test
+        sW = V[:-1, order] * alpha / V[-1, order]
+        s = Winv @ sW
+        smag = np.linalg.norm(sW)
+        #s = Winv @ V[:-1, order] * alpha / V[-1, order]
+        #smag = np.linalg.norm(s)
 
         if smag > r_tr:
             upper = alpha
@@ -191,7 +198,9 @@ def rs_rfo(pes, g, r_tr, Winv, order=0, alpha=0.5):
         dsda = (V[:-1, order] / V[-1, order]
                 + (alpha / V[-1, order]) * dVda[:-1]
                 - (V[:-1, order] * alpha / V[-1, order]**2) * dVda[-1])
-        dsmagda = (s @ Winv @ dsda) / smag
+        #FIXME: temporary test
+        dsmagda = (sW @ dsda) / smag
+        #dsmagda = (s @ Winv @ dsda) / smag
         err = smag - r_tr
         alpha -= err / dsmagda
         if np.isnan(alpha) or alpha <= lower or alpha >= upper:

@@ -689,7 +689,7 @@ cdef class CartToInternal:
 
     @cython.boundscheck(True)
     @cython.wraparound(False)
-    @cython.cdivision(True)
+    @cython.cdivision(False)
     def dq_wrap(CartToInternal self, double[:] dq):
         dq_out_np = np.zeros_like(dq)
         cdef double[:] dq_out = memoryview(dq_out_np)
@@ -709,14 +709,30 @@ cdef class CartToInternal:
         if info < 0:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
-        cdef int ncb = self.ncart + self.nbonds
+        cdef int start
         cdef int i
         cdef bint bad = False
         with nogil:
+            start = self.ncart + self.nbonds
             for i in range(self.nangles):
-                if not (self.atol < self.q1[ncb + i] < pi - self.atol):
+                if not (self.atol < self.q1[start + i] < pi - self.atol):
                     bad = True
                     break
+            # FIXME: implement bond distance check in peswrapper
+            ## Check for too-short bonds
+            #start = self.ncart
+            #for i in range(self.nbonds):
+            #    if self.q1[start + i] < 0.5:  # FIXME: make this a parameter
+            #        bad = True
+            #        break
+
+            ## Check for near-linear angles
+            #if not bad:
+            #    start += self.nbonds
+            #    for i in range(self.nangles):
+            #        if not (self.atol < self.q1[start + i] < pi - self.atol):
+            #            bad = True
+            #            break
         return bad
 
 

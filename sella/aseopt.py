@@ -64,9 +64,8 @@ class Sella(Optimizer):
                            force_consistent)
 
         if delta0 is None:
-            self.delta = default['delta0'] * len(self.pes.xfree)
-        else:
-            self.delta = delta0 * len(self.pes.xfree)
+            delta0 = default['delta0']
+        self.delta = delta0 * len(self.pes.xfree)
 
         if sigma_inc is None:
             self.sigma_inc = default['sigma_inc']
@@ -164,4 +163,4 @@ class Sella(Optimizer):
         return self.pes.converged(self.fmax)
 
     def log(self, forces=None):
-        return Optimizer.log(self, self.pes.forces)
+        Optimizer.log(self, self.pes.forces)
