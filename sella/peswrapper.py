@@ -140,10 +140,14 @@ class BasePES:
 
     def _calc_eg(self, x):
         pos0 = self.atoms.positions.copy()
+        if self.dummies is not None:
+            dpos0 = self.dummies.positions.copy()
         self.x = x
         g = self.g
         f = self.f
         self.atoms.positions = pos0
+        if self.dummies is not None:
+            self.dummies.positions = dpos0
         return f, g
 
     def diag(self, gamma=0.5, threepoint=False, maxiter=None):
@@ -185,6 +189,7 @@ class CartPES(BasePES):
         self.con_user, self.target_user = merge_user_constraints(atoms,
                                                                  constraints)
         self.cons = get_constraints(atoms, self.con_user, self.target_user)
+        self.dummies = None
 
     res = property(lambda self: self.cons.get_res(self.atoms.positions))
     drdx = property(lambda self: self.cons.get_drdx(self.atoms.positions))
@@ -394,7 +399,7 @@ class IntPES(BasePES):
                     self.int, self.cons, self.dummies = out
                     dq = self.B[:, :nx+ndx] @ ode.y[nx+ndx:]
                     break
-                if ode.nfev > 200:
+                if ode.nfev > 1000:
                     raise RuntimeError("Geometry update ODE is taking "
                                        "too long to converge!")
             else:
@@ -483,23 +488,8 @@ class IntPES(BasePES):
 
     @property
     def Winv(self):
-        wb = 1.
-        wa = 0.5
-        wd = 0.1
-        h0 = []
-        h0 += [1.] * self.int.ncart
-        h0 += [wb] * self.int.nbonds
-        h0 += [wa] * self.int.nangles
-        h0 += [wd] * self.int.ndihedrals
-        h0 += [wa] * self.int.nangle_sums
-        h0 += [wa] * self.int.nangle_diffs
-        h0 = np.diag(h0)
-        #h0 = np.array(h0)
-        #h0 = np.ones(len(self.x))
-        #h0 = self.int.guess_hessian(self.atoms, self.dummies)
+        h0 = np.sqrt(self.int.guess_hessian(self.atoms, self.dummies))
         Winv = np.linalg.inv(self.Ufree.T @ h0 @ self.Ufree)
-        #h0 = np.diag(self.int.guess_hessian(self.atoms, self.dummies))
-        #Winv = self.Ufree.T @ np.diag(1./np.sqrt(h0)) @ self.Ufree
         return Winv / np.linalg.det(Winv)**(1./len(Winv))
 
     def _project_H(self):
@@ -530,7 +520,7 @@ class IntPES(BasePES):
             dx = self.int_last.dq_wrap(q1 - self.lastlast['xint'])
             nx = 3 * len(self.atoms)
 
-            dg = self.int_last.get_Binv(self.atoms.positions, self.dummies_last.positions).T @ self.last['g'] - self.lastlast['gint']
+            dg = self.int_last.get_Binv(self.atoms.positions, self.dummies_last.positions)[:3*len(self.atoms)].T @ self.last['g'] - self.lastlast['gint']
             if self.H is not None:
                 H = self.int_last.guess_hessian(self.atoms, self.dummies_last)
             else:
@@ -546,12 +536,13 @@ class IntPES(BasePES):
 
         qlast = self.int.get_q(self.lastlast['x'].reshape((-1, 3)),
                                self.lastlast['xdummy'].reshape((-1, 3)))
+
         dx = self.int.dq_wrap(self.x - qlast)
-        #dg = self.g - self.int.Binv(self.lastlast['x']).T @ self.lastlast['g']
-        dg = self.g - self.glast
+        dg = self.g - self.lastlast['gint']
         if self.H is None:
             H = self.int.guess_hessian(self.atoms, self.dummies)
         else:
             H = self.H
         P = self.B @ self.Binv
-        self.H = update_H(P @ H @ P.T, dx, dg)
+        #P = self.B @ Binvlast
+        self.H = P @ update_H(P @ H @ P.T, dx, dg) @ P
