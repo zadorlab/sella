@@ -5,54 +5,37 @@ import numpy as np
 from scipy.sparse.linalg import LinearOperator
 
 
-class MatrixWrapper(LinearOperator):
-    def __init__(self, A):
-        self.shape = A.shape
-        self.dtype = A.dtype
-        self.A = A
-
-    def _matvec(self, v):
-        return self.A.dot(v)
-
-    def _rmatvec(self, v):
-        return v.dot(self.A)
-
-    def __add__(self, other):
-        return MatrixSum(self, other)
-
-    def _matmat(self, other):
-        if isinstance(other, MatrixSum):
-            raise ValueError
-        return MatrixWrapper(self.A.dot(other))
-
-    def _rmatmat(self, other):
-        if isinstance(other, MatrixSum):
-            raise ValueError
-        return MatrixWrapper(other.dot(self.A))
-
-    def _transpose(self):
-        return MatrixWrapper(self.A.transpose)
-
-    def _adjoint(self):
-        return MatrixWrapper(self.A.conj().T)
-
-
-class NumericalHessian(MatrixWrapper):
+class NumericalHessian(LinearOperator):
     dtype = np.dtype('float64')
 
-    def __init__(self, func, x0, g0, eta, threepoint):
+    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None):
         self.func = func
         self.x0 = x0.copy()
         self.g0 = g0.copy()
         self.eta = eta
         self.threepoint = threepoint
         self.calls = 0
+        self.Uproj = Uproj
 
-        n = len(self.x0)
+        self.ntrue = len(self.x0)
+
+        if self.Uproj is not None:
+            ntrue, n = self.Uproj.shape
+            assert ntrue == self.ntrue
+        else:
+            n = self.ntrue
+
         self.shape = (n, n)
+
+        self.Vs = np.empty((self.ntrue, 0), dtype=self.dtype)
+        self.AVs = np.empty((self.ntrue, 0), dtype=self.dtype)
 
     def _matvec(self, v):
         self.calls += 1
+
+        if self.Uproj is not None:
+            v = self.Uproj @ v.ravel()
+
         # Since the sign of v is arbitrary, we choose a "canonical" direction
         # for the finite displacement. Essentially, we always displace in a
         # descent direction, unless the displacement vector is orthogonal
@@ -69,6 +52,7 @@ class NumericalHessian(MatrixWrapper):
 
         vdotg = v.ravel() @ self.g0
         vdotx = v.ravel() @ self.x0
+        sign = 1.
         if abs(vdotg) > 1e-4:
             sign = 2. * (vdotg < 0) - 1.
         elif abs(vdotx) > 1e-4:
@@ -86,53 +70,33 @@ class NumericalHessian(MatrixWrapper):
         _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
         if self.threepoint:
             fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
-            return vnorm * (gplus - gminus) / (2 * self.eta)
-        return vnorm * ((gplus - self.g0) / self.eta).reshape(v.shape)
+            Av = vnorm * (gplus - gminus) / (2 * self.eta)
+        else:
+            Av = vnorm * (gplus - self.g0) / self.eta
 
-    def _matmat(self, V):
-        W = np.zeros_like(V)
-        for i, v in enumerate(V.T):
-            W[:, i] = self.matvec(v)
-        return W
+        self.Vs = np.hstack((self.Vs, v.reshape((self.ntrue, -1))))
+        self.AVs = np.hstack((self.AVs, Av.reshape((self.ntrue, -1))))
 
-    def _rmatvec(self, v):
-        return self.matvec(v)
+        if self.Uproj is not None:
+            Av = self.Uproj.T @ Av
+
+        return Av
+
+    def __add__(self, other):
+        return MatrixSum(self, other)
 
     def _transpose(self):
         return self
 
-    def _adjoint(self):
-        return self
-
-
-class ProjectedMatrix(MatrixWrapper):
-    def __init__(self, A, Tm):
-        self.A = A
-        self.dtype = A.dtype
-        self.Tm = Tm.copy()
-
-        self.dtrue, self.dproj = Tm.shape
-        self.shape = (self.dproj, self.dproj)
-        self.Vs = np.empty((self.dtrue, 0), dtype=A.dtype)
-        self.AVs = np.empty((self.dtrue, 0), dtype=A.dtype)
-
-    def dot(self, v_m):
-        v = self.Tm @ v_m
-        self.Vs = np.hstack((self.Vs, v.reshape((self.dtrue, -1))))
-        w = self.A.dot(v)
-        self.AVs = np.hstack((self.AVs, w.reshape((self.dtrue, -1))))
-        return self.Tm.T @ w
-
 
 class MatrixSum(LinearOperator):
-    def __init__(self, *args):
-        matrices = []
-        for arg in args:
-            if isinstance(arg, MatrixSum):
-                matrices += arg.matrices
-            else:
-                matrices.append(arg)
+    def __init__(self, *matrices):
+        # This makes sure that if matrices of different dtypes are
+        # provided, we use the most general type for the sum.
 
+        # For example, if two matrices are provided with the detypes
+        # np.int64 and np.float64, then this MatrixSum object will be
+        # np.float64.
         self.dtype = sorted([mat.dtype for mat in matrices], reverse=True)[0]
         self.shape = matrices[0].shape
 
@@ -140,13 +104,14 @@ class MatrixSum(LinearOperator):
         self.matrices = []
         for matrix in matrices:
             assert matrix.dtype <= self.dtype
-            assert matrix.shape == self.shape
+            assert matrix.shape == self.shape, (matrix.shape, self.shape)
             if isinstance(matrix, np.ndarray):
                 if mnum is None:
                     mnum = np.zeros(self.shape, dtype=self.dtype)
                 mnum += matrix
             else:
                 self.matrices.append(matrix)
+
         if mnum is not None:
             self.matrices.append(mnum)
 
@@ -156,25 +121,8 @@ class MatrixSum(LinearOperator):
             w += matrix.dot(v)
         return w
 
-    def _rmatvec(self, v):
-        w = np.zeros_like(v, dtype=self.dtype)
-        for matrix in self.matrices:
-            w += v.dot(matrix)
-        return w
-
-    def _matmat(self, V):
-        if isinstance(V, np.ndarray):
-            return self._matvec(V)
-        return MatrixSum(*[matrix.dot(V) for matrix in self.matrices])
-
-    def _rmatmat(self, V):
-        return MatrixSum(*[V.dot(matrix) for matrix in self.matrices])
-
-    def _adjoint(self):
-        return self
-
     def _transpose(self):
-        return self
+        return MatrixSum(*[mat.T for mat in self.matrices])
 
     def __add__(self, other):
-        return MatrixSum(self, other)
+        return MatrixSum(*self.matrices, other)
