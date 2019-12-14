@@ -11,7 +11,7 @@ from sella.constraints import merge_user_constraints, get_constraints
 from sella.internal.get_internal import get_internal
 #from sella.cython_routines import modified_gram_schmidt
 from sella.hessian_update import update_H, symmetrize_Y
-from sella.linalg import NumericalHessian, ProjectedMatrix
+from sella.linalg import NumericalHessian
 from sella.eigensolvers import rayleigh_ritz
 
 
@@ -160,9 +160,11 @@ class BasePES:
         if P is None:
             P = np.eye(len(self.xfree))
             v0 = self.gfree.copy()
-        Htrue = NumericalHessian(self._calc_eg, x0, self.g.copy(), self.eta,
-                                 threepoint)
-        Hproj = ProjectedMatrix(Htrue, self.Ufree)
+        #Htrue = NumericalHessian(self._calc_eg, x0, self.g.copy(), self.eta,
+        #                         threepoint)
+        #Hproj = ProjectedMatrix(Htrue, self.Ufree)
+        Hproj = NumericalHessian(self._calc_eg, x0, self.g.copy(), self.eta,
+                                 threepoint, self.Ufree)
         lams, Vs, AVs = rayleigh_ritz(Hproj, gamma, P, v0=v0,
                                       method=self.eigensolver,
                                       maxiter=maxiter)

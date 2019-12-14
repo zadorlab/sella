@@ -1,6 +1,8 @@
 import pytest
 import numpy as np
 
+from utils import get_matrix
+
 from sella.hessian_update import update_H
 
 
@@ -22,20 +24,10 @@ def test_update_H(dim, subdim, method, symm, pd):
 
     tol = dict(atol=1e-6, rtol=1e-6)
 
-    B = rng.normal(size=(dim, dim))
-    B = 0.5 * (B + B.T)
+    B = get_matrix(dim, dim, pd, True, rng=rng)
+    H = get_matrix(dim, dim, pd, True, rng=rng)
 
-    H = rng.normal(size=(dim, dim))
-    H = 0.5 * (H + H.T)
-
-    if pd:
-        lams, vecs = np.linalg.eigh(B)
-        B = vecs @ (np.abs(lams)[:, np.newaxis] * vecs.T)
-
-        lams, vecs = np.linalg.eigh(H)
-        H = vecs @ (np.abs(lams)[:, np.newaxis] * vecs.T)
-
-    S = rng.normal(size=(dim, subdim))
+    S = get_matrix(dim, subdim, rng=rng)
     Y = H @ S
 
     B1 = update_H(None, S, Y, method=method, symm=symm)
