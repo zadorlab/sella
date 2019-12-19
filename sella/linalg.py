@@ -2,7 +2,10 @@
 
 import numpy as np
 
+from sella.hessian_update import update_H
+
 from scipy.sparse.linalg import LinearOperator
+from scipy.linalg import eigh
 
 
 class NumericalHessian(LinearOperator):
@@ -126,3 +129,64 @@ class MatrixSum(LinearOperator):
 
     def __add__(self, other):
         return MatrixSum(*self.matrices, other)
+
+
+class ApproximateHessian(LinearOperator):
+    def __init__(self, dim, B0=None, update_method='TS-BFGS', symm=2):
+        """A wrapper object for the approximate Hessian matrix."""
+        self.dim = dim
+        self.shape = (self.dim, self.dim)
+        self.dtype = np.float64
+        self.update_method = update_method
+        self.symm = symm
+
+        self.set_B(B0)
+
+    def set_B(self, target):
+        if target is None:
+            self.B = None
+            self.evals = None
+            self.evecs = None
+            return
+        elif np.isscalar(target):
+            target = target * np.eye(self.dim)
+        assert target.shape == self.shape
+        self.B = target
+        self.evals, self.evecs = eigh(self.H)
+
+    def update(self, dx, dg):
+        """Perform a quasi-Newton update on B"""
+        self.B = update_H(self.B, dx, dg, method=self.update_method,
+                          symm=self.symm, lams=self.evals, vecs=self.evecs)
+
+    def project(self, U):
+        """Project B into the subspace defined by U."""
+        m, n = U.shape
+        assert m == self.dim
+        dim_proj = self.dim - n
+        if self.B is None:
+            Bproj = None
+        else:
+            Bproj = U.T @ self.B @ U
+        return ApproximateHessian(dim_proj, Bproj, self.update_method,
+                                  self.symm)
+
+    def _matvec(self, v):
+        if self.B is None:
+            return v
+        return self.B @ v
+
+    def _rmatvec(self, v):
+        return self.matvec(v)
+
+    def _matmat(self, X):
+        if self.H is None:
+            return X
+        return self.B @ X
+
+    def _rmatmat(self, X):
+        return self.matmat(X)
+
+    def __add__(self, other):
+        return ApproximateHessian(self.dim, self.B + other, self.update_method,
+                                  self.symm)

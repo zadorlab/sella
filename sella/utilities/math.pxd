@@ -18,9 +18,6 @@ cdef (int, double) inner(double[:, :] M, double[:] x, double[:] y,
 cdef int mgs(double[:, :] X, double[:, :] Y=?, double eps1=?,
              double eps2=?, int maxiter=?) nogil
 
-cdef int svdr(int n, int m, double[:, :] A, double[:, :] VT, double[:] s,
-              double[:] work, double eps=?) nogil
-
 cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
               double[:] s, double[:, :] Ainv, double[:] work,
               double eps=?) nogil

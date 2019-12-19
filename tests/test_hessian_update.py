@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-from utils import get_matrix
+from test_utils import get_matrix
 
 from sella.hessian_update import update_H
 

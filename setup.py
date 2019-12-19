@@ -1,50 +1,39 @@
 #!/usr/bin/env python
+import os
+
 import numpy as np
 
 from setuptools import setup, Extension, find_packages
 
 try:
-    from Cython.Distutils import build_ext
+    #from Cython.Distutils import build_ext
+    from Cython.Build import cythonize
 except ImportError:
     use_cython = False
 else:
     use_cython = True
 
-cmdclass = dict()
+#cmdclass = dict()
+
+cy_suff = '.pyx' if use_cython else '.c'
+
+cy_files = [['force_match'],
+            ['cython_routines'],
+            ['internal_cython'],
+            ['internal', 'int_eval'],
+            ['internal', 'int_find'],
+            ['internal', 'int_classes'],
+            ['utilities', 'math']]
+
+ext_modules = []
+for cy_file in cy_files:
+    ext_modules.append(Extension('.'.join(['sella', *cy_file]),
+                                 [os.path.join('sella', *cy_file) + cy_suff],
+                                 define_macros=[('CYTHON_TRACE_NOGIL', '1')]))
 
 if use_cython:
-    ext_modules = [Extension('sella.force_match',
-                             ['sella/force_match.pyx']),
-                   Extension('sella.cython_routines',
-                             ['sella/cython_routines.pyx']),
-                   Extension('sella.internal_cython',
-                             ['sella/internal_cython.pyx']),
-                   Extension('sella.internal.int_eval',
-                             ['sella/internal/int_eval.pyx']),
-                   Extension('sella.internal.int_find',
-                             ['sella/internal/int_find.pyx']),
-                   Extension('sella.internal.int_classes',
-                             ['sella/internal/int_classes.pyx']),
-                   Extension('sella.utilities.math',
-                             ['sella/utilities/math.pyx']),
-                   ]
-    cmdclass['build_ext'] = build_ext
-else:
-    ext_modules = [Extension('sella.force_match',
-                             ['sella/force_match.c']),
-                   Extension('sella.cython_routines',
-                             ['sella/cython_routines.c']),
-                   Extension('sella.internal_cython',
-                             ['sella/internal_cython.c']),
-                   Extension('sella.internal.int_eval',
-                             ['sella/internal/int_eval.c']),
-                   Extension('sella.internal.int_find',
-                             ['sella/internal/int_find.pyx']),
-                   Extension('sella.internal.int_classes',
-                             ['sella/internal/int_classes.pyx']),
-                   Extension('sella.utilities.math',
-                             ['sella/utilities/math.c']),
-                   ]
+    ext_modules = cythonize(ext_modules,
+                            compiler_directives={'linetrace': True})
 
 with open('README.md', 'r') as f:
     long_description = f.read()
@@ -59,7 +48,7 @@ setup(name='Sella',
       long_description=long_description,
       long_description_content_type='text/markdown',
       packages=find_packages(),
-      cmdclass=cmdclass,
+      #cmdclass=cmdclass,
       ext_modules=ext_modules,
       include_dirs=[np.get_include()],
       classifiers=['Development Status :: 3 - Alpha',
@@ -75,4 +64,5 @@ setup(name='Sella',
                    'Topic :: Scientific/Engineering :: Physics'],
       python_requires='>=3.5',
       install_requires=install_requires,
+#      define_macros=[('CYTHON_TRACE_NOGIL', '1')],
       )

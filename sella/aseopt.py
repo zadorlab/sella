@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import warnings
+from time import localtime, strftime
 
 import numpy as np
 
@@ -163,4 +164,18 @@ class Sella(Optimizer):
         return self.pes.converged(self.fmax)
 
     def log(self, forces=None):
-        Optimizer.log(self, self.pes.forces)
+        if self.logfile is None:
+            return
+        fmax = np.sqrt((self.pes.forces**2).sum(1).max())
+        cmax = np.max(np.abs(self.pes.res), initial=0.)
+        e = self.pes.f
+        T = strftime("%H:%M:%S", localtime())
+        name = self.__class__.__name__
+        buf = " " * len(name)
+        if self.nsteps == 0:
+            self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} {:>12s}\n"
+                               .format("Step", "Time", "Energy", "fmax",
+                                       "cmax", "rtrust"))
+        self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
+                          .format(name, self.nsteps, T, e, fmax, cmax, self.delta))
+        self.logfile.flush()

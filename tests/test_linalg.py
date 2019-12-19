@@ -5,7 +5,7 @@ from scipy.stats import ortho_group
 
 from sella.linalg import NumericalHessian
 
-from utils import poly_factory
+from test_utils import poly_factory
 
 
 @pytest.mark.parametrize("dim,subdim,order,threepoint",

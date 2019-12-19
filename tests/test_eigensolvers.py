@@ -5,7 +5,7 @@ import numpy as np
 from sella.eigensolvers import exact, rayleigh_ritz
 from sella.linalg import NumericalHessian
 
-from utils import poly_factory, get_matrix
+from test_utils import poly_factory, get_matrix
 
 
 @pytest.mark.parametrize("dim,order,eta,threepoint",

@@ -194,16 +194,13 @@ def get_constraints(atoms, con, target, dummies=None, dinds=None,
             con_arrays[kind] = None
     target_all = np.array(target_all, dtype=np.float64)
 
-    return Constraints(atoms, target_all, cart=con_arrays['fix'],
-                       bonds=con_arrays['bonds'],
-                       angles=con_arrays['angles'],
-                       dihedrals=con_arrays['dihedrals'],
-                       angle_sums=con_arrays['angle_sums'],
-                       angle_diffs=con_arrays['angle_diffs'],
+    return Constraints(atoms,
+                       target_all,
                        dummies=dummies,
                        dinds=dinds,
                        proj_trans=proj_trans,
-                       proj_rot=proj_rot)
+                       proj_rot=proj_rot,
+                       **con_arrays)
 
 def _ase_constraints_to_dict(constraints):
     fix = set()

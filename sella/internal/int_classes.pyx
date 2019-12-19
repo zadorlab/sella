@@ -10,7 +10,7 @@ from libc.stdint cimport uint8_t
 
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dgemv, dcopy
 
-from sella.utilities.math cimport (my_daxpy, vec_sum, mgs, cross, svdr,
+from sella.utilities.math cimport (my_daxpy, vec_sum, mgs, cross,
                                    normalize, mppi)
 from sella.internal.int_eval cimport (cart_to_bond, cart_to_angle,
                                       cart_to_dihedral)
@@ -412,8 +412,6 @@ cdef class CartToInternal:
         self.nint = mppi(self.nq, self.nx, self.Uint, self.Usvd, self.Uext,
                          self.sing, self.Binv, self.work3)
 
-        #self.nint = svdr(self.nq, self.nx, self.Uint, self.Uext, self.sing,
-        #                 self.work3)
         if self.nint < 0:
             return self.nint
         self.next = self.nx - self.nint
@@ -940,8 +938,8 @@ cdef class Constraints(CartToInternal):
     def get_Ufree(self, double[:, :] pos, double[:, :] dummypos=None):
         return self.get_Uext(pos, dummypos)
 
-    def get_D(self, double[:, :] pos, double[:, :] dummypos=None):
-        raise NotImplementedError
+    #def get_D(self, double[:, :] pos, double[:, :] dummypos=None):
+    #    raise NotImplementedError
 
     def guess_hessian(self, atoms, double h0cart=70.):
         raise NotImplementedError

@@ -147,7 +147,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
         ny = 0
         sdy = -1
     else:
-        if Y.shape[0] != n:
+        if Y.shape[0] != n:  # pragma: no cover
             return -1
         ny = Y.shape[1]
         sdy = Y.strides[0] >> 3
@@ -191,7 +191,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
             elif 0. <= 1. - normtot <= eps1:
                 m += 1
                 break
-        else:
+        else:  # pragma: no cover
             return -1
 
     # Just for good measure, zero out any leftover bits of X
@@ -204,89 +204,21 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
 
 def modified_gram_schmidt(Xin, Yin=None, eps1=1.e-15, eps2=1.e-6,
                           maxiter=100):
-    Xout_np = Xin.copy()
-    cdef double[:, :] Xout = memoryview(Xout_np)
+    if Xin.shape[1] == 0:
+        return Xin
 
-    if Yin is None:
-        nx = mgs(Xout, None, eps1=eps1, eps2=eps2, maxiter=maxiter)
-        if nx < 0:
-            raise RuntimeError("MGS failed.")
-        return Xout_np[:, :nx]
+    if Yin is not None:
+        Yout = Yin.copy()
+        ny = mgs(Yout, None, eps1=eps1, eps2=eps2, maxiter=maxiter)
+        Yout = Yout[:, :ny]
+    else:
+        Yout = None
 
-    Y_np = Yin.copy()
-    cdef double[:, :] Y = memoryview(Y_np)
-
-    nx = mgs(Xout, Y, eps1=eps1, eps2=eps2, maxiter=maxiter)
-    if nx < 0:
-        raise RuntimeError("MGS failed: Mismatched matrix sizes!")
-    return Xout_np[:, :nx]
-
-
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
-cdef int svdr(int n, int m, double[:, :] A, double[:, :] VT, double[:] s,
-              double[:] work, double eps=1e-6) nogil:
-    """Computes the right singular vectors of matrix A. Singular vectors
-    are stored in VT. A will be populated with the columns of VT that
-    correspond to the null space of A on input."""
-    if A.shape[0] < n:
-        return -1
-    if A.shape[1] < m:
-        return -1
-    cdef int lda = A.strides[0] >> 3
-
-    cdef int ldvt = VT.strides[0] >> 3
-    if ldvt < n or VT.shape[1] < n:
-        return -1
-
-    cdef double utmp
-
-    cdef int ns = s.shape[0]
-    if ns < min(n, m):
-        return -1
-
-    cdef int lwork = work.shape[0]
-    cdef int info
-
-    #memset(&s[0], 0, ns * sizeof(double))
-    #memset(&VT[0, 0], 0, VT.shape[0] * VT.shape[1] * sizeof(double))
-    #memset(&work[0], 0, work.shape[0] * sizeof(double))
-
-    dgesvd('A', 'N', &m, &n, &A[0, 0], &lda, &s[0], &VT[0, 0], &ldvt, &utmp,
-           &UNITY, &work[0], &lwork, &info)
-    if info != 0:
-        return -1
-
-    cdef int i
-    cdef int nsing = 0
-    for i in range(ns):
-        if fabs(s[i]) > eps:
-            nsing += 1
-
-    cdef int na = A.strides[1] >> 3
-    cdef int nvt = VT.strides[1] >> 3
-    for i in range(m):
-        dcopy(&m, &VT[i, 0], &nvt, &A[0, i], &lda)
-
-    for i in range(m - nsing):
-        dcopy(&m, &A[0, nsing + i], &lda, &VT[0, i], &ldvt)
-
-    return nsing
-
-def ortho_svd(A):
-    cdef int n, m, minnm, maxnm
-    n, m = A.shape
-    minnm = min(n, m)
-    maxnm = max(n, m)
-    VT = np.zeros((maxnm, maxnm))
-    s = np.zeros(minnm)
-    work = np.zeros(2 * max(3 * minnm + maxnm, 5 * minnm, 1))
-    Aout = np.zeros((maxnm, maxnm))
-    Aout[:n, :m] = A
-    nsing = svdr(n, m, Aout, VT, s, work)
-    nnull = m - nsing
-    return Aout[:, :nsing], VT[:, :nnull]
+    Xout = Xin.copy()
+    nx = mgs(Xout, Yout, eps1=eps1, eps2=eps2, maxiter=maxiter)
+    if nx < 0:  # pragma: no cover
+        raise RuntimeError("MGS failed.")
+    return Xout[:, :nx]
 
 
 @cython.boundscheck(False)
@@ -299,9 +231,9 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
     Ainv. This is done using singular value decomposition. Additionally, saves
     the right singular values in VT. A is then populated with the columns of
     VT that correspond to the null space of the singular vectors."""
-    if A.shape[0] < n:
+    if A.shape[0] < n:  # pragma: no cover
         return -1
-    if A.shape[1] < m:
+    if A.shape[1] < m:  # pragma: no cover
         return -1
 
     cdef int minnm = min(n, m)
@@ -310,7 +242,7 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
     cdef int ldvt = VT.strides[0] >> 3
 
     cdef int ns = s.shape[0]
-    if ns < minnm:
+    if ns < minnm:  # pragma: no cover
         return -1
 
     cdef int lwork = work.shape[0]
@@ -318,7 +250,7 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
 
     dgesvd('A', 'S', &m, &n, &A[0, 0], &lda, &s[0], &VT[0, 0], &ldvt,
            &U[0, 0], &ldu, &work[0], &lwork, &info)
-    if info != 0:
+    if info != 0:  # pragma: no cover
         return -1
 
     memset(&Ainv[0, 0], 0, Ainv.shape[0] * Ainv.shape[1] * sizeof(double))
@@ -348,3 +280,25 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
 
     return nsing
 
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+def pseudo_inverse(double[:, :] A, double eps=1e-6):
+    cdef int n, m, minnm, maxnm
+    n, m = A.shape[:2]
+    minnm = min(n, m)
+    maxnm = max(n, m)
+
+    U = np.zeros((n, n), dtype=np.float64)
+    VT = np.zeros((m, m), dtype=np.float64)
+    s = np.zeros(min(n, m), dtype=np.float64)
+    Ainv = np.zeros((m, n), dtype=np.float64)
+    work = np.zeros(2 * max(3 * minnm + maxnm, 5 * minnm, 1))
+
+    nsing = mppi(n, m, A, U, VT, s, Ainv, work, eps=eps)
+
+    if nsing == -1:  # pragma: no cover
+        raise RuntimeError("mmpi failed!")
+
+    return U, s, VT, Ainv, nsing
