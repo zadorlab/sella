@@ -5,7 +5,7 @@ import numpy as np
 from ase.build import molecule
 from ase.calculators.emt import EMT
 
-from sella.peswrapper import CartPES, IntPES
+from sella.peswrapper import PES, InternalPES
 
 @pytest.mark.parametrize("name,traj,cons",
                          [("CH4", "CH4.traj", None),
@@ -21,17 +21,18 @@ def test_PES(name, traj, cons):
     # of the few calculators that is guaranteed to be available to all
     # users, and we don't need to use a physical PES to test this.
     atoms.calc = EMT()
-    for PES in [CartPES, IntPES]:
+    for MyPES in [PES, InternalPES]:
         pes = PES(atoms, trajectory=traj)
 
         pes.kick(0., diag=True, gamma=0.1)
 
         for i in range(2):
-            pes.kick(-pes.gfree * 0.01)
+            pes.kick(-pes.get_g() * 0.01)
 
         assert pes.H is not None
-        assert not pes.converged(0.)
+        assert not pes.converged(0.)[0]
         assert pes.converged(1e100)
-        np.testing.assert_allclose(pes.Ufree.T @ pes.Ucons, 0, **tol)
+        A = pes.get_Ufree().T @ pes.get_Ucons()
+        np.testing.assert_allclose(A, 0, **tol)
 
-        pes.kick(-pes.gfree * 0.001, diag=True, gamma=0.1)
+        pes.kick(-pes.get_g() * 0.001, diag=True, gamma=0.1)

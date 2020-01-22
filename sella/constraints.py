@@ -174,7 +174,7 @@ def merge_internal_constraints(con_user, target_user, bcons, acons, dcons,
 
     for arg in dcons:
         con_out['dihedrals'].append(_sort_indices(arg))
-        target_out['dihedrals'].append(0.)
+        target_out['dihedrals'].append(np.pi)
 
     for arg in adiffs:
         con_out['angle_diffs'].append(_sort_indices(arg))
@@ -182,10 +182,29 @@ def merge_internal_constraints(con_user, target_user, bcons, acons, dcons,
 
     return con_out, target_out
 
+def cons_to_dict(cons):
+    # dict for combined user/generated constraints and targets
+    con_out = {key: [] for key in _con_kinds}
+    target_out = {key: [] for key in _con_kinds}
+
+    tot = 0
+    for kind in _con_kinds:
+        if kind == 'fix':
+            attr = 'cart'
+        else:
+            attr = kind
+        for row in np.asarray(getattr(cons, attr)):
+            con_out[kind].append(row)
+            target_out[kind].append(cons.target[tot])
+            tot += 1
+
+    return con_out, target_out
+
+
 def get_constraints(atoms, con, target, dummies=None, dinds=None,
-                    proj_trans=True, proj_rot=True):
+                    proj_trans=True, proj_rot=True, **kwargs):
     target_all = []
-    con_arrays = dict()
+    con_arrays = kwargs.copy()
     for kind in _con_kinds:
         target_all += target.get(kind, [])
         if con.get(kind, []):

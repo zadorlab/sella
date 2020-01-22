@@ -7,9 +7,11 @@ cimport cython
 from libc.math cimport fabs, acos, pi, HUGE_VAL
 from libc.string cimport memset
 
-from scipy.linalg.cython_blas cimport ddot, dcopy
+from scipy.linalg.cython_blas cimport ddot, dcopy, dnrm2
+from scipy.linalg.cython_lapack cimport dgesvd
 
-from sella.utilities.math cimport my_daxpy, normalize, vec_sum, cross
+from sella.utilities.blas cimport my_daxpy
+from sella.utilities.math cimport normalize, vec_sum, cross
 from sella.internal.int_eval cimport cart_to_angle
 
 # imports
@@ -48,7 +50,7 @@ def find_bonds(atoms):
     cdef int natoms = len(atoms)
     cdef int i, j, k, err
     cdef int nbonds_tot = 0
-    cdef double scale = 1.
+    cdef double scale = 1.5
 
     #bonds_np = np.zeros((natoms * _MAX_BONDS // 2, 2), dtype=np.int32)
     #cdef int[:, :] bonds = memoryview(bonds_np)
@@ -162,16 +164,214 @@ def find_bonds(atoms):
     return bonds_np, nbonds_np, c10y_np
 
 
+cdef inline (int, bint) check_if_linear(double[:] x1, double[:] x2,
+                                        double[:] x3, double[:] dx1,
+                                        double[:] dx2, double tol) nogil:
+    """Check whether three atoms are (nearly) collinear."""
+
+    cdef int err = 0
+    cdef double angle
+    cdef bint linear = True
+    cdef int sddx1 = dx1.strides[0] >> 3
+    cdef int sddx2 = dx2.strides[0] >> 3
+
+    err = vec_sum(x1, x2, dx1, -1.)
+    err += vec_sum(x3, x2, dx2, -1.)
+
+    angle = acos(ddot(&THREE, &dx1[0], &sddx1, &dx2[0], &sddx2)
+                 / (dnrm2(&THREE, &dx1[0], &sddx1)
+                    * dnrm2(&THREE, &dx2[0], &sddx2)))
+
+    if tol < angle < (pi - tol):
+        linear = False
+
+    return err, linear
+
+cdef inline (int, bint) check_if_planar(double[:, :] dxs, double[:, :] A,
+                                        double[:] s, double[:] work,
+                                        double tol) nogil:
+    cdef bint planar = True
+    cdef int m = dxs.shape[0]
+    cdef int n = dxs.shape[1]
+    cdef int minnm = min(n, m)
+    cdef int ldx = dxs.strides[0] >> 3
+    cdef int sdx = dxs.strides[1] >> 3
+    cdef int sds = s.strides[0] >> 3
+    cdef int lda = A.strides[0] >> 3
+    cdef int sda = A.strides[1] >> 3
+    cdef double U, VT
+    cdef int ldu = 1
+    cdef int ldvt = 1
+    cdef int lwork = work.shape[0]
+    cdef int info
+    cdef int i, j
+    cdef double norm
+
+    # Normalize the bond vectors and copy into A for SVD
+    for i in range(m):
+        norm = dnrm2(&n, &dxs[i, 0], &sdx)
+        for j in range(n):
+            dxs[i, j] /= norm
+        dcopy(&n, &dxs[i, 0], &sdx, &A[i, 0], &sda)
+
+    # Get singular vectors of A
+    dgesvd('O', 'N', &n, &m, &A[0, 0], &lda, &s[0], &U, &ldu, &VT, &ldvt,
+           &work[0], &lwork, &info)
+
+    if info != 0:
+        return -1, planar
+
+    # Copy the minor axis into s for safe keeping
+    dcopy(&n, &A[2, 0], &sda, &s[0], &sds)
+
+    cdef double angle
+    cdef double min_angle = pi / 2
+    cdef double max_angle = pi / 2
+
+    # Calculate angle between each bond vector and the minor axis,
+    # keep track of maximum/minimum angles
+    for i in range(m):
+        angle = acos(ddot(&n, &dxs[i, 0], &sdx, &s[0], &sds))
+        if angle < min_angle:
+            min_angle = angle
+        if angle > max_angle:
+            max_angle = angle
+
+    # When max_angle - min_angle is close to 0, the atom is almost totally
+    # planar. If max_angle - min_angle is large, then the atom is not
+    # almost totally planar.
+    if max_angle - min_angle > tol:
+        planar = False
+
+    return 0, planar
+
+
+cdef (int, int) find_dummy_dihedral(double[:, :] pos, double[:] dpos,
+                                    double[:] dx1, double[:] dx2,
+                                    int[:] nbonds, int[:, :] c10y,
+                                    int i, int j, int k,
+                                    double atol) nogil:
+    cdef int a
+    cdef int b = -1
+    cdef int l
+    cdef int info
+    cdef bint linear = True
+    cdef int sddx1 = dx1.strides[0] >> 3
+    cdef int sddx2 = dx2.strides[0] >> 3
+
+    for a in range(nbonds[i]):
+        l = c10y[i, a]
+        if l == j or l == k:
+            continue
+        info, linear = check_if_linear(pos[l], pos[i], pos[j], dx1, dx2, atol)
+        if info < 0: return info, info
+
+        if not linear:
+            b = i
+            break
+
+    if b == -1:
+        for a in range(nbonds[k]):
+            l = c10y[k, a]
+            if l == i or l == j:
+                continue
+
+            info, linear = check_if_linear(pos[l], pos[k], pos[j], dx1, dx2,
+                                           atol)
+            if info < 0: return info, info
+
+            if not linear:
+                b = k
+                break
+
+    if b == -1:
+        return 0, 0
+
+    # All l for which angle(i-j-l) == angle(k-j-l) obey the relation:
+    # r_jl perpto (r_ij / |r_ij| + r_jl / |r_jl|)
+    # Find and normalize the RHS vector
+    info = vec_sum(pos[i], pos[j], dx1, -1)
+    if info < 0:  return info, info
+
+    info = normalize(dx1)
+    if info < 0:  return info, info
+
+    info = vec_sum(pos[j], pos[k], dx2, -1)
+    if info < 0:  return info, info
+
+    info = normalize(dx2)
+    if info < 0:  return info, info
+
+    info = my_daxpy(1., dx2, dx1)
+    if info < 0:  return info, info
+
+    if dnrm2(&THREE, &dx1[0], &sddx1) < 1e-4:
+        info = vec_sum(pos[i], pos[k], dx1, -1)
+        if info < 0:  return info, info
+
+    info = normalize(dx1)
+    if info < 0:  return info, info
+
+    info = vec_sum(pos[b], pos[l], dx2, -1)
+    if info < 0:  return info, info
+
+    info = my_daxpy(-ddot(&THREE, &dx1[0], &sddx1, &dx2[0], &sddx2),
+                    dx1, dx2)
+    if info < 0:  return info, info
+
+    info = normalize(dx2)
+    if info < 0:  return info, info
+
+    info = vec_sum(pos[j], dx2, dpos)
+    if info < 0:  return info, info
+
+    return l, b
+
+
+cdef int find_dummy_improper(double[:, :] pos, double[:] dpos, double[:] dx1,
+                             double[:] dx2, int i, int j, int k) nogil:
+    cdef int err
+    cdef int a
+    cdef int b = 0
+    cdef double dxmin = 1.
+    cdef int m = len(dx1)
+    cdef int sddx1 = dx1.strides[0] >> 3
+    cdef int sddx2 = dx2.strides[0] >> 3
+
+    err = vec_sum(pos[i], pos[k], dx1, -1.)
+    if err != 0: return err
+
+    err = normalize(dx1)
+    if err != 0: return err
+
+    for a in range(m):
+        if fabs(dx1[a]) < dxmin:
+            dxmin = fabs(dx1[a])
+            b = a
+        dx2[a] = 0.
+    dx2[b] = 1.
+
+    err = my_daxpy(-ddot(&m, &dx1[0], &sddx1, &dx2[0], &sddx2), dx1, dx2)
+    if err != 0: return err
+
+    err = normalize(dx2)
+    if err != 0: return err
+
+    err = vec_sum(pos[j], dx2, dpos)
+    if err != 0: return err
+
+    return 0
+
+
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
 def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
-                int[:, :] c10y, dummies=None, dinds_np=None,
-                int[:, :] angle_sums_old=None):
+                int[:, :] c10y, dummies=None, dinds_np=None):
     cdef int i, j, k, l, nj, a, b
-    cdef int ii, jj, kk, ll, n
     cdef int natoms = len(atoms)
     cdef int nbonds_tot = len(bonds)
+    cdef bint linear, planar
 
     cdef double[:, :] pos = memoryview(atoms.positions)
 
@@ -201,13 +401,6 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
     cdef int[:, :] angle_constraints = memoryview(angle_constraints_np)
     cdef int nangle_constraints = 0
 
-    # Old angle sums, used to shortcut linear angle detection
-    cdef int nangle_sums_old
-    if angle_sums_old is None:
-        nangle_sums_old = 0
-    else:
-        nangle_sums_old = angle_sums_old.shape[0]
-
     # Angle sums w/ dummies
     angle_sums_np = -np.ones((natoms, 4), dtype=np.int32)
     cdef int[:, :] angle_sums = memoryview(angle_sums_np)
@@ -229,473 +422,234 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
         dinds_np = -np.ones(natoms, dtype=np.int32)
     cdef int[:] dinds = memoryview(dinds_np)
 
-    # Set of basis vectors for determining whether an atom is planar
-    basis_np = np.zeros((3, 3), dtype=np.float64)
-    cdef double[:, :] basis = memoryview(basis_np)
-    cdef int nbasis
-
-    # temporary arrys for various things below
-    work_np = np.zeros((1, 1, 1, 3), dtype=np.float64)
-    cdef double[:, :, :, :] work = memoryview(work_np)
-
     dx1_np = np.zeros(3, dtype=np.float64)
     cdef double[:] dx1 = memoryview(dx1_np)
 
     dx2_np = np.zeros(3, dtype=np.float64)
     cdef double[:] dx2 = memoryview(dx2_np)
 
-    # We don't actually use dq or d2q anywhere in this function,
-    # but we need to call cart_to_angle to check for linearity, and
-    # those functions require dq and d2q.
-    #
-    # Can we somehow find a way to avoid allocating these arrays?
-    # It probably doesn't matter from a performance standpoint, but
-    # it's the principle of the thing.
-    dq_np = np.zeros((natoms, 3), dtype=np.float64)
-    cdef double[:, :] dq = memoryview(dq_np)
-
-    d2q_np = np.zeros((4, 3, 4, 3), dtype=np.float64)
-    cdef double[:, :, :, :] d2q = memoryview(d2q_np)
-
-    di_inds_np = np.zeros(4, dtype=np.int32)
-    cdef int[:] di_inds = memoryview(di_inds_np)
-
-    dx_orth_np = np.zeros(3, dtype=np.float64)
-    cdef double[:] dx_orth = memoryview(dx_orth_np)
-
-    linear_angles_np = np.zeros((_MAX_BONDS // 2, 3), dtype=np.int32)
+    linear_angles_np = np.zeros((_MAX_BONDS // 2, 2), dtype=np.int32)
     cdef int[:, :] linear_angles = memoryview(linear_angles_np)
     cdef int nlinear_angles
 
     cdef int min_dim, angle_constraint
     cdef double min_dim_val, dpos_norm, dx_dot
 
-    # Now we are going to look for angles. We may also need to add dummy
-    # atoms and everything that goes along with those (angle sums, bond
-    # constraints, angle diff constraints, dihedral constraints).
+    dxs_np = np.zeros((_MAX_BONDS, 3), dtype=np.float64)
+    cdef double[:, :] dxs = memoryview(dxs_np)
+
+    A_np = dxs_np.copy()
+    cdef double[:, :] A = memoryview(A_np)
+
+    axis_np = np.zeros(3, dtype=np.float64)
+    cdef double[:] axis = memoryview(axis_np)
+
+    svdwork_np = np.zeros(32, dtype=np.float64)
+    cdef double[:] svdwork = memoryview(svdwork_np)
+
+    cdef int err = 0
+
     with nogil:
-        # Angles are sorted by the central atom index
         for j in range(natoms):
             nj = nbonds[j]
-
-            # First check to see whether there's a dummy atom already attached
-            # to j
-            if dinds[j] >= 0:
-                nlinear_angles = 0
-                bond_constraints[nbond_constraints, 0] = j
-                bond_constraints[nbond_constraints, 1] = dinds[j]
-                nbond_constraints += 1
-                for a in range(nj):
-                    i = c10y[j, a]
-                    for b in range(a + 1, nj):
-                        k = c10y[j, b]
-
-                        # See if this angle was previously determined to be
-                        # nearly linear
-                        for n in range(nangle_sums_old):
-                            if ((j == angle_sums_old[n, 1]
-                                 and dinds[j] == angle_sums_old[n, 3])
-                                 and ((i == angle_sums_old[n, 0]
-                                       and k == angle_sums_old[n, 2])
-                                      or (i == angle_sums_old[n, 2]
-                                          and k == angle_sums_old[n, 0]))):
-                                angle_sums[nangle_sums, 0] = i
-                                angle_sums[nangle_sums, 1] = j
-                                angle_sums[nangle_sums, 2] = k
-                                angle_sums[nangle_sums, 3] = dinds[j]
-                                nangle_sums += 1
-
-                                if nlinear_angles < 2:
-                                    angle_diffs[nangle_diffs, 0] = i
-                                    angle_diffs[nangle_diffs, 1] = j
-                                    angle_diffs[nangle_diffs, 2] = k
-                                    angle_diffs[nangle_diffs, 3] = dinds[j]
-                                    nangle_diffs += 1
-                                nlinear_angles += 1
-                                break
-                        else:
-                            err = vec_sum(pos[j], pos[i], dx1, -1.)
-                            if err != 0: break
-                            err = vec_sum(pos[k], pos[j], dx2, -1.)
-                            if err != 0: break
-                            err = cart_to_angle(i, j, k, dx1, dx2, &angle,
-                                                dq, d2q, work, False, False)
-                            if err != 0: break
-                            if atol < angle < pi - atol:
-                                angles[nangles, 0] = i
-                                angles[nangles, 1] = j
-                                angles[nangles, 2] = k
-                                nangles += 1
-                                continue
-
-                            angle_sums[nangle_sums, 0] = i
-                            angle_sums[nangle_sums, 1] = j
-                            angle_sums[nangle_sums, 2] = k
-                            angle_sums[nangle_sums, 3] = dinds[j]
-                            nangle_sums += 1
-
-                            if nlinear_angles < 2:
-                                angle_diffs[nangle_diffs, 0] = i
-                                angle_diffs[nangle_diffs, 1] = j
-                                angle_diffs[nangle_diffs, 2] = k
-                                angle_diffs[nangle_diffs, 3] = dinds[j]
-                                nangle_diffs += 1
-                            nlinear_angles += 1
-                        if err != 0: break
-                    if err != 0: break
-                if err != 0: break
-                if nlinear_angles == 0:
-                    err = -1
-                    break
-                elif nlinear_angles == 1:
-                    for a in range(nj):
-                        i = c10y[j, a]
-                        if (i == angle_sums[nangle_sums - 1, 0]
-                                or i == angle_sums[nangle_sums - 1, 2]):
-                            continue
-                        angle_constraints[nangle_constraints, 0] = i
-                        angle_constraints[nangle_constraints, 1] = j
-                        angle_constraints[nangle_constraints, 2] = dinds[j]
-                        nangle_constraints += 1
-                        break
-                    else:
-                        i = angle_sums[nangle_sums - 1, 0]
-                        k = angle_sums[nangle_sums - 1, 2]
-                        err = vec_sum(pos[i], pos[j], dx2, -1.)
-                        if err != 0: break
-                        for a in range(nbonds[i]):
-                            l = c10y[i, a]
-                            if l == j or l == k:
-                                continue
-                            err = vec_sum(pos[l], pos[i], dx1, -1.)
-                            if err != 0: break
-                            err = cart_to_angle(j, i, l, dx1, dx2, &angle,
-                                                dq, d2q, work, False, False)
-                            if err != 0: break
-                            if atol < angle < pi - atol:
-                                dihedral_constraints[ndihedral_constraints, 0] = l
-                                dihedral_constraints[ndihedral_constraints, 1] = i
-                                dihedral_constraints[ndihedral_constraints, 2] = j
-                                dihedral_constraints[ndihedral_constraints, 3] = dinds[j]
-                                ndihedral_constraints += 1
-                                nlinear_angles += 1
-                                break
-                        if err != 0: break
-                        if nlinear_angles == 2:
-                            continue
-
-                        err = vec_sum(pos[k], pos[j], dx2, -1.)
-                        if err != 0: break
-                        for a in range(nbonds[k]):
-                            l = c10y[k, a]
-                            if l == j or l == i:
-                                continue
-                            err = vec_sum(pos[l], pos[k], dx1, -1.)
-                            if err != 0: break
-                            err = cart_to_angle(j, k, l, dx1, dx2, &angle,
-                                                dq, d2q, work, False, False)
-                            if err != 0: break
-                            if atol < angle < pi - atol:
-                                dihedral_constraints[ndihedral_constraints, 0] = l
-                                dihedral_constraints[ndihedral_constraints, 1] = k
-                                dihedral_constraints[ndihedral_constraints, 2] = j
-                                dihedral_constraints[ndihedral_constraints, 3] = dinds[j]
-                                ndihedral_constraints += 1
-                                nlinear_angles += 1
-                                break
-                        if err != 0: break
-                        if nlinear_angles == 2:
-                            continue
-                        dihedral_constraints[ndihedral_constraints, 0] = j
-                        dihedral_constraints[ndihedral_constraints, 1] = i
-                        dihedral_constraints[ndihedral_constraints, 2] = dinds[j]
-                        dihedral_constraints[ndihedral_constraints, 3] = k
-                        ndihedral_constraints += 1
-                continue
-
-            # If atom j isn't bonded to anything, that means the network isn't
-            # fully connected, even though it is supposed to be.
             if nj == 0:
-                err = j
+                # 0 bonding partners: should be impossible.
+                err = -1
                 break
+
             elif nj == 1:
-                # Atom j is terminal (likely a Hydrogen atom), so no angles
-                # have j as the center
+                # 1 bonding parter: no angles -> no linear angles
                 continue
+
             elif nj == 2:
-                # Only one angle passes through j, so we will check whether
-                # it's linear
+                # 2 bonding partners: 1 angle to check for linearity
                 i = c10y[j, 0]
                 k = c10y[j, 1]
-                err = vec_sum(pos[j], pos[i], dx1, -1.)
-                if err != 0: break
-                err = vec_sum(pos[k], pos[j], dx2, -1.)
-                if err != 0: break
-                err = cart_to_angle(i, j, k, dx1, dx2, &angle, dq, d2q, work,
-                                    False, False)
-                if err != 0: break
+                err, linear = check_if_linear(pos[i], pos[j], pos[k],
+                                              dx1, dx2, atol)
+                if err != 0:  break
 
-                if atol < angle < pi - atol:
+                if not linear:
+                    # Not linear, so add the angle and move on to the
+                    # next center
                     angles[nangles, 0] = i
                     angles[nangles, 1] = j
                     angles[nangles, 2] = k
                     nangles += 1
                     continue
 
-                # The bond is linear. Can we find any atoms to form
-                # a dihedral?
-                memset(&di_inds[0], 0, 4 * sizeof(int))
-                di_inds[0] = -1
-                for a in range(nbonds[i]):
-                    l = c10y[i, a]
-                    if l == j or l == k:
-                        continue
-                    err = vec_sum(pos[i], pos[l], dx2, -1.)
+                if dinds[j] <= 0:
+                    dinds[j] = natoms + ndummies
+
+                    # Add dummy bond constraint
+                    bond_constraints[nbond_constraints, 0] = j
+                    bond_constraints[nbond_constraints, 1] = dinds[j]
+                    nbond_constraints += 1
+
+                    angle_constraints[nangle_constraints, 0] = i
+                    angle_constraints[nangle_constraints, 1] = j
+                    angle_constraints[nangle_constraints, 2] = dinds[j]
+                    nangle_constraints += 1
+
+                    ## Angle diff constraint
+                    #angle_diffs[nangle_diffs, 0] = i
+                    #angle_diffs[nangle_diffs, 1] = j
+                    #angle_diffs[nangle_diffs, 2] = k
+                    #angle_diffs[nangle_diffs, 3] = dinds[j]
+                    #nangle_diffs += 1
+
+                    ## Try to find dummy position and its final constraint
+                    ## from dihedrals w/ atoms bonded to i or k
+                    #l, b = find_dummy_dihedral(pos, dummypos[ndummies], dx1,
+                    #                           dx2, nbonds, c10y, i, j, k,
+                    #                           2 * atol)
+                    #if l < 0:
+                    #    err = l
+                    #    break
+                    #elif l > 0:
+                    #    dihedral_constraints[ndihedral_constraints, 0] = l
+                    #    dihedral_constraints[ndihedral_constraints, 1] = b
+                    #    dihedral_constraints[ndihedral_constraints, 2] = j
+                    #    dihedral_constraints[ndihedral_constraints, 3] = dinds[j]
+                    #    ndihedral_constraints += 1
+                    #else:
+                    #    err = find_dummy_improper(pos, dummypos[ndummies],
+                    #                              dx1, dx2, i, j, k)
+                    #    if err != 0: break
+                    #    dihedral_constraints[ndihedral_constraints, 0] = i
+                    #    dihedral_constraints[ndihedral_constraints, 1] = j
+                    #    dihedral_constraints[ndihedral_constraints, 2] = dinds[j]
+                    #    dihedral_constraints[ndihedral_constraints, 3] = k
+                    #    ndihedral_constraints += 1
+                    err = find_dummy_improper(pos, dummypos[ndummies],
+                                              dx1, dx2, i, j, k)
                     if err != 0: break
-                    # Yes, it's supposed to be dx2 then dx1
-                    err = cart_to_angle(l, i, j, dx2, dx1, &angle, dq, d2q,
-                                        work, False, False)
-                    if err != 0: break
+                    dihedral_constraints[ndihedral_constraints, 0] = i
+                    dihedral_constraints[ndihedral_constraints, 1] = j
+                    dihedral_constraints[ndihedral_constraints, 2] = dinds[j]
+                    dihedral_constraints[ndihedral_constraints, 3] = k
+                    ndihedral_constraints += 1
+                    ndummies += 1
 
-                    if atol < angle < pi - atol:
-                        di_inds[0] = l
-                        di_inds[1] = i
-                        di_inds[2] = j
-                        di_inds[3] = natoms + ndummies
-                        err = vec_sum(pos[l], pos[i], dummypos[ndummies], -1.)
-                        break
-
-                if err != 0: break
-
-                if di_inds[0] == -1:
-                    err = vec_sum(pos[j], pos[k], dx2, -1.)
-                    if err != 0: break
-                    for a in range(nbonds[k]):
-                        l = c10y[k, a]
-                        if l == i or l == j:
-                            continue
-                        err = vec_sum(pos[k], pos[l], dx1, -1.)
-                        if err != 0: break
-                        err = cart_to_angle(l, k, j, dx1, dx2, &angle, dq,
-                                            d2q, work, False, False)
-                        if err != 0: break
-                        if atol < angle < pi - atol:
-                            di_inds[0] = l
-                            di_inds[1] = k
-                            di_inds[2] = j
-                            di_inds[3] = natoms + ndummies
-                            err = vec_sum(pos[l], pos[k], dummypos[ndummies],
-                                          -1.)
-                            # We don't check err because we are breaking
-                            # regardless, and if err is nonzero, then the
-                            # check after this loop will catch it.
-                            break
-                    if err != 0: break
-
-                if di_inds[0] == -1:
-                    di_inds[0] = j
-                    di_inds[1] = i
-                    di_inds[2] = natoms + ndummies
-                    di_inds[3] = k
-                    min_dim_val = HUGE_VAL
-                    min_dim = -1
-                    err = vec_sum(pos[k], pos[i], dx1, -1.)
-                    if err != 0: break
-                    for l in range(3):
-                        if fabs(dx1[l]) < min_dim_val:
-                            min_dim_val = fabs(dx1[l])
-                            min_dim = l
-                    if min_dim == -1:
-                        err = -10
-                        break
-                    dummypos[ndummies, min_dim] = 1.
-                err = normalize(dummypos[ndummies])
-                if err != 0: break
-                err = vec_sum(pos[k], pos[i], dx_orth, -1.)
-                if err != 0: break
-                err = normalize(dx_orth)
-                if err != 0: break
-                dx_dot = ddot(&THREE, &dummypos[ndummies, 0], &UNITY,
-                              &dx_orth[0], &UNITY)
-                err = my_daxpy(-dx_dot, dx_orth, dummypos[ndummies])
-                if err != 0: break
-                err = normalize(dummypos[ndummies])
-                if err != 0: break
-                err = my_daxpy(1., pos[j], dummypos[ndummies])
-                if err != 0: break
-
-                bond_constraints[nbond_constraints, 0] = j
-                bond_constraints[nbond_constraints, 1] = natoms + ndummies
-                nbond_constraints += 1
-
+                # Add the angle sum
                 angle_sums[nangle_sums, 0] = i
                 angle_sums[nangle_sums, 1] = j
                 angle_sums[nangle_sums, 2] = k
-                angle_sums[nangle_sums, 3] = natoms + ndummies
+                angle_sums[nangle_sums, 3] = dinds[j]
                 nangle_sums += 1
 
-                angle_diffs[nangle_diffs, 0] = i
-                angle_diffs[nangle_diffs, 1] = j
-                angle_diffs[nangle_diffs, 2] = k
-                angle_diffs[nangle_diffs, 3] = natoms + ndummies
-                nangle_diffs += 1
-
-                dihedral_constraints[ndihedral_constraints, 0] = di_inds[0]
-                dihedral_constraints[ndihedral_constraints, 1] = di_inds[1]
-                dihedral_constraints[ndihedral_constraints, 2] = di_inds[2]
-                dihedral_constraints[ndihedral_constraints, 3] = di_inds[3]
-                ndihedral_constraints += 1
-
-                dinds[j] = natoms + ndummies
-                ndummies += 1
             else:
+                # Find all linear angles first, but don't do anything with
+                # them yet.
                 nlinear_angles = 0
                 for a in range(nj):
                     i = c10y[j, a]
-                    for b in range(a+1, nj):
+                    err = vec_sum(pos[i], pos[j], dxs[a], -1)
+                    if err != 0: break
+                    for b in range(a + 1, nj):
                         k = c10y[j, b]
-                        err = vec_sum(pos[j], pos[i], dx1, -1.)
+                        err, linear = check_if_linear(pos[i], pos[j], pos[k],
+                                                      dx1, dx2, atol)
                         if err != 0: break
-                        err = vec_sum(pos[k], pos[j], dx2, -1.)
-                        if err != 0: break
-                        err = cart_to_angle(i, j, k, dx1, dx2, &angle, dq, d2q,
-                                            work, False, False)
-                        if err != 0: break
-                        if atol < angle < pi - atol:
+
+                        if linear:
+                            linear_angles[nlinear_angles, 0] = i
+                            linear_angles[nlinear_angles, 1] = k
+                            nlinear_angles += 1
+                        else:
+                            # If this angle is *not* linear, just add it
+                            # to the list of angles
                             angles[nangles, 0] = i
                             angles[nangles, 1] = j
                             angles[nangles, 2] = k
                             nangles += 1
-                            continue
-                        linear_angles[nlinear_angles, 0] = i
-                        linear_angles[nlinear_angles, 1] = k
-                        nlinear_angles += 1
+
                     if err != 0: break
                 if err != 0: break
 
                 if nlinear_angles == 0:
+                    # If we didn't find any linear angles, then we're done
+                    # with this center.
                     continue
-                nbasis = 0
-                for a in range(nlinear_angles):
-                    i = linear_angles[a, 0]
-                    k = linear_angles[a, 1]
-                    err = vec_sum(pos[k], pos[i], dx1, -1.)
-                    if err != 0: break
-                    err = normalize(dx1)
-                    if err != 0: break
-                    for b in range(nbasis):
-                        dx_dot = ddot(&THREE, &basis[b, 0], &UNITY,
-                                      &dx1[0], &UNITY)
-                        if acos(fabs(dx_dot)) < atol / 2.:
-                            break
-                    else:
-                        if nbasis >= 3:
-                            err = -1
-                            break
-                        dcopy(&THREE, &dx1[0], &UNITY,
-                              &basis[nbasis, 0], &UNITY)
-                        nbasis += 1
-                    if err != 0: break
-                if err != 0: break
 
-                if nbasis == 3:
-                    continue
-                angle_constraint = -1
-                for a in range(nj):
-                    l = c10y[j, a]
-                    for b in range(nlinear_angles):
-                        if (l == linear_angles[b, 0]
-                                or l == linear_angles[b, 1]):
-                            break
-                    else:
-                        if angle_constraint == -1:
-                            angle_constraint = l
-                        err = vec_sum(pos[l], pos[j], dx1, -1.)
-                        if err != 0: break
-                        err = normalize(dx1)
-                        if err != 0: break
-                        for b in range(nbasis):
-                            dx_dot = ddot(&THREE, &basis[b, 0], &UNITY,
-                                          &dx1[0], &UNITY)
-                            if acos(fabs(dx_dot)) < atol / 2.:
-                                break
-                        else:
-                            if nbasis >= 3:
-                                err = -1
-                                break
-                            dcopy(&THREE, &dx1[0], &UNITY,
-                                  &basis[nbasis, 0], &UNITY)
-                            nbasis += 1
-                        if err != 0: break
+                if dinds[j] <= 0:
+                    # No dummy atom yet. Check to see if atom center is
+                    # planar before adding a dummy atom
+                    err, planar = check_if_planar(dxs[:nj], A[:nj], axis, svdwork, atol)
                     if err != 0: break
-                if err != 0: break
+                    if not planar:
+                        continue
 
-                if nbasis == 3:
-                    continue
-                if nbasis == 1:
-                    err = -1
-                    break
+                    dinds[j] = natoms + ndummies
+                    err = vec_sum(pos[j], axis, dummypos[ndummies], 1.)
 
-                bond_constraints[nbond_constraints, 0] = j
-                bond_constraints[nbond_constraints, 1] = natoms + ndummies
-                nbond_constraints += 1
-                cross(basis[0], basis[1], dummypos[ndummies])
-                err = normalize(dummypos[ndummies])
-                if err != 0: break
-                for a in range(nlinear_angles):
-                    i = linear_angles[a, 0]
-                    k = linear_angles[a, 1]
-                    angle_sums[nangle_sums, 0] = i
-                    angle_sums[nangle_sums, 1] = j
-                    angle_sums[nangle_sums, 2] = k
-                    angle_sums[nangle_sums, 3] = natoms + ndummies
-                    nangle_sums += 1
-                    if a < 2:
-                        angle_diffs[nangle_diffs, 0] = i
-                        angle_diffs[nangle_diffs, 1] = j
-                        angle_diffs[nangle_diffs, 2] = k
-                        angle_diffs[nangle_diffs, 3] = natoms + ndummies
-                        err = vec_sum(pos[k], pos[i], dx1, -1.)
-                        if err != 0: break
-                        err = normalize(dx1)
-                        if err != 0: break
-                        dx_dot = ddot(&THREE, &dx1[0], &UNITY,
-                                      &dummypos[ndummies, 0], &UNITY)
-                        err = my_daxpy(-dx_dot, dx1, dummypos[ndummies])
-                        if err != 0: break
-                        err = normalize(dummypos[ndummies])
-                        if err != 0: break
+                    # Bond constraints
+                    bond_constraints[nbond_constraints, 0] = j
+                    bond_constraints[nbond_constraints, 1] = dinds[j]
+                    nbond_constraints += 1
 
-                if nlinear_angles == 1:
-                    if angle_constraint == -1:
-                        err = -1
-                        break
-                    err = vec_sum(pos[angle_constraint], pos[j], dx1, -1.)
+                    i = linear_angles[0, 0]
+                    k = linear_angles[0, 1]
+
+                    err = find_dummy_improper(pos, dummypos[ndummies],
+                                              dx1, dx2, i, j, k)
                     if err != 0: break
-                    err = normalize(dx1)
-                    if err != 0: break
-                    dx_dot = ddot(&THREE, &dx1[0], &UNITY, &dummypos[ndummies, 0], &UNITY)
-                    err = my_daxpy(-dx_dot, dx1, dummypos[ndummies])
-                    if err != 0: break
-                    err = normalize(dummypos[ndummies])
-                    if err != 0: break
-                    angle_constraints[nangle_constraints, 0] = angle_constraint
+                    dihedral_constraints[ndihedral_constraints, 0] = i
+                    dihedral_constraints[ndihedral_constraints, 1] = j
+                    dihedral_constraints[ndihedral_constraints, 2] = dinds[j]
+                    dihedral_constraints[ndihedral_constraints, 3] = k
+                    ndihedral_constraints += 1
+
+                    angle_constraints[nangle_constraints, 0] = i
                     angle_constraints[nangle_constraints, 1] = j
-                    angle_constraints[nangle_constraints, 2] = (natoms
-                                                                + ndummies)
+                    angle_constraints[nangle_constraints, 2] = dinds[j]
                     nangle_constraints += 1
-                err = my_daxpy(1., pos[j], dummypos[ndummies])
-                if err != 0: break
-                dinds[j] = natoms + ndummies
-                ndummies += 1
-            if err != 0: break
+                    #angle_diffs[nangle_diffs, 0] = i
+                    #angle_diffs[nangle_diffs, 1] = j
+                    #angle_diffs[nangle_diffs, 2] = k
+                    #angle_diffs[nangle_diffs, 3] = dinds[j]
+                    #nangle_diffs += 1
+
+                    ## angle diff constraint(s)
+                    #for a in range(min(nlinear_angles, 2)):
+                    #    angle_diffs[nangle_diffs, 0] = linear_angles[a, 0]
+                    #    angle_diffs[nangle_diffs, 1] = j
+                    #    angle_diffs[nangle_diffs, 2] = linear_angles[a, 1]
+                    #    angle_diffs[nangle_diffs, 3] = dinds[j]
+                    #    nangle_diffs += 1
+
+                    #if nlinear_angles < 2:
+                    #    # regular angle constraint, if necessary
+                    #    for a in range(nj):
+                    #        i = c10y[j, a]
+                    #        for b in range(nlinear_angles):
+                    #            if (i == linear_angles[b, 0]
+                    #                    or i == linear_angles[b, 1]):
+                    #                break
+                    #        else:
+                    #            angle_constraints[nangle_constraints, 0] = i
+                    #            angle_constraints[nangle_constraints, 1] = j
+                    #            angle_constraints[nangle_constraints, 2] = dinds[j]
+                    #            nangle_constraints += 1
+                    #            break
+                    #    else:
+                    #        err = -1
+                    #        break
+                    ndummies += 1
+
+                for a in range(nlinear_angles):
+                    angle_sums[nangle_sums, 0] = linear_angles[a, 0]
+                    angle_sums[nangle_sums, 1] = j
+                    angle_sums[nangle_sums, 2] = linear_angles[a, 1]
+                    angle_sums[nangle_sums, 3] = dinds[j]
+                    nangle_sums += 1
     if err > 0:
         raise RuntimeError("Atom {} has no bonds! This shouldn't happen."
                            "".format(j))
-    elif err == -10:
+    elif err == -1:
         raise RuntimeError("Dummy atom position determination failed.")
     elif err != 0:
-        raise RuntimeError("An error occurred while identifying angles.")
+        raise RuntimeError("An error occurred while identifying angles: {}".format(err))
     dummies = Atoms('X{}'.format(ndummies), dummypos_np[:ndummies])
     return (angles_np[:nangles], dummies, dinds_np, angle_sums[:nangle_sums],
             bond_constraints[:nbond_constraints],

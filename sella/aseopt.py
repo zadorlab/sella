@@ -9,22 +9,22 @@ from ase.optimize.optimize import Optimizer
 from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
-from sella.optimize import rs_newton, rs_rfo, rs_prfo
-from sella.peswrapper import BasePES, CartPES, IntPES
+from sella.optimize import get_restricted_step
+from sella.peswrapper import PES, InternalPES
 
 _default_kwargs = dict(minimum=dict(delta0=1e-1,
                                     sigma_inc=1.15,
                                     sigma_dec=0.90,
                                     rho_inc=1.035,
                                     rho_dec=100,
-                                    method='rsrfo',
+                                    method='rfo',
                                     eig=False),
                        saddle=dict(delta0=1.3e-3,
                                    sigma_inc=1.15,
                                    sigma_dec=0.65,
                                    rho_inc=1.035,
                                    rho_dec=5.0,
-                                   method='rsprfo',
+                                   method='prfo',
                                    eig=True))
 
 
@@ -35,7 +35,7 @@ class Sella(Optimizer):
                  order=1, eig=None, eta=1e-4, method=None, gamma=0.4,
                  threepoint=False, constraints=None, constraints_tol=1e-5,
                  v0=None, internal=False, append_trajectory=False,
-                 **kwargs):
+                 rs=None, **kwargs):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
@@ -47,26 +47,36 @@ class Sella(Optimizer):
                 trajectory = Trajectory(trajectory, mode=mode,
                                         atoms=atoms, master=master)
 
-        if isinstance(atoms, BasePES):
-            asetraj = trajectory
-            self.pes = atoms
-            atoms = self.pes.atoms
+        asetraj = None
+        if internal:
+            MyPES = InternalPES
         else:
-            asetraj = None
-            if internal:
-                self.pes = IntPES(atoms, constraints=constraints,
-                                  trajectory=trajectory, eta=eta, v0=v0,
-                                  **kwargs)
-            else:
-                self.pes = CartPES(atoms, constraints=constraints,
-                                   trajectory=trajectory, eta=eta, v0=v0,
-                                   **kwargs)
+            MyPES = PES
+        self.pes = MyPES(atoms, constraints=constraints, trajectory=trajectory, eta=eta, v0=v0, **kwargs)
+
+        if rs is None:
+            rs = 'mis' if internal else 'tr'
+        self.rs = get_restricted_step(rs)
+        #if isinstance(atoms, BasePES):
+        #    asetraj = trajectory
+        #    self.pes = atoms
+        #    atoms = self.pes.atoms
+        #else:
+        #    asetraj = None
+        #    if internal:
+        #        self.pes = IntPES(atoms, constraints=constraints,
+        #                          trajectory=trajectory, eta=eta, v0=v0,
+        #                          **kwargs)
+        #    else:
+        #        self.pes = CartPES(atoms, constraints=constraints,
+        #                           trajectory=trajectory, eta=eta, v0=v0,
+        #                           **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
 
         if delta0 is None:
             delta0 = default['delta0']
-        self.delta = delta0 * len(self.pes.xfree)
+        self.delta = delta0 * self.pes.get_Ufree().shape[1]
 
         if sigma_inc is None:
             self.sigma_inc = default['sigma_inc']
@@ -104,6 +114,7 @@ class Sella(Optimizer):
         self.constraints_tol = constraints_tol
         self.niter = 0
         self.peskwargs = dict(gamma=gamma, threepoint=threepoint)
+        self.rho = 1.
 
         if self.ord != 0 and not self.eig:
             warnings.warn("Saddle point optimizations with eig=False will "
@@ -112,44 +123,29 @@ class Sella(Optimizer):
 
         self.initialized = False
         self.xi = 1.
-        if self.method not in ['gmtrm', 'rsrfo', 'rsprfo']:
-            raise ValueError('Unknown method:', self.method)
 
     def _predict_step(self):
         if not self.initialized:
-            self.glast = self.pes.gfree
+            self.pes.get_g()
             if self.eig:
                 self.pes.diag(**self.peskwargs)
             self.initialized = True
 
-        # Find new search step
-        if self.method == 'gmtrm':
-            # TODO: Implement Winv for rs_newton
-            s, smag, self.xi, _ = rs_newton(self.pes, self.glast,
-                                            self.delta,
-        #                                    self.pes.Winv,
-                                            self.ord, self.xi)
-        elif self.method == 'rsrfo':
-            s, smag, self.xi, _ = rs_rfo(self.pes, self.glast,
-                                         self.delta,
-                                         self.pes.Winv,
-                                         self.ord, self.xi)
-        elif self.method == 'rsprfo':
-            s, smag, self.xi, _ = rs_prfo(self.pes, self.glast,
-                                          self.delta, self.pes.Winv,
-                                          self.ord, self.xi)
-        else:
-            raise RuntimeError("Don't know what to do for method", self.method)
-
+        s, smag = self.rs(self.pes, self.ord, self.delta, method=self.method).get_s()
         return s, smag
 
     def step(self):
         s, smag = self._predict_step()
 
         # Determine if we need to call the eigensolver, then step
-        ev = (self.eig and self.pes.lams is not None
-              and np.any(self.pes.lams[:self.ord] > 0))
-        _, self.glast, rho = self.pes.kick(s, ev, **self.peskwargs)
+        if self.eig and self.pes.H.evals is not None:
+            Unred = self.pes.get_Unred()
+            ev = self.pes.get_HL().project(Unred).evals[:self.ord] > 0
+        else:
+            ev = False
+        #ev = (self.eig and self.pes.H.evals is not None
+        #      and np.any(self.pes.get_HL().evals[:self.ord] > 0))
+        rho = self.pes.kick(s, ev, **self.peskwargs)
         self.niter += 1
 
         # Update trust radius
@@ -159,23 +155,25 @@ class Sella(Optimizer):
             self.delta = max(smag * self.sigma_dec, self.delta_min)
         elif 1./self.rho_inc < rho < self.rho_inc:
             self.delta = max(self.sigma_inc * smag, self.delta)
+        self.rho = rho
+        if self.rho is None:
+            self.rho = 1.
 
     def converged(self, forces=None):
-        return self.pes.converged(self.fmax)
+        return self.pes.converged(self.fmax)[0]
 
     def log(self, forces=None):
         if self.logfile is None:
             return
-        fmax = np.sqrt((self.pes.forces**2).sum(1).max())
-        cmax = np.max(np.abs(self.pes.res), initial=0.)
-        e = self.pes.f
+        _, fmax, cmax = self.pes.converged(self.fmax)
+        e = self.pes.get_f()
         T = strftime("%H:%M:%S", localtime())
         name = self.__class__.__name__
         buf = " " * len(name)
         if self.nsteps == 0:
-            self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} {:>12s}\n"
+            self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} {:>12s} {:>12s}\n"
                                .format("Step", "Time", "Energy", "fmax",
-                                       "cmax", "rtrust"))
-        self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
-                          .format(name, self.nsteps, T, e, fmax, cmax, self.delta))
+                                       "cmax", "rtrust", "rho"))
+        self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
+                          .format(name, self.nsteps, T, e, fmax, cmax, self.delta, self.rho))
         self.logfile.flush()

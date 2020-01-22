@@ -1,7 +1,5 @@
 # cython: language_level=3
 
-cdef int my_daxpy(double scale, double[:] x, double[:] y) nogil
-
 cdef int normalize(double[:] x) nogil
 
 cdef int vec_sum(double[:] x, double[:] y, double[:] z, double scale=?) nogil

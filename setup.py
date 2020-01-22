@@ -23,6 +23,7 @@ cy_files = [['force_match'],
             ['internal', 'int_eval'],
             ['internal', 'int_find'],
             ['internal', 'int_classes'],
+            ['utilities', 'blas'],
             ['utilities', 'math']]
 
 ext_modules = []

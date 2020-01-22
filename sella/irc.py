@@ -3,7 +3,7 @@ import warnings
 import numpy as np
 from scipy.linalg import eigh
 
-from sella.peswrapper import CartPES, IntPES
+from sella.peswrapper import PES
 
 from ase.optimize.optimize import Optimizer
 

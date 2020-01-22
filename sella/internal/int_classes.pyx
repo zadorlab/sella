@@ -4,13 +4,14 @@
 
 cimport cython
 
-from libc.math cimport fabs, exp, pi, sqrt
+from libc.math cimport fabs, exp, pi, sqrt, copysign
 from libc.string cimport memset
 from libc.stdint cimport uint8_t
 
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dgemv, dcopy
 
-from sella.utilities.math cimport (my_daxpy, vec_sum, mgs, cross,
+from sella.utilities.blas cimport my_ddot, my_daxpy, my_dgemv
+from sella.utilities.math cimport (vec_sum, mgs, cross,
                                    normalize, mppi)
 from sella.internal.int_eval cimport (cart_to_bond, cart_to_angle,
                                       cart_to_dihedral)
@@ -123,6 +124,7 @@ cdef class CartToInternal:
                   double atol=15,
                   **kwargs):
 
+        cdef int i, a, b
         cdef size_t sd = sizeof(double)
 
         self.nreal = len(atoms)
@@ -135,6 +137,15 @@ cdef class CartToInternal:
             self.ndummies = len(dummies)
 
         self.natoms = self.nreal + self.ndummies
+
+        self.rcov = memoryview(np.zeros(self.natoms, dtype=np.float64))
+        for i in range(self.nreal):
+            self.rcov[i] = covalent_radii[atoms.numbers[i]].copy()
+        for i in range(self.ndummies):
+            self.rcov[self.nreal + i] = covalent_radii[0].copy()
+
+        bmat_np = np.zeros((self.natoms, self.natoms), dtype=np.uint8)
+        self.bmat = memoryview(bmat_np)
 
         self.nx = 3 * self.natoms
 
@@ -149,6 +160,11 @@ cdef class CartToInternal:
         else:
             self.bonds = bonds
         self.nbonds = len(self.bonds)
+
+        for i in range(self.nbonds):
+            a = self.bonds[i, 0]
+            b = self.bonds[i, 1]
+            self.bmat[a, b] = self.bmat[b, a] = True
 
         if angles is None:
             self.angles = memoryview(np.empty((0, 3), dtype=np.int32))
@@ -182,7 +198,7 @@ cdef class CartToInternal:
         self.nq = (self.ncart + self.nbonds + self.nangles
                    + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
 
-        self.atol = atol * pi / 180.
+        self.atol = pi * atol / 180.
 
 
     def get_q(self, double[:, :] pos, double[:, :] dummypos=None):
@@ -215,10 +231,11 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return D2q(self.natoms, self.ncart, self.bonds, self.angles,
-                   self.dihedrals, self.angle_sums, self.angle_diffs,
-                   self.d2q_bonds, self.d2q_angles, self.d2q_dihedrals,
-                   self.d2q_angle_sums, self.d2q_angle_diffs)
+        return D2q(self.natoms, self.ncart,
+                   self.bonds, self.angles, self.dihedrals, self.angle_sums,
+                   self.angle_diffs, self.d2q_bonds,
+                   self.d2q_angles, self.d2q_dihedrals, self.d2q_angle_sums,
+                   self.d2q_angle_diffs)
 
     cdef bint _validate_pos(CartToInternal self, double[:, :] pos,
                             double[:, :] dummypos=None) nogil:
@@ -708,14 +725,36 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
         cdef int start
-        cdef int i
+        cdef int i, j
         cdef bint bad = False
+        dx_np = np.zeros(3, dtype=np.float64)
+        cdef double[:] dx = memoryview(dx_np)
+        cdef int sddx = dx.strides[0] >> 3
+        cdef double dist
+        cdef double factr
         with nogil:
             start = self.ncart + self.nbonds
             for i in range(self.nangles):
                 if not (self.atol < self.q1[start + i] < pi - self.atol):
                     bad = True
                     break
+
+            if not bad:
+                # Ignore dummy atoms for this check
+                for i in range(self.nreal - 1):
+                    for j in range(i + 1, self.nreal):
+                        if self.bmat[i, j]:
+                            factr = 0.5
+                        else:
+                            factr = 1.25
+                        info = vec_sum(self.pos[i], self.pos[j], dx, -1.)
+                        if info != 0:  break
+                        dist = dnrm2(&THREE, &dx[0], &sddx)
+                        if dist < factr * (self.rcov[i] + self.rcov[j]):
+                            bad = True
+                            break
+                    if bad or info != 0:  break
+
             # FIXME: implement bond distance check in peswrapper
             ## Check for too-short bonds
             #start = self.ncart
@@ -731,6 +770,8 @@ cdef class CartToInternal:
             #        if not (self.atol < self.q1[start + i] < pi - self.atol):
             #            bad = True
             #            break
+        if info != 0:
+            raise RuntimeError("Failed while checking for bad internals!")
         return bad
 
 
@@ -746,7 +787,7 @@ cdef class Constraints(CartToInternal):
                   bint proj_rot=True,
                   **kwargs):
         self.target = memoryview(np.zeros(self.nq, dtype=np.float64))
-        self.target[:] = target[:]
+        self.target[:len(target)] = target[:]
         self.proj_trans = proj_trans
         self.proj_rot = proj_rot
         self.rot_axes = memoryview(np.eye(3, dtype=np.float64))
@@ -816,7 +857,7 @@ cdef class Constraints(CartToInternal):
             self.proj_trans = False
 
         self.ninternal = self.nq
-        self.nq += self.ntrans + self.nrot
+        self.nq += self.nrot + self.ntrans
 
     def __init__(Constraints self,
                  atoms,
@@ -922,7 +963,8 @@ cdef class Constraints(CartToInternal):
             n = self.ncart + self.nbonds + self.nangles
             # Dihedrals are periodic on the range -pi to pi
             for i in range(self.ndihedrals):
-                self.res[n + i] = (pi + self.res[n + i]) % (2 * pi) - pi
+                self.res[n + i] = (pi + self.res[n + i]) % (2 * pi) #- pi
+                self.res[n + i] -= copysign(pi, self.res[n + i])
         self.calc_res = True
         return np.asarray(self.res)
 
@@ -937,9 +979,6 @@ cdef class Constraints(CartToInternal):
 
     def get_Ufree(self, double[:, :] pos, double[:, :] dummypos=None):
         return self.get_Uext(pos, dummypos)
-
-    #def get_D(self, double[:, :] pos, double[:, :] dummypos=None):
-    #    raise NotImplementedError
 
     def guess_hessian(self, atoms, double h0cart=70.):
         raise NotImplementedError
@@ -1016,6 +1055,7 @@ cdef class D2q:
     @cython.cdivision(True)
     def ldot(self, double[:] v1):
         cdef size_t m = self.ncart
+        #assert len(v1) == self.nq, (len(v1), self.nq)
 
         result_np = np.zeros((self.natoms, 3, self.natoms, 3),
                              dtype=np.float64)
@@ -1045,7 +1085,7 @@ cdef class D2q:
                  int[:, :] q,
                  double[:, :, :, :, :] D2,
                  double[:] v,
-                 double[:, :, :, :] res) nogil:
+                 double[:, :, :, :] res) nogil except -1:
         cdef int err
         cdef size_t n, i, a, ai, b, bi
 
@@ -1061,12 +1101,12 @@ cdef class D2q:
                             return err
         return 0
 
-
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def rdot(self, double[:] v1):
         cdef size_t m = self.ncart
+        assert len(v1) == self.nx
 
         result_np = np.zeros((self.nq, self.natoms, 3), dtype=np.float64)
         cdef double[:, :, :] res = memoryview(result_np)
@@ -1096,7 +1136,7 @@ cdef class D2q:
                  int[:, :] q,
                  double[:, :, :, :, :] D2,
                  double[:] v,
-                 double[:, :, :] res) nogil:
+                 double[:, :, :] res) nogil except -1:
         cdef size_t n, a, ai
         cdef int sv = v.strides[0] >> 3
         cdef int sres = res.strides[2] >> 3
@@ -1114,12 +1154,13 @@ cdef class D2q:
                 res[start + n, ai, :] = self.work2[a, :]
         return 0
 
-
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
     def ddot(self, double[:] v1, double[:] v2):
         cdef size_t m = self.ncart
+        assert len(v1) == self.nx
+        assert len(v2) == self.nx
 
         result_np = np.zeros(self.nq, dtype=np.float64)
         cdef double[:] res = memoryview(result_np)
@@ -1139,9 +1180,6 @@ cdef class D2q:
                      self.Dangle_diffs, v1, v2, res)
         return result_np
 
-    #def ddot(self, double[:] v1, v2):
-    #    return self.rdot(v1) @ v2
-
     @cython.boundscheck(True)
     @cython.wraparound(False)
     @cython.cdivision(True)
@@ -1153,7 +1191,7 @@ cdef class D2q:
                  double[:, :, :, :, :] D2,
                  double[:] v1,
                  double[:] v2,
-                 double[:] res) nogil:
+                 double[:] res) nogil except -1:
         cdef size_t n, a, ai
         cdef int sv1 = v1.strides[0] >> 3
         cdef int sv2 = v2.strides[0] >> 3

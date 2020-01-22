@@ -1,7 +1,6 @@
 # cython: language_level=3
 
 cimport cython
-from cython.view cimport array as cva
 
 from libc.math cimport sqrt, fabs
 from libc.string cimport memset
@@ -14,20 +13,6 @@ cdef int UNITY = 1
 
 cdef double DUNITY = 1.
 cdef double DZERO = 0.
-
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
-cdef inline int my_daxpy(double scale, double[:] x, double[:] y) nogil:
-    """A wrapper for daxpy with size checks and automatic determination
-    of stride size"""
-    cdef int n = len(x)
-    if len(y) != n:
-        return -1
-    cdef int sdx = x.strides[0] >> 3
-    cdef int sdy = y.strides[0] >> 3
-    daxpy(&n, &scale, &x[0], &sdx, &y[0], &sdy)
-    return 0
 
 
 @cython.boundscheck(False)

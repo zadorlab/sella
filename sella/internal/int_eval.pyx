@@ -10,7 +10,8 @@ from libc.string cimport memset
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dger, dsyr, dsyr2
 from scipy.linalg.cython_lapack cimport dlacpy, dlaset, dlascl
 
-from sella.utilities.math cimport my_daxpy, vec_sum, cross, symmetrize, skew
+from sella.utilities.blas cimport my_daxpy, my_ddot, my_dger
+from sella.utilities.math cimport vec_sum, cross, symmetrize, skew
 
 # Constants for BLAS/LAPACK calls
 cdef double DNTWO = -2.

@@ -1,528 +1,506 @@
 import numpy as np
-
-from ase.io import Trajectory
-from ase.utils import basestring
-
-from scipy.linalg import eigh, null_space
+from scipy.linalg import eigh
 from scipy.integrate import LSODA
+from ase.utils import basestring
+from ase.visualize import view
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.io.trajectory import Trajectory
 
 from sella.utilities.math import modified_gram_schmidt
-from sella.constraints import merge_user_constraints, get_constraints
-from sella.internal.get_internal import get_internal
-from sella.hessian_update import update_H, symmetrize_Y
-from sella.linalg import NumericalHessian
+from sella.hessian_update import symmetrize_Y
+from sella.linalg import NumericalHessian, ApproximateHessian
+from sella.constraints import get_constraints, merge_user_constraints
 from sella.eigensolvers import rayleigh_ritz
+from sella.internal.get_internal import get_internal
 
 
-class DummyTrajectory:
-    def write(self):
-        pass
-
-
-class BasePES:
-    def __init__(self, atoms, eigensolver='jd0', trajectory=None, eta=1e-4,
+class PES:
+    def __init__(self,
+                 atoms,
+                 H0=None,
+                 constraints=None,
+                 eigensolver='jd0',
+                 trajectory=None,
+                 eta=1e-4,
                  v0=None):
         self.atoms = atoms
-        self.last = dict(x=None, f=None, g=None)
-        self.lastlast = dict(x=None, f=None, g=None)
-        self.neval = 0
+        self.set_constraints(constraints)
+        self.eigensolver = eigensolver
+
         if trajectory is not None:
             if isinstance(trajectory, basestring):
                 self.traj = Trajectory(trajectory, 'w', self.atoms)
             else:
                 self.traj = trajectory
         else:
-            self.traj = DummyTrajectory()
-        self.H = None
-        self.eigensolver = eigensolver
+            self.traj = None
+
         self.eta = eta
         self.v0 = v0
 
-    calls = property(lambda self: self.neval)
+        self.neval = 0
+        self.curr = dict(x=None,
+                         f=None,
+                         g=None,
+                         gfree=None,
+                         hfree=None,
+                         )
+        self.last = self.curr.copy()
 
-    def _project_H(self):
-        return self.H
-
-    @property
-    def H(self):
-        return self._H
-
-    @H.setter
-    def H(self, target):
-        if target is None:
-            self._H = None
-            self.Hred = None
-            self.lams = None
-            self.vecs = None
-            return
-        self._H = target
-        self.Hred = self.Ufree.T @ self._H @ self.Ufree
-        self.lams, self.vecs = eigh(self.Hred)
-
-    def _update(self):
-        x = self.atoms.positions.ravel()
-        if self.last['x'] is not None and np.all(x == self.last['x']):
-            return False
-        g = -self.atoms.get_forces().ravel()
-        f = self.atoms.get_potential_energy()
-        self.lastlast = self.last
-        self.last = dict(x=x.copy(),
-                         f=f,
-                         g=g.copy())
-
-        self.neval += 1
-        self.traj.write()
-        #self._test_traj.write(self.atoms + self.int.dummies)
-        return True
-
-    def converged(self, fmax, maxres=1e-5):
-        return ((self.forces**2).sum(1).max() < fmax**2
-                and (np.linalg.norm(self.res) < maxres))
-
-    @property
-    def f(self):
-        self._update()
-        return self.last['f']
-
-    def kick(self, dxfree, diag=False, **diag_kwargs):
-        pos0 = self.atoms.positions.copy()
-        f0 = self.f
-        #g0 = self.g.copy()
-
-        # Update "free" coordinates, which in turn will also update
-        # the "constrained" coordinates to reduce self.res
-        self.xfree = self.xfree + dxfree
-        df_actual = self.f - f0
-        g0 = self.glast
-
-        dx = self.dx(pos0)
-        if self.H is not None and g0 is not None:
-            H = self._project_H()
-            df_pred = g0.T @ dx + (dx.T @ H @ dx) / 2.
-            ratio = df_pred / df_actual
-        else:
-            ratio = None
-
-        if g0 is not None:
-            self.update_H()
-
-        if diag:
-            self.diag(**diag_kwargs)
-
-        return self.f, self.gfree, ratio
-
-    def dx(self, pos0):
-        x1 = self.x.copy()
-        pos1 = self.atoms.positions.copy()
-        self.atoms.positions = pos0
-        x0 = self.x.copy()
-        self.atoms.positions = pos1
-        return x1 - x0
-
-    def _calc_eg(self, x):
-        pos0 = self.atoms.positions.copy()
-        if self.dummies is not None:
-            dpos0 = self.dummies.positions.copy()
-        self.x = x
-        g = self.g
-        f = self.f
-        self.atoms.positions = pos0
-        if self.dummies is not None:
-            self.dummies.positions = dpos0
-        return f, g
-
-    def diag(self, gamma=0.5, threepoint=False, maxiter=None):
-        lastlast = self.lastlast.copy()
-        last = self.last.copy()
-
-        x0 = self.x.copy()
-        P = self.Hred
-        v0 = None
-        if P is None:
-            P = np.eye(len(self.xfree))
-            v0 = self.gfree.copy()
-        Hproj = NumericalHessian(self._calc_eg, x0, self.g.copy(), self.eta,
-                                 threepoint, self.Ufree)
-        lams, Vs, AVs = rayleigh_ritz(Hproj, gamma, P, v0=v0,
-                                      method=self.eigensolver,
-                                      maxiter=maxiter)
-
-        L = np.linalg.lstsq(self.drdx @ self.Ucons, self.Ucons.T @ self.g, rcond=None)[0]
-        Vs = Hproj.Vs
-        AVs = Hproj.AVs + self.cons.get_D(self.atoms.positions).ldot(L) @ Vs
-        self.x = x0
-        Atilde = Vs.T @ symmetrize_Y(Vs, AVs, symm=2)
-        theta, X = eigh(Atilde)
-        Vs = Vs @ X
-        AVs = AVs @ X
-        AVstilde = AVs
-        #AVstilde = AVs - self.cons.get_D(self.atoms.positions).ldot(L) @ Vs
-        #AVstilde = (self.Ufree @ self.Ufree.T) @ AVs
-        self.H = update_H(self.H, Vs, AVstilde)
-        self.lastlast = lastlast
-        self.last = last
-
-
-class CartPES(BasePES):
-    def __init__(self, atoms, eigensolver='jd0', constraints=None,
-                 trajectory=None, eta=1e-4, v0=None):
-        BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
-        self.last.update(gfree=None, h=None)
-        self.con_user, self.target_user = merge_user_constraints(atoms,
-                                                                 constraints)
-        self.cons = get_constraints(atoms, self.con_user, self.target_user)
+        # Internal coordinate specific things
+        self.int = None
         self.dummies = None
 
-    res = property(lambda self: self.cons.get_res(self.atoms.positions))
-    drdx = property(lambda self: self.cons.get_drdx(self.atoms.positions))
+        self.dim = 3 * len(atoms)
+        self.set_H(H0)
 
-    @property
-    def Ucons(self):
-        return modified_gram_schmidt(self.drdx.T)
+        self.savepoint = dict(apos=None, dpos=None)
 
-    @property
-    def Ufree(self):
-        return null_space(self.Ucons.T)
+    apos = property(lambda self: self.atoms.positions.copy())
+    dpos = property(lambda self: None)
 
-    def _update(self):
-        if not BasePES._update(self):
-            return False
-        g = self.last['g']
+    def save(self):
+        self.savepoint = dict(apos=self.apos, dpos=self.dpos)
 
-        gfree = self.Ufree.T @ g
-        h = g - g @ self.Ucons @ self.Ucons.T
+    def restore(self):
+        apos = self.savepoint['apos']
+        dpos = self.savepoint['dpos']
+        assert apos is not None
+        self.atoms.positions = apos
+        if dpos is not None:
+            self.dummies.positions = dpos
 
-        self.last.update(gfree=gfree, h=h)
-        return True
+    def set_constraints(self, c):
+        self.con_user, self.target_user = merge_user_constraints(self.atoms, c)
+        self.cons = get_constraints(self.atoms, self.con_user, self.target_user)
 
-    @property
-    def x(self):
-        return self.atoms.positions.ravel()
-
-    @x.setter
-    def x(self, target):
+    # Position getter/setter
+    def set_x(self, target):
         self.atoms.positions = target.reshape((-1, 3))
 
-    @property
-    def g(self):
-        self._update()
-        return self.last['g']
+    def get_x(self):
+        return self.apos.ravel().copy()
 
-    @property
-    def glast(self):
-        self._update()
-        return self.lastlast['g']
+    # Hessian getter/setter
+    def get_H(self):
+        return self.H
 
-    @property
-    def xfree(self):
-        Ufree = self.cons.get_Ufree(self.atoms.positions)
-        return Ufree.T @ self.x
+    def set_H(self, target):
+        self.H = ApproximateHessian(self.dim, target)
 
-    @xfree.setter
-    def xfree(self, target):
-        dx_cons = -np.linalg.pinv(self.drdx) @ self.res
-        dx_free = self.Ufree @ (target - self.xfree)
-        self.x = self.x + dx_free + dx_cons
+    # Hessian of the constraints
+    def get_Hc(self):
+        return self.cons.get_D(self.apos, self.dpos).ldot(self.curr['L'])
 
-    @property
-    def gfree(self):
-        self._update()
-        return self.last['gfree']
+    # Hessian of the Lagrangian
+    def get_HL(self):
+        return self.get_H() - self.get_Hc()
 
-    @property
-    def forces(self):
-        self._update()
-        return -((self.Ufree @ self.Ufree.T) @ self.g).reshape((-1, 3))
+    # Getters for constraints and their derivatives
+    def get_res(self):
+        return self.cons.get_res(self.apos, self.dpos).copy()
 
-    @property
-    def h(self):
-        self._update()
-        return self.last['h']
+    def get_drdx(self):
+        return self.cons.get_drdx(self.apos, self.dpos).copy()
 
-    @property
-    def Winv(self):
-        return np.eye(self.Ufree.shape[1])
+    def _calc_basis(self):
+        drdx = self.get_drdx()
+        Ucons = modified_gram_schmidt(drdx.T)
+        Unred = np.eye(self.dim)
+        Ufree = modified_gram_schmidt(Unred, Ucons)
+        return drdx, Ucons, Unred, Ufree
 
-    def update_H(self):
-        if self.lastlast['x'] is None:
-            return
-        dx = self.x - self.lastlast['x']
-        dg = self.g - self.lastlast['g']
+    def write_traj(self):
+        if self.traj is not None:
+            self.traj.write()
 
-        gL = self.g.copy()
-        #if self.H is not None:
-        #    gL += self.H @ dx
-        L = np.linalg.lstsq(self.drdx @ self.Ucons, self.Ucons.T @ gL, rcond=None)[0]
-        print(np.linalg.norm(L @ self.drdx - self.g))
-        dA = self.drdx - self.cons.get_drdx(self.lastlast['x'].reshape((-1, 3)))
-        dh = dg - L @ dA
-        #dh = self.h - self.lastlast['h']
-        self.H = update_H(self.H, dx, dh)
+    def eval(self):
+        self.neval += 1
+        f = self.atoms.get_potential_energy()
+        g = -self.atoms.get_forces().ravel()
+        self.write_traj()
+        return f, g
 
+    def _calc_eg(self, x):
+        self.save()
+        self.set_x(x)
 
-class IntPES(BasePES):
-    def __init__(self, atoms, eigensolver='jd0', constraints=None,
-                 trajectory=None, eta=1e-4, v0=None, angles=True,
-                 dihedrals=True, extra_bonds=None):
-        BasePES.__init__(self, atoms, eigensolver, trajectory, eta, v0)
-        self.last.update(xint=None, gint=None, hint=None, xdummy=None)
-        self.con_user, self.target_user = merge_user_constraints(atoms,
-                                                                 constraints)
-        self.int, self.cons, self.dummies = get_internal(atoms, self.con_user,
-                                                         self.target_user)
+        f, g = self.eval()
 
-        self._H0 = self.int.guess_hessian(atoms, self.dummies)
-        self.Binvlast = self.Binv.copy()
-        self._natoms = len(atoms)
-        self.int_last = None
+        self.restore()
+        return f, g
 
-    apos = property(lambda self: self.atoms.positions)
-    dpos = property(lambda self: self.dummies.positions)
+    def get_scons(self):
+        """Returns displacement vector for linear constraint correction."""
+        Ucons = self.get_Ucons()
 
-    res = property(lambda self: self.cons.get_res(self.apos, self.dpos))
+        #scons = -Ucons @ np.linalg.inv(self.get_drdx() @ Ucons) @ self.get_res()
+        #scons = -np.linalg.lstsq(self.get_drdx() @ Ucons @ Ucons.T,
+        #                         self.get_res(), rcond=None)[0]
+        scons = -Ucons @ np.linalg.lstsq(self.get_drdx() @ Ucons,
+                                        self.get_res(), rcond=None)[0]
+        return scons
 
-    @property
-    def drdx(self):
-        return self.cons.get_drdx(self.apos, self.dpos) @ self.Binv
+    def _update(self, feval=True):
+        x = self.get_x()
+        new_point = True
+        if self.curr['x'] is not None and np.all(x == self.curr['x']):
+            if feval and self.curr['f'] is None:
+                new_point = False
+            else:
+                return False
+        drdx, Ucons, Unred, Ufree = self._calc_basis()
 
-    @property
-    def drdxinv(self):
-        return self.B @ self.cons.get_Binv(self.apos, self.dpos)
-
-    @property
-    def Ufree(self):
-        # This is a bit convoluted.
-        # There might be a better way to accomplish this.
-        Ufree = self.cons.get_Ufree(self.apos, self.dpos)
-        B = self.B @ (Ufree @ Ufree.T)
-        G = B @ B.T
-        lams, vecs = eigh(G)
-        indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-8]
-        return vecs[:, indices]
-
-    @property
-    def Ucons(self):
-        Ucons = modified_gram_schmidt(self.drdxinv)
-        return Ucons
-
-    def _update(self):
-        if not BasePES._update(self):
-            # The geometry has not changed, so nothing needs to be done
-            return
-        g = self.last['g']
-        xint = self.x
-        gint = g @ self.Binv[:3*len(self.atoms)]
-        hint = gint - gint @ self.Ucons @ self.drdx
-        h = hint @ self.B
-
-        self.last.update(xint=xint, gint=gint, h=h, hint=hint,
-                         xdummy=self.dummies.positions.ravel().copy())
-
-    def kick(self, dxfree, diag=False, **diag_kwargs):
-        pos0 = self.atoms.positions.copy()
-        dpos0 = self.dummies.positions.copy()
-        f0 = self.f
-        #g0 = self.g.copy()
-
-        # Update "free" coordinates, which in turn will also update
-        # the "constrained" coordinates to reduce self.res
-        self.xfree = self.xfree + dxfree
-        df_actual = self.f - f0
-        g0 = self.glast
-
-        dx = self.dx(pos0, dpos0)
-        if self.H is not None and g0 is not None:
-            H = self._project_H()
-            df_pred = g0.T @ dx + (dx.T @ H @ dx) / 2.
-            ratio = df_pred / df_actual
+        if feval:
+            f, g = self.eval()
+            L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
         else:
-            ratio = None
+            f = None
+            g = None
+            L = None
 
-        if g0 is not None:
-            self.update_H()
+        if new_point:
+            self.last = self.curr
+            self.curr = dict(x=x, f=f, g=g, drdx=drdx, Ucons=Ucons,
+                             Unred=Unred, Ufree=Ufree, L=L)
+            self._update_H()
+        else:
+            self.curr['f'] = f
+            self.curr['g'] = g
+            self.curr['L'] = L
+        return True
+
+    def _update_H(self):
+        if self.last['x'] is None or self.last['g'] is None:
+            return
+        dx = self.wrap_dx(self.curr['x'] - self.last['x'])
+        dg = self.curr['g'] - self.last['g']
+        self.H.update(dx, dg)
+
+    def get_f(self):
+        self._update()
+        return self.curr['f']
+
+    def get_g(self):
+        self._update()
+        return self.curr['g'].copy()
+
+    def get_Unred(self):
+        self._update(False)
+        return self.curr['Unred']
+
+    def get_Ufree(self):
+        self._update(False)
+        return self.curr['Ufree']
+
+    def get_Ucons(self):
+        self._update(False)
+        return self.curr['Ucons']
+
+    def diag(self, gamma=0.5, threepoint=False, maxiter=None):
+        x0 = self.get_x()
+
+        Ufree = self.get_Ufree()
+        Unred = self.get_Unred()
+
+        P = self.get_HL().project(Unred)
+        v0 = None
+
+        if P.B is None:
+            P = np.eye(Unred.shape[1])
+            v0 = self.v0
+            if v0 is None:
+                v0 = Unred.T @ self.get_g()
+        else:
+            P = P.asarray()
+
+        Hproj = NumericalHessian(self._calc_eg, self.get_x(), self.get_g(),
+                                 self.eta, threepoint, Unred)
+        Hc = self.get_Hc()
+        rayleigh_ritz(Hproj - Unred.T @ Hc @ Unred, gamma, P, v0=v0,
+                      method=self.eigensolver,
+                      maxiter=maxiter)
+
+        # Extract eigensolver iterates
+        Vs = Hproj.Vs
+        AVs = Hproj.AVs
+
+        # Re-calculate Ritz vectors
+        Atilde = Vs.T @ symmetrize_Y(Vs, AVs, symm=2) - Vs.T @ Hc @ Vs
+        _, X = eigh(Atilde)
+
+        # Rotate Vs and AVs into X
+        Vs = Vs @ X
+        AVs = AVs @ X
+
+        # Update the approximate Hessian
+        self.H.update(Vs, AVs)
+
+    # FIXME: temporary functions for backwards compatibility
+    def get_projected_forces(self):
+        """Returns Nx3 array of atomic forces orthogonal to constraints."""
+        g = self.get_g()
+        Ufree = self.get_Ufree()
+        return -((Ufree @ Ufree.T) @ g).reshape((-1, 3))
+
+    def converged(self, fmax, cmax=1e-5):
+        fmax1 = np.linalg.norm(self.get_projected_forces(), axis=1).max()
+        cmax1 = np.linalg.norm(self.get_res())
+        conv = (fmax1 < fmax) and (cmax1 < cmax)
+        return conv, fmax1, cmax1
+
+    def get_W(self):
+        return np.eye(self.dim)
+
+    def wrap_dx(self, dx):
+        return dx
+
+    def get_df_pred(self, dx, g, H):
+        if H is None:
+            return None
+        return g.T @ dx + (dx.T @ H @ dx) / 2.
+
+    def kick(self, dx, diag=False, **diag_kwargs):
+        x0 = self.get_x()
+        f0 = self.get_f()
+        g0 = self.get_g()
+        B0 = self.H.B
+
+        self.set_x(x0 + dx)
+
+        x1 = self.get_x()
+
+        dx_actual = self.wrap_dx(self.get_x() - x0)
+        df_pred = self.get_df_pred(dx_actual, g0, B0)
+        df_actual = self.get_f() - f0
+        if df_pred is None:
+            ratio = None
+        else:
+            ratio = df_actual / df_pred
 
         if diag:
             self.diag(**diag_kwargs)
 
-        return self.f, self.gfree, ratio
+        return ratio
 
-    @property
-    def x(self):
-        return self.int.get_q(self.apos, self.dpos)
 
-    @x.setter
-    def x(self, target):
-        dq = self.int.dq_wrap(target - self.x)
-        pos0 = self.atoms.positions.ravel().copy()
-        dpos0 = self.dummies.positions.ravel().copy()
-        B0 = self.B.copy()
+class InternalPES(PES):
+    def __init__(self, atoms, *args, H0=None, angles=True, dihedrals=True,
+                 extra_bonds=None, **kwargs):
+        PES.__init__(self, atoms, *args, H0=None, **kwargs)
+        self.int, self.cons, self.dummies = get_internal(atoms, self.con_user,
+                                                         self.target_user)
+        self.dim = len(self.get_x())
+        if H0 is None:
+            # Construct guess hessian and zero out components in
+            # infeasible subspace
+            B = self.int.get_B(self.apos, self.dpos)
+            P = B @ self.int.get_Binv(self.apos, self.dpos)
+            H0 = P @ self.int.guess_hessian(self.atoms, self.dummies) @ P
+            # Invert curvature in direction of gradient
+            v0 = self.get_g()
+            v0 /= np.linalg.norm(v0)
+            P2 = np.outer(v0, v0)
+            H0 -= 2 * np.abs(v0.T @ H0 @ v0) * np.outer(v0, v0)
+        self.set_H(H0)
+
+        # Flag used to indicate that new internal coordinates are required
+        self.bad_int = False
+
+    dpos = property(lambda self: self.dummies.positions.copy())
+
+    # Position getter/setter
+    def set_x(self, target):
+        dx = self.int.dq_wrap(target - self.get_x())
 
         t0 = 0.
-        running = True
-        self.int_last = None
-        self.dummies_last = None
-        while running:
-            pos = self.atoms.positions.ravel().copy()
-            dpos = self.dummies.positions.ravel().copy()
-            nx = len(pos)
-            ndx = len(dpos)
-            y0 = np.zeros(2 * (nx + ndx))
-            y0[:nx] = pos
-            y0[nx:nx+ndx] = dpos
-            y0[nx+ndx:] = self.Binv @ dq
-            ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-9)
-            while ode.status == 'running':
-                ode.step()
-                t0 = ode.t
-                # FIXME: This needs to be updated for the new internal stuff
-                if self.int.check_for_bad_internal(self.atoms.positions,
-                                                   self.dummies.positions):
-                    print("Bad internals found")
-                    if self.int_last is None:
-                        self.int_last = self.int
-                        self.dummies_last = self.dummies
-                    out = get_internal(self.atoms, self.con_user,
-                                       self.target_user,
-                                       intlast=self.int_last,
-                                       dummies=self.dummies)
-                    self.int, self.cons, self.dummies = out
-                    dq = self.B[:, :nx+ndx] @ ode.y[nx+ndx:]
-                    break
-                if ode.nfev > 1000:  # pragma: no cover
-                    raise RuntimeError("Geometry update ODE is taking "
-                                       "too long to converge!")
-            else:
-                running = False
-        if ode.status == 'failed':  # pragma: no cover
-            raise RuntimeError("Geometry update ODE failed to converge!")
-        self.atoms.positions = ode.y[:nx].reshape((-1, 3))
-        self.dummies.positions = ode.y[nx:nx+ndx].reshape((-1, 3))
+        y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
+                        self.int.get_Binv(self.apos, self.dpos) @ dx))
+        ylast = y0.copy()
+        ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
 
+        while ode.status == 'running':
+            ode.step()
+            y = ode.y
+            t0 = ode.t
+            if self.int.check_for_bad_internal(self.apos, self.dpos):
+                print('Bad internals found!')
+                #y = ylast
+                self.bad_int = True
+                break
+            if ode.nfev > 1000:
+                view(self.atoms + self.dummies)
+                raise RuntimeError("Geometry update ODE is taking too long to converge!")
+            ylast = y.copy()
+
+        if ode.status == 'failed':
+            raise RuntimeError("Geometry update ODE failed to converge!")
+
+        nxa = 3 * len(self.atoms)
+        nxd = 3 * len(self.dummies)
+        self.atoms.positions = y[:nxa].reshape((-1, 3))
+        self.dummies.positions = y[nxa : nxa+nxd].reshape((-1, 3))
+
+    def get_x(self):
+        return self.int.get_q(self.apos, self.dpos)
+
+    # Hessian of the constraints
+    def get_Hc(self):
+        D_cons = self.cons.get_D(self.apos, self.dpos)
+        D_int = self.int.get_D(self.apos, self.dpos)
+
+        B_cons = self.cons.get_B(self.apos, self.dpos)
+        Binv_int = self.int.get_Binv(self.apos, self.dpos)
+
+        L_cons = self.curr['L']
+        L_int = self.curr['g']
+
+        Hc = Binv_int.T @ (D_cons.ldot(L_cons) - D_int.ldot(L_int)) @ Binv_int
+        return Hc
+
+    def get_drdx(self):
+        # dr/dq = dr/dx dx/dq
+        return PES.get_drdx(self) @ self.int.get_Binv(self.apos, self.dpos)
+
+    def _calc_basis(self):
+        drdx = self.get_drdx()
+        Ucons = modified_gram_schmidt(drdx.T)
+        B = self.int.get_B(self.apos, self.dpos)
+        Binv = self.int.get_Binv(self.apos, self.dpos)
+        Unred = modified_gram_schmidt(B @ Binv)
+        Ufree = modified_gram_schmidt(Unred, Ucons)
+        return drdx, Ucons, Unred, Ufree
+
+    def eval(self):
+        f, g_cart = PES.eval(self)
+        Binv = self.int.get_Binv(self.apos, self.dpos)
+        return f, g_cart @ Binv[:len(g_cart)]
+
+    def update_internals(self, dx):
+        self._update(True)
+        # Find new internals, constraints, and dummies
+        out = get_internal(self.atoms, self.con_user, self.target_user,
+                           dummies=self.dummies, conslast=self.cons)
+        new_int, new_cons, new_dummies = out
+        nold = 3 * (len(self.atoms) + len(self.dummies))
+
+        # Calculate B matrix and its inverse for new and old internals
+        Blast = self.int.get_B(self.apos, self.dpos)
+        Binvlast = self.int.get_Binv(self.apos, self.dpos)
+        B = new_int.get_B(self.apos, new_dummies.positions)
+        Binv = new_int.get_Binv(self.apos, new_dummies.positions)
+        Dlast = self.int.get_D(self.apos, self.dpos)
+        D = new_int.get_D(self.apos, new_dummies.positions)
+
+        # Projection matrices
+        P = Blast @ Binv[:nold]
+        P2 = B[:, nold:] @ Binv[nold:, :]
+
+        # Update the info in self.curr
+        x = new_int.get_q(self.apos, new_dummies.positions)
+        g = -self.atoms.get_forces().ravel() @ Binv[:3*len(self.atoms)]
+        drdx = new_cons.get_drdx(self.apos, new_dummies.positions) @ Binv
+        L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
+        Ucons = modified_gram_schmidt(drdx.T)
+        Unred = modified_gram_schmidt(B @ B.T)
+        Ufree = modified_gram_schmidt(Unred, Ucons)
+
+        # Update H using old data where possible. For new (dummy) atoms,
+        # use the guess hessian info.
+        H = self.get_H().asarray()
+        Hcart = Blast.T @ H @ Blast + Dlast.ldot(self.curr['g'])
+        Hnew = Binv.T[:, :nold] @ Hcart @ Binv[:nold] - Binv.T @ D.ldot(g) @ Binv
+        Hnew += P2.T @ new_int.guess_hessian(self.atoms, new_dummies) @ P2.T
+        #Hnew = P.T @ H @ P + P2 @ new_int.guess_hessian(self.atoms, new_dummies) @ P2.T
+        self.dim = len(x)
+        self.set_H(Hnew)
+
+        self.int = new_int
+        self.cons = new_cons
+        self.dummies = new_dummies
+
+        self.curr.update(x=x, g=g, drdx=drdx, Ufree=Ufree,
+                         Unred=Unred, Ucons=Ucons, L=L, B=B, Binv=Binv)
+
+    def get_df_pred(self, dx, g, H):
+        if H is None:
+            return None
+        B = self.int.get_B(self.apos, self.dpos)
+        Ured = modified_gram_schmidt(B @ B.T)
+        dx_r = self.wrap_dx(dx) @ Ured
+        g_r = g @ Ured
+        H_r = Ured.T @ H @ Ured
+        return g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
+
+    # FIXME: temporary functions for backwards compatibility
+    def get_projected_forces(self):
+        """Returns Nx3 array of atomic forces orthogonal to constraints."""
+        g = self.get_g()
+        Ufree = self.get_Ufree()
+        B = self.int.get_B(self.apos, self.dpos)
+        return -((Ufree @ Ufree.T) @ g @ B).reshape((-1, 3))
+
+    #def get_W(self):
+    #    Ufree = self.get_Ufree()
+    #    h0 = np.sqrt(self.int.guess_hessian(self.atoms, self.dummies))
+    #    Winv = np.linalg.pinv(Ufree.T @ h0 @ Ufree)
+    #    return Ufree @ Winv @ Ufree.T / np.linalg.det(Winv)**(1./len(Winv))
+
+    def wrap_dx(self, dx):
+        return self.int.dq_wrap(dx)
+
+    # x setter aux functions
     def _q_ode(self, t, y):
-        nx = 3 * len(self.atoms)
-        ndx = 3 * len(self.dummies)
-        x = y[:nx+ndx]
-        dxdt = y[nx+ndx:]
+        nxa = 3 * len(self.atoms)
+        nxd = 3 * len(self.dummies)
+        x, dxdt = y.reshape((2, nxa + nxd))
 
         dydt = np.zeros_like(y)
-        dydt[:nx+ndx] = dxdt
+        dydt[:nxa + nxd] = dxdt
 
-        self.atoms.positions = x[:nx].reshape((-1, 3)).copy()
-        self.dummies.positions = x[nx:].reshape((-1, 3)).copy()
+        self.atoms.positions = x[:nxa].reshape((-1, 3)).copy()
+        self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
+
         D = self.int.get_D(self.apos, self.dpos)
-        dydt[nx+ndx:] = -self.Binv @ D.ddot(dxdt, dxdt)
+        Binv = self.int.get_Binv(self.apos, self.dpos)
+        dydt[nxa + nxd:] = -Binv @ D.ddot(dxdt, dxdt)
 
         return dydt
 
-    @property
-    def f(self):
-        self._update()
-        return self.last['f']
+    def kick(self, dx, diag=False, **diag_kwargs):
+        ratio = PES.kick(self, dx, diag=diag, **diag_kwargs)
 
-    @property
-    def g(self):
-        self._update()
-        return self.last['gint']
+        if self.bad_int:
+            self.update_internals(dx)
+            self.bad_int = False
 
-    @property
-    def glast(self):
-        self._update()
-        if self.lastlast['x'] is None:
-            return None
-        x = self.lastlast['x'].reshape((-1, 3))
-        xd = self.lastlast['xdummy'].reshape((-1, 3))
-        if len(xd) != len(self.dummies):
-            xd = self.dummies.positions.copy()
-        Binvlast = self.int.get_Binv(x, xd)
-        return Binvlast[:3*len(self.atoms)].T @ self.lastlast['g']
+        return ratio
 
-    @property
-    def h(self):
-        self._update()
-        return self.last['hint']
+    def _update_H(self):
+        if self.last['x'] is None or self.last['g'] is None:
+            return
+        #P = self.last['B'] @ self.int.get_Binv(self.apos, self.dpos)
+        Unred = self.get_Unred()
+        P = Unred @ Unred.T
+        dx = P @ self.wrap_dx(self.curr['x'] - self.last['x'])
+        dg = P @ (self.curr['g'] - self.last['g'])
+        self.H = self.H.project(P)
+        self.H.update(dx, dg)
 
-    @property
-    def xfree(self):
-        return self.Ufree.T @ self.x
+    def write_traj(self):
+        if self.traj is not None:
+            energy = self.atoms.calc.results['energy']
+            forces = np.zeros((len(self.atoms) + len(self.dummies), 3))
+            forces[:len(self.atoms)] = self.atoms.calc.results['forces']
+            atoms_tmp = self.atoms + self.dummies
+            atoms_tmp.calc = SinglePointCalculator(atoms_tmp, energy=energy, forces=forces)
+            self.traj.write(atoms_tmp)
 
-    @xfree.setter
-    def xfree(self, target):
-        dx_cons = -self.drdxinv @ self.res
-        dx_free = self.Ufree @ (target - self.xfree)
-        self.x = self.x + self.int.dq_wrap(dx_free + dx_cons)
+    def _update(self, feval=True):
+        if not PES._update(self, feval=True):
+            return
 
-    @property
-    def gfree(self):
-        self._update()
-        return self.Ufree.T @ self.g
-
-    @property
-    def forces(self):
-        self._update()
-        forces_int = -((self.Ufree @ self.Ufree.T) @ self.g)
-        forces_cart = forces_int @ self.B
-        return forces_cart.reshape((-1, 3))
-
-    def dx(self, pos0, dpos0):
-        if len(dpos0) != len(self.dummies):
-            dpos0 = self.dummies.positions.copy()
-        x0 = self.int.get_q(pos0, dpos0)
-        return self.int.dq_wrap(self.x - x0)
-
-    @property
-    def B(self):
-        return self.int.get_B(self.apos, self.dpos)
-
-    @property
-    def Binv(self):
-        return self.int.get_Binv(self.apos, self.dpos)
-
-    @property
-    def Winv(self):
-        h0 = np.sqrt(self.int.guess_hessian(self.atoms, self.dummies))
-        Winv = np.linalg.inv(self.Ufree.T @ h0 @ self.Ufree)
-        return Winv / np.linalg.det(Winv)**(1./len(Winv))
-
-    def _project_H(self):
-        if self.int_last is None:
-            return self.H
-        nd0 = len(self.dummies_last)
-        nold = 3 * (len(self.atoms) + nd0)
-        self.dummies_last.positions[:nd0] = self.dummies.positions[:nd0]
-        Blast = self.int_last.get_B(self.atoms.positions, self.dummies_last.positions)
-        Binvlast = self.int_last.get_Binv(self.atoms.positions, self.dummies_last.positions)
-        B = self.int.get_B(self.atoms.positions, self.dummies.positions)
-        Binv = self.int.get_Binv(self.atoms.positions, self.dummies.positions)
-        P = B[:, :nold] @ Binvlast
-        P2 = B[:, nold:] @ Binv[nold:, :]
-
-        return P @ self.H @ P.T + P2 @ self.int.guess_hessian(self.atoms, self.dummies) @ P2.T
-
-    def update_H(self):
-        xlast = self.lastlast['x'].reshape((-1, 3))
-
-        if self.int_last is not None:
-            xd = self.dummies.positions.copy()
-            nd0 = len(self.dummies_last)
-            xd[:nd0] = self.dummies_last.positions
-
-            Binvlast = self.int.get_Binv(xlast, xd)
-            gintlast = self.lastlast['g'] @ Binvlast[:3*len(self.atoms)]
-            drdxlast = self.cons.get_drdx(xlast, xd) @ Binvlast
-            Uconslast = modified_gram_schmidt(self.drdx.T)
-            dh = self.h - (gintlast - gintlast @ Uconslast @ drdxlast)
-        else:
-            xd = self.lastlast['xdummy'].reshape((-1, 3))
-            dh = self.h - self.lastlast['hint']
-
-        qlast = self.int.get_q(xlast, xd)
-        dx = self.int.dq_wrap(self.x - qlast)
-
-        H = self._project_H()
-        if H is None:
-            H = self.int.guess_hessian(self.atoms, self.dummies)
-
-        P = self.B @ self.Binv
-        #self.H = P @ update_H(P @ H @ P.T, dx, dh) @ P
-        #self.H = update_H(P @ H @ P.T, dx, dh)
-        self.H = update_H(H, dx, dh)
+        B = self.int.get_B(self.apos, self.dpos)
+        Binv = self.int.get_Binv(self.apos, self.dpos)
+        self.curr.update(B=B, Binv=Binv)
+        return True

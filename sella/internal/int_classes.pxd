@@ -10,6 +10,8 @@ cdef class CartToInternal:
     cdef public int[:] dinds
     cdef public int[:, :] cart, bonds, angles, dihedrals, angle_sums
     cdef public int[:, :] angle_diffs
+    cdef uint8_t[:, :] bmat
+    cdef double[:] rcov, center
     cdef double[:] q1
     cdef double[:, :] pos, work2
     cdef double[:] dx1, dx2, dx3, work3, sing
@@ -55,12 +57,10 @@ cdef class CartToInternal:
 
 cdef class Constraints(CartToInternal):
     cdef bint proj_trans, proj_rot, calc_res
-    cdef int ntrans, nrot, ninternal
+    cdef int ninternal, nrot, ntrans
     cdef public double[:] res, target
-    cdef double[:] center
-    cdef double[:, :] Ured
+    cdef double[:, :] Ured, rot_axes
     cdef uint8_t[:] trans_dirs
-    cdef double[:, :] rot_axes
     cdef double[:, :] tvecs
     cdef double[:, :] rvecs
 
@@ -85,12 +85,12 @@ cdef class D2q:
 
     cdef int _ld(D2q self, size_t start, size_t nq, size_t nind,
                  int[:, :] q, double[:, :, :, :, :] D2, double[:] v,
-                 double[:, :, :, :] res) nogil
+                 double[:, :, :, :] res) nogil except -1
 
     cdef int _rd(D2q self, size_t start, size_t nq, size_t nind,
                  int[:, :] q, double[:, :, :, :, :] D2, double[:] v,
-                 double[:, :, :] res) nogil
+                 double[:, :, :] res) nogil except -1
 
     cdef int _dd(D2q self, size_t start, size_t nq, size_t nind,
                  int[:, :] q, double[:, :, :, :, :] D2, double[:] v1,
-                 double[:] v2, double[:] res) nogil
+                 double[:] v2, double[:] res) nogil except -1

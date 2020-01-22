@@ -152,24 +152,30 @@ class ApproximateHessian(LinearOperator):
             target = target * np.eye(self.dim)
         assert target.shape == self.shape
         self.B = target
-        self.evals, self.evecs = eigh(self.H)
+        self.evals, self.evecs = eigh(self.B)
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
-        self.B = update_H(self.B, dx, dg, method=self.update_method,
-                          symm=self.symm, lams=self.evals, vecs=self.evecs)
+        self.set_B(update_H(self.B, dx, dg, method=self.update_method,
+                            symm=self.symm, lams=self.evals, vecs=self.evecs))
 
     def project(self, U):
         """Project B into the subspace defined by U."""
         m, n = U.shape
         assert m == self.dim
-        dim_proj = self.dim - n
+
         if self.B is None:
             Bproj = None
         else:
             Bproj = U.T @ self.B @ U
-        return ApproximateHessian(dim_proj, Bproj, self.update_method,
+
+        return ApproximateHessian(n, Bproj, self.update_method,
                                   self.symm)
+
+    def asarray(self):
+        if self.B is not None:
+            return self.B
+        return np.eye(self.dim)
 
     def _matvec(self, v):
         if self.B is None:
@@ -180,7 +186,7 @@ class ApproximateHessian(LinearOperator):
         return self.matvec(v)
 
     def _matmat(self, X):
-        if self.H is None:
+        if self.B is None:
             return X
         return self.B @ X
 
@@ -188,5 +194,8 @@ class ApproximateHessian(LinearOperator):
         return self.matmat(X)
 
     def __add__(self, other):
-        return ApproximateHessian(self.dim, self.B + other, self.update_method,
+        B = self.B
+        if B is None:
+            B = np.eye(self.dim)
+        return ApproximateHessian(self.dim, B + other, self.update_method,
                                   self.symm)
