@@ -6,8 +6,19 @@ import numpy as np
 
 from scipy.linalg import eigh, lstsq, solve
 
-from .cython_routines import symmetrize_Y2
-
+def symmetrize_Y2(S, Y):
+    _, nvecs = S.shape
+    dY = np.zeros_like(Y)
+    YTS = Y.T @ S
+    dYTS = np.zeros_like(YTS)
+    STS = S.T @ S
+    for i in range(1, nvecs):
+        RHS = np.linalg.lstsq(STS[:i, :i],
+                              YTS[i, :i].T - YTS[:i, i] - dYTS[:i, i],
+                              rcond=None)[0]
+        dY[:, i] = -S[:, :i] @ RHS
+        dYTS[i, :] = -STS[:, :i] @ RHS
+    return dY
 
 def symmetrize_Y(S, Y, symm):
     if symm is None or S.shape[1] == 1:

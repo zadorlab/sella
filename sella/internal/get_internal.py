@@ -14,43 +14,13 @@ _cons_shapes = dict(fix=2, bonds=2, angles=3, dihedrals=4, angle_sums=4, angle_d
 
 def extract_dummy_constraints(natoms, con_user):
     con_dummy = dict()
-    for key, cons in con_user.items():
-        size = _cons_shapes[key]
+    for key, size in _cons_shapes.items():
         data = []
-        for row in cons:
+        for row in con_user.get(key, []):
             if np.any(np.asarray(row) >= natoms):
                 data.append(row)
         con_dummy[key] = np.array(data, dtype=np.int32).reshape((-1, size))
     return con_dummy
-
-def get_trans_rot(atoms, fix):
-    center = atoms.positions.mean(0)
-    cell_ortho = modified_gram_schmidt(atoms.cell[atoms.pbc].T).T
-    axes = modified_gram_schmidt(np.eye(3), atoms.cell[atoms.pbc].T)
-    trans = np.ones(3, dtype=np.uint8)
-
-    ilast = -1
-    dx = None
-    for i, dim in fix:
-        center[dim] = atoms.positions[i]
-        trans[dim] = False
-        if i != ilast and axes.shape[1] > 1:
-            dx = atoms.positions[i] - atoms.positions[ilast]
-            axes = modifid_gram_schmidt(axes, dx[:, np.newaxis])
-        ilast = i
-
-    if axes.shape[1] <= 1:
-        return trans, None, center
-
-    dxs = atoms.positions - center[np.newaxis, :]
-    dxs_rot = dxs @ axes
-    dim = axes.shape[1]
-    dxs_rot_norm = np.linalg.norm(dxs_rot, axis=1)
-    I = (dxs_rot_norm[:, np.newaxis, np.newaxis] * np.eye(dim)[np.newaxis, :, :]
-         - dxs_rot[:, np.newaxis, :] * dxs_rot[:, :, np.newaxis]).sum(axis=0)
-    _, V = np.linalg.eigh(I)
-    axes = V @ axes
-    return trans, axes.T, center
 
 def get_internal(atoms, con_user=None, target_user=None, atol=15.,
                  dummies=None, conslast=None):
@@ -81,9 +51,6 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
     dihedrals = find_dihedrals(atoms + dummies, atol, bonds, angles, nbonds,
                                c10y, dinds)
 
-    #trans, axes, center = get_trans_rot(atoms + dummies,
-    #                                    con_user.get('fix', dict()))
-
     bonds = np.vstack((bonds, np.atleast_2d(con_dummy['bonds']), bcons))
     angles = np.vstack((angles, np.atleast_2d(con_dummy['angles']), acons))
     dihedrals = np.vstack((dihedrals, np.atleast_2d(con_dummy['dihedrals']), dcons))
@@ -95,9 +62,6 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
                               dihedrals=dihedrals,
                               angle_sums=angle_sums,
                               angle_diffs=adiffs,
-                              #trans=trans,
-                              #rot_axes=axes,
-                              #center=center,
                               dummies=dummies,
                               atol=atol)
 
@@ -105,10 +69,6 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
     con, target = merge_internal_constraints(con_user, target_user, bcons,
                                              acons, dcons, adiffs)
     constraints = get_constraints(atoms, con, target, dummies, dinds,
-                                  proj_trans=False, proj_rot=False,
-                                  #trans=trans,
-                                  #rot_axes=axes,
-                                  #center=center,
-                                  )
+                                  proj_trans=False, proj_rot=False)
 
     return internal, constraints, dummies

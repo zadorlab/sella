@@ -3,7 +3,6 @@ import numpy as np
 from scipy.linalg import eigh, lstsq, solve, null_space
 
 from sella.utilities.math import modified_gram_schmidt
-from .cython_routines import ortho
 from .hessian_update import symmetrize_Y
 
 
@@ -48,7 +47,6 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
         P_lams, P_vecs, _ = exact(P, 0)
         nneg = max(1, np.sum(P_lams < 0))
         V = modified_gram_schmidt(P_vecs[:, :nneg])
-        #V = ortho(P_vecs[:, :nneg])
         v0 = V[:, 0]
 
     AV = A.dot(V)
@@ -101,7 +99,6 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
             t = ri / np.linalg.norm(ri)
 
         t = modified_gram_schmidt(t[:, np.newaxis], V)
-        #t = ortho(t, V)
 
         # Davidson failed to find a new search direction
         if t.shape[1] == 0:  # pragma: no cover
@@ -115,8 +112,6 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
                 if t.shape[1] == 0:
                     return lams, V, AV
 
-            #t = ortho(ri[:, np.newaxis], V)
-            ##t = ortho(AV[:, -1], V)
             ## If Lanczos also fails to find a new search direction,
             ## just give up and return the current Ritz pairs
             #if t.shape[1] == 0:

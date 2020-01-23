@@ -4,3 +4,4 @@ source = sella
 omit =
     tests
     *__init__.py
+    *.pxd

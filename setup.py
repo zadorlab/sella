@@ -6,20 +6,15 @@ import numpy as np
 from setuptools import setup, Extension, find_packages
 
 try:
-    #from Cython.Distutils import build_ext
     from Cython.Build import cythonize
 except ImportError:
     use_cython = False
 else:
     use_cython = True
 
-#cmdclass = dict()
-
 cy_suff = '.pyx' if use_cython else '.c'
 
 cy_files = [['force_match'],
-            ['cython_routines'],
-            ['internal_cython'],
             ['internal', 'int_eval'],
             ['internal', 'int_find'],
             ['internal', 'int_classes'],
@@ -49,7 +44,6 @@ setup(name='Sella',
       long_description=long_description,
       long_description_content_type='text/markdown',
       packages=find_packages(),
-      #cmdclass=cmdclass,
       ext_modules=ext_modules,
       include_dirs=[np.get_include()],
       classifiers=['Development Status :: 3 - Alpha',
@@ -65,5 +59,4 @@ setup(name='Sella',
                    'Topic :: Scientific/Engineering :: Physics'],
       python_requires='>=3.5',
       install_requires=install_requires,
-#      define_macros=[('CYTHON_TRACE_NOGIL', '1')],
       )

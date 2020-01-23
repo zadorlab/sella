@@ -7,8 +7,6 @@ import numpy as np
 from ase.constraints import (FixCartesian, FixAtoms, FixBondLengths,
                              FixInternals)
 
-from sella.cython_routines import modified_gram_schmidt, simple_ortho
-from sella.internal_cython import cart_to_internal
 from sella.internal.int_classes import Constraints
 
 _con_kinds = ['fix', 'bonds', 'angles', 'dihedrals',

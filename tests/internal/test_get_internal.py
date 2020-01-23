@@ -9,4 +9,4 @@ from sella.internal.get_internal import get_internal
 def test_get_internal(name):
     atoms = molecule(name)
     internal, constraints, dummies = get_internal(atoms)
-    get_internal(atoms, intlast=internal, dummies=dummies)
+    get_internal(atoms, conslast=constraints, dummies=dummies)

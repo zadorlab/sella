@@ -10,9 +10,6 @@ cdef void symmetrize(double* X, size_t n, size_t lda) nogil
 
 cdef void skew(double[:] x, double[:, :] Y, double scale=?) nogil
 
-cdef (int, double) inner(double[:, :] M, double[:] x, double[:] y,
-                         double[:] Mx) nogil
-
 cdef int mgs(double[:, :] X, double[:, :] Y=?, double eps1=?,
              double eps2=?, int maxiter=?) nogil
 

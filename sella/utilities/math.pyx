@@ -2,7 +2,7 @@
 
 cimport cython
 
-from libc.math cimport sqrt, fabs
+from libc.math cimport sqrt, fabs, INFINITY
 from libc.string cimport memset
 from scipy.linalg.cython_blas cimport daxpy, dnrm2, dcopy, dgemv, ddot, dger
 from scipy.linalg.cython_lapack cimport dgesvd
@@ -64,7 +64,7 @@ cdef inline void symmetrize(double* X, size_t n, size_t lda) nogil:
     """Symmetrizes matrix X by populating the lower triangle with the
     contents of the upper triangle"""
     cdef size_t i, j
-    for i in range(n - 1):
+    for i in range(max(0, n - 1)):
         for j in range(i + 1, n):
             X[j * lda + i] = X[i * lda + j]
 
@@ -88,30 +88,6 @@ cdef inline void skew(double[:] x, double[:, :] Y, double scale=1.) nogil:
     Y[1, 2] = -Y[2, 1]
     Y[2, 0] = -Y[0, 2]
     Y[0, 1] = -Y[1, 0]
-
-
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
-cdef (int, double) inner(double[:, :] M, double[:] x, double[:] y,
-                         double[:] Mx) nogil:
-    """Calculates the inner product y.T @ M @ x"""
-    cdef int n = len(x)
-    cdef int m = len(y)
-    if M.shape[0] != m:
-        return (-1, 0.)
-    if M.shape[1] != n:
-        return (-1, 0.)
-    if len(Mx) != m:
-        return (-1, 0.)
-    cdef int sdx = x.strides[0] >> 3
-    cdef int sdM = M.strides[1] >> 3
-    cdef int ldM = n * sdM
-    cdef int sdy = y.strides[0] >> 3
-    cdef int sdMx = Mx.strides[0] >> 3
-    dgemv('N', &n, &m, &DUNITY, &M[0, 0], &ldM, &x[0], &sdx, &DZERO,
-          &Mx[0], &sdMx)
-    return (0, ddot(&n, &y[0], &sdy, &Mx[0], &sdMx))
 
 
 @cython.boundscheck(False)
@@ -177,7 +153,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
                 m += 1
                 break
         else:  # pragma: no cover
-            return -1
+            return -2
 
     # Just for good measure, zero out any leftover bits of X
     for i in range(m, nx):
