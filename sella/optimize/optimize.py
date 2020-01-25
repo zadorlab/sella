@@ -3,13 +3,11 @@
 import warnings
 from time import localtime, strftime
 
-import numpy as np
-
 from ase.optimize.optimize import Optimizer
 from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
-from sella.optimize import get_restricted_step
+from .restricted_step import get_restricted_step
 from sella.peswrapper import PES, InternalPES
 
 _default_kwargs = dict(minimum=dict(delta0=1e-1,
@@ -52,25 +50,12 @@ class Sella(Optimizer):
             MyPES = InternalPES
         else:
             MyPES = PES
-        self.pes = MyPES(atoms, constraints=constraints, trajectory=trajectory, eta=eta, v0=v0, **kwargs)
+        self.pes = MyPES(atoms, constraints=constraints,
+                         trajectory=trajectory, eta=eta, v0=v0, **kwargs)
 
         if rs is None:
             rs = 'mis' if internal else 'tr'
         self.rs = get_restricted_step(rs)
-        #if isinstance(atoms, BasePES):
-        #    asetraj = trajectory
-        #    self.pes = atoms
-        #    atoms = self.pes.atoms
-        #else:
-        #    asetraj = None
-        #    if internal:
-        #        self.pes = IntPES(atoms, constraints=constraints,
-        #                          trajectory=trajectory, eta=eta, v0=v0,
-        #                          **kwargs)
-        #    else:
-        #        self.pes = CartPES(atoms, constraints=constraints,
-        #                           trajectory=trajectory, eta=eta, v0=v0,
-        #                           **kwargs)
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
 
@@ -131,7 +116,8 @@ class Sella(Optimizer):
                 self.pes.diag(**self.peskwargs)
             self.initialized = True
 
-        s, smag = self.rs(self.pes, self.ord, self.delta, method=self.method).get_s()
+        s, smag = self.rs(self.pes, self.ord, self.delta,
+                          method=self.method).get_s()
         return s, smag
 
     def step(self):
@@ -143,8 +129,6 @@ class Sella(Optimizer):
             ev = self.pes.get_HL().project(Unred).evals[:self.ord] > 0
         else:
             ev = False
-        #ev = (self.eig and self.pes.H.evals is not None
-        #      and np.any(self.pes.get_HL().evals[:self.ord] > 0))
         rho = self.pes.kick(s, ev, **self.peskwargs)
         self.niter += 1
 
@@ -171,9 +155,12 @@ class Sella(Optimizer):
         name = self.__class__.__name__
         buf = " " * len(name)
         if self.nsteps == 0:
-            self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} {:>12s} {:>12s}\n"
+            self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
+                               "{:>12s} {:>12s}\n"
                                .format("Step", "Time", "Energy", "fmax",
                                        "cmax", "rtrust", "rho"))
-        self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
-                          .format(name, self.nsteps, T, e, fmax, cmax, self.delta, self.rho))
+        self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                           "{:>12.4f} {:>12.4f}\n"
+                           .format(name, self.nsteps, T, e, fmax, cmax,
+                                   self.delta, self.rho))
         self.logfile.flush()

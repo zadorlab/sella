@@ -3,6 +3,7 @@ import inspect
 
 from .stepper import get_stepper, BaseStepper, NaiveStepper
 
+
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)
 class BaseRestrictedStep:
     synonyms = None
@@ -95,6 +96,7 @@ class BaseRestrictedStep:
     def match(cls, name):
         return name in cls.synonyms
 
+
 class TrustRegion(BaseRestrictedStep):
     synonyms = ['tr', 'trust region', 'trust-region', 'trust radius',
                 'trust-radius']
@@ -106,6 +108,7 @@ class TrustRegion(BaseRestrictedStep):
 
         dval = dsda @ s / val
         return val, dval
+
 
 class IRCTrustRegion(TrustRegion):
     synonyms = []
@@ -121,6 +124,7 @@ class IRCTrustRegion(TrustRegion):
         if dsda is not None:
             dsda = dsda * self.sqrtm
         return TrustRegion.cons(self, s, dsda)
+
 
 class RestrictedAtomicStep(BaseRestrictedStep):
     synonyms = ['ras', 'restricted atomic step']
@@ -145,14 +149,15 @@ class RestrictedAtomicStep(BaseRestrictedStep):
         dval = dsda_mat[index] @ s_mat[index] / val
         return val, dval
 
+
 class MaxInternalStep(BaseRestrictedStep):
     synonyms = ['mis', 'max internal step']
 
     def __init__(self, pes, *args, wx=1., wb=1., wa=1., wd=1., **kwargs):
         if pes.int is None:
             raise ValueError("Internal coordinates are required for the "
-                              "{} trust region method"
-                              .format(self.__class__.__name__))
+                             "{} trust region method"
+                             .format(self.__class__.__name__))
         self.wx = wx
         self.wb = wb
         self.wa = wa
@@ -178,6 +183,7 @@ class MaxInternalStep(BaseRestrictedStep):
 
 
 _all_restricted_step = [TrustRegion, RestrictedAtomicStep, MaxInternalStep]
+
 
 def get_restricted_step(name):
     for rs in _all_restricted_step:

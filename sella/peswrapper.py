@@ -76,7 +76,9 @@ class PES:
 
     def set_constraints(self, c):
         self.con_user, self.target_user = merge_user_constraints(self.atoms, c)
-        self.cons = get_constraints(self.atoms, self.con_user, self.target_user,
+        self.cons = get_constraints(self.atoms,
+                                    self.con_user,
+                                    self.target_user,
                                     proj_trans=self.proj_trans,
                                     proj_rot=self.proj_rot)
 
@@ -140,11 +142,8 @@ class PES:
         """Returns displacement vector for linear constraint correction."""
         Ucons = self.get_Ucons()
 
-        #scons = -Ucons @ np.linalg.inv(self.get_drdx() @ Ucons) @ self.get_res()
-        #scons = -np.linalg.lstsq(self.get_drdx() @ Ucons @ Ucons.T,
-        #                         self.get_res(), rcond=None)[0]
         scons = -Ucons @ np.linalg.lstsq(self.get_drdx() @ Ucons,
-                                        self.get_res(), rcond=None)[0]
+                                         self.get_res(), rcond=None)[0]
         return scons
 
     def _update(self, feval=True):
@@ -204,9 +203,6 @@ class PES:
         return self.curr['Ucons']
 
     def diag(self, gamma=0.5, threepoint=False, maxiter=None):
-        x0 = self.get_x()
-
-        Ufree = self.get_Ufree()
         Unred = self.get_Unred()
 
         P = self.get_HL().project(Unred)
@@ -274,8 +270,6 @@ class PES:
 
         self.set_x(x0 + dx)
 
-        x1 = self.get_x()
-
         dx_actual = self.wrap_dx(self.get_x() - x0)
         df_pred = self.get_df_pred(dx_actual, g0, B0)
         df_actual = self.get_f() - f0
@@ -306,7 +300,6 @@ class InternalPES(PES):
             # Invert curvature in direction of gradient
             v0 = self.get_g()
             v0 /= np.linalg.norm(v0)
-            P2 = np.outer(v0, v0)
             H0 -= 2 * np.abs(v0.T @ H0 @ v0) * np.outer(v0, v0)
         self.set_H(H0)
 
@@ -322,7 +315,6 @@ class InternalPES(PES):
         t0 = 0.
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         self.int.get_Binv(self.apos, self.dpos) @ dx))
-        ylast = y0.copy()
         ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
 
         while ode.status == 'running':
@@ -331,13 +323,12 @@ class InternalPES(PES):
             t0 = ode.t
             if self.int.check_for_bad_internal(self.apos, self.dpos):
                 print('Bad internals found!')
-                #y = ylast
                 self.bad_int = True
                 break
             if ode.nfev > 1000:
                 view(self.atoms + self.dummies)
-                raise RuntimeError("Geometry update ODE is taking too long to converge!")
-            ylast = y.copy()
+                raise RuntimeError("Geometry update ODE is taking too long "
+                                   "to converge!")
 
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
@@ -345,7 +336,7 @@ class InternalPES(PES):
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)
         self.atoms.positions = y[:nxa].reshape((-1, 3))
-        self.dummies.positions = y[nxa : nxa+nxd].reshape((-1, 3))
+        self.dummies.positions = y[nxa:nxa + nxd].reshape((-1, 3))
 
     def get_x(self):
         return self.int.get_q(self.apos, self.dpos)
@@ -355,7 +346,6 @@ class InternalPES(PES):
         D_cons = self.cons.get_D(self.apos, self.dpos)
         D_int = self.int.get_D(self.apos, self.dpos)
 
-        B_cons = self.cons.get_B(self.apos, self.dpos)
         Binv_int = self.int.get_Binv(self.apos, self.dpos)
 
         L_cons = self.curr['L']
@@ -392,14 +382,12 @@ class InternalPES(PES):
 
         # Calculate B matrix and its inverse for new and old internals
         Blast = self.int.get_B(self.apos, self.dpos)
-        Binvlast = self.int.get_Binv(self.apos, self.dpos)
         B = new_int.get_B(self.apos, new_dummies.positions)
         Binv = new_int.get_Binv(self.apos, new_dummies.positions)
         Dlast = self.int.get_D(self.apos, self.dpos)
         D = new_int.get_D(self.apos, new_dummies.positions)
 
         # Projection matrices
-        P = Blast @ Binv[:nold]
         P2 = B[:, nold:] @ Binv[nold:, :]
 
         # Update the info in self.curr
@@ -415,9 +403,8 @@ class InternalPES(PES):
         # use the guess hessian info.
         H = self.get_H().asarray()
         Hcart = Blast.T @ H @ Blast + Dlast.ldot(self.curr['g'])
-        Hnew = Binv.T[:, :nold] @ Hcart @ Binv[:nold] - Binv.T @ D.ldot(g) @ Binv
+        Hnew = Binv.T[:, :nold]@Hcart@Binv[:nold] - Binv.T@D.ldot(g) @ Binv
         Hnew += P2.T @ new_int.guess_hessian(self.atoms, new_dummies) @ P2.T
-        #Hnew = P.T @ H @ P + P2 @ new_int.guess_hessian(self.atoms, new_dummies) @ P2.T
         self.dim = len(x)
         self.set_H(Hnew)
 
@@ -445,12 +432,6 @@ class InternalPES(PES):
         Ufree = self.get_Ufree()
         B = self.int.get_B(self.apos, self.dpos)
         return -((Ufree @ Ufree.T) @ g @ B).reshape((-1, 3))
-
-    #def get_W(self):
-    #    Ufree = self.get_Ufree()
-    #    h0 = np.sqrt(self.int.guess_hessian(self.atoms, self.dummies))
-    #    Winv = np.linalg.pinv(Ufree.T @ h0 @ Ufree)
-    #    return Ufree @ Winv @ Ufree.T / np.linalg.det(Winv)**(1./len(Winv))
 
     def wrap_dx(self, dx):
         return self.int.dq_wrap(dx)
@@ -485,7 +466,6 @@ class InternalPES(PES):
     def _update_H(self):
         if self.last['x'] is None or self.last['g'] is None:
             return
-        #P = self.last['B'] @ self.int.get_Binv(self.apos, self.dpos)
         Unred = self.get_Unred()
         P = Unred @ Unred.T
         dx = P @ self.wrap_dx(self.curr['x'] - self.last['x'])
@@ -499,7 +479,8 @@ class InternalPES(PES):
             forces = np.zeros((len(self.atoms) + len(self.dummies), 3))
             forces[:len(self.atoms)] = self.atoms.calc.results['forces']
             atoms_tmp = self.atoms + self.dummies
-            atoms_tmp.calc = SinglePointCalculator(atoms_tmp, energy=energy, forces=forces)
+            atoms_tmp.calc = SinglePointCalculator(atoms_tmp, energy=energy,
+                                                   forces=forces)
             self.traj.write(atoms_tmp)
 
     def _update(self, feval=True):

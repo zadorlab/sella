@@ -1,6 +1,5 @@
 import numpy as np
 from ase import Atom, Atoms
-from ase.visualize import view
 
 _MAX_BONDS = 20
 
@@ -45,6 +44,7 @@ def check_if_planar(dxs, atol):
     angles = np.arccos(dxs @ VT[:, 2])
     return np.max(angles) - np.min(angles) > atol
 
+
 def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
     atoms = atoms.copy()
     natoms = len(atoms)
@@ -58,7 +58,6 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
     if dinds is None:
         dinds = -np.ones(natoms, dtype=np.int32)
 
-    nbonds_tot = len(bonds)
     angles = []
 
     bond_constraints = []
@@ -66,8 +65,6 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
     angle_sums = []
     angle_diffs = []
     dihedral_constraints = []
-
-    #atol *= 180 / np.pi
 
     for j, nj in enumerate(nbonds):
         if nj == 0:
@@ -99,7 +96,8 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
                 if check_if_planar(dxs, atol):
                     dinds[j] = natoms + ndummies
 
-                    linear = sorted(linear, key=lambda x: atoms.get_distance(x[0], j))
+                    linear = sorted(linear,
+                                    key=lambda x: atoms.get_distance(x[0], j))
                     a = linear[0][0]
                     if len(linear) == 1:
                         i, k = linear[0]
@@ -134,7 +132,6 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
                     angles.append([i, j, dinds[j]])
 
     allatoms = atoms + dummies
-    #view(allatoms)
     # verify constraints are correct
     for i, j in bond_constraints:
         rij = allatoms.get_distance(i, j)
@@ -156,7 +153,6 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
 
 
 def find_dihedrals(atoms, atol, bonds, angles, nbonds, c10y, dinds):
-    #atol *= 180 / np.pi
     nreal = len(c10y)
     dihedrals = []
     for i, j, k in angles:
@@ -167,6 +163,7 @@ def find_dihedrals(atoms, atol, bonds, angles, nbonds, c10y, dinds):
             if dinds[n] > 0:
                 bonds_n.append(dinds[n])
             for l in bonds_n:
-                if l > m and l != j and atol < atoms.get_angle(j, n, l) < 180 - atol:
+                if (l > m and l != j
+                        and atol < atoms.get_angle(j, n, l) < 180 - atol):
                     dihedrals.append([m, j, n, l])
     return np.array(dihedrals, dtype=np.int32).reshape((-1, 4))

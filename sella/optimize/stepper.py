@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.linalg import eigh
 
+
 # Classes for optimization algorithms (e.g. MMF, Newton, RFO)
 class BaseStepper:
     alpha0 = None
@@ -92,7 +93,8 @@ class RationalFunctionOptimization(BaseStepper):
     synonyms = ['rfo', 'rational function optimization']
 
     def _stepper_init(self):
-        self.A = np.block([[self.H.asarray(), self.g[:, np.newaxis]], [self.g, 0]])
+        self.A = np.block([[self.H.asarray(), self.g[:, np.newaxis]],
+                           [self.g, 0]])
 
     def get_s(self, alpha):
         A = self.A * alpha
@@ -138,8 +140,10 @@ class PartitionedRationalFunctionOptimization(RationalFunctionOptimization):
         dsda = self.Vmax @ dsmaxda + self.Vmin @ dsminda
         return s, dsda
 
+
 _all_steppers = [QuasiNewton, RationalFunctionOptimization,
                  PartitionedRationalFunctionOptimization]
+
 
 def get_stepper(name):
     for stepper in _all_steppers:

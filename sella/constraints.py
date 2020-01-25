@@ -1,5 +1,3 @@
-import warnings
-
 from collections import Sequence
 
 import numpy as np
@@ -11,6 +9,7 @@ from sella.internal.int_classes import Constraints
 
 _con_kinds = ['cart', 'bonds', 'angles', 'dihedrals',
               'angle_sums', 'angle_diffs']
+
 
 def _sort_indices(indices):
     if indices[0] > indices[-1]:
@@ -181,6 +180,7 @@ def merge_internal_constraints(con_user, target_user, bcons, acons, dcons,
 
     return con_out, target_out
 
+
 def cons_to_dict(cons):
     # dict for combined user/generated constraints and targets
     con_out = {key: [] for key in _con_kinds}
@@ -215,6 +215,7 @@ def get_constraints(atoms, con, target, dummies=None, dinds=None,
                        proj_trans=proj_trans,
                        proj_rot=proj_rot,
                        **con_arrays)
+
 
 def _ase_constraints_to_dict(constraints):
     cart = set()

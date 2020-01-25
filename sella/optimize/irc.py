@@ -32,10 +32,12 @@ class IRC(Optimizer):
                 self.atoms.set_masses('defaults')
 
         self.sqrtm = np.repeat(np.sqrt(self.atoms.get_masses()), 3)
+
         def get_W(self):
             return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))
         PES.get_W = get_W
-        self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False, **kwargs)
+        self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False,
+                       **kwargs)
 
         self.lastrun = None
         self.x0 = self.pes.get_x()
@@ -82,7 +84,8 @@ class IRC(Optimizer):
     def step(self):
         x0 = self.pes.get_x()
         for n in range(100):
-            s, smag = IRCTrustRegion(self.pes, 0, self.dx, method=QuasiNewtonIRC,
+            s, smag = IRCTrustRegion(self.pes, 0, self.dx,
+                                     method=QuasiNewtonIRC,
                                      sqrtm=self.sqrtm, d1=self.d1).get_s()
             bound_clip = abs(smag - self.dx) < 1e-8
             self.d1 += s

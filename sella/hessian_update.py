@@ -6,6 +6,7 @@ import numpy as np
 
 from scipy.linalg import eigh, lstsq, solve
 
+
 def symmetrize_Y2(S, Y):
     _, nvecs = S.shape
     dY = np.zeros_like(Y)
@@ -19,6 +20,7 @@ def symmetrize_Y2(S, Y):
         dY[:, i] = -S[:, :i] @ RHS
         dYTS[i, :] = -STS[:, :i] @ RHS
     return dY
+
 
 def symmetrize_Y(S, Y, symm):
     if symm is None or S.shape[1] == 1:

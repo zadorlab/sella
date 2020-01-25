@@ -1,6 +1,6 @@
 import numpy as np
 
-from scipy.linalg import eigh, lstsq, solve, null_space
+from scipy.linalg import eigh, solve
 
 from sella.utilities.math import modified_gram_schmidt
 from .hessian_update import symmetrize_Y
@@ -112,11 +112,6 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
                 if t.shape[1] == 0:
                     return lams, V, AV
 
-            ## If Lanczos also fails to find a new search direction,
-            ## just give up and return the current Ritz pairs
-            #if t.shape[1] == 0:
-            #    return lams, V, AV
-
         V = np.hstack([V, t])
         AV = np.hstack([AV, A.dot(t)])
 
@@ -124,7 +119,6 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
 def expand(V, Y, P, B, lams, vecs, shift, method='jd0', seeking=0):
     d, n = V.shape
     R = Y @ vecs - B @ V @ vecs * lams[np.newaxis, :]
-    I = np.eye(d)
     Pshift = P - shift * B
     if method == 'lanczos':
         return R[:, seeking]
