@@ -1,9 +1,12 @@
 #!/usr/bin/env python
+import sys
 import os
 
 import numpy as np
 
 from setuptools import setup, Extension, find_packages
+
+debug = '--debug' in sys.argv or '-g' in sys.argv
 
 try:
     from Cython.Build import cythonize
@@ -21,15 +24,20 @@ cy_files = [['force_match'],
             ['utilities', 'blas'],
             ['utilities', 'math']]
 
+macros = []
+if debug:
+    macros.append(('CYTHON_TRACE_NOGIL', '1'))
+
 ext_modules = []
 for cy_file in cy_files:
     ext_modules.append(Extension('.'.join(['sella', *cy_file]),
                                  [os.path.join('sella', *cy_file) + cy_suff],
-                                 define_macros=[('CYTHON_TRACE_NOGIL', '1')]))
+                                 define_macros=macros))
 
 if use_cython:
-    ext_modules = cythonize(ext_modules,
-                            compiler_directives={'linetrace': True})
+    compdir = dict(linetrace=debug, boundscheck=debug, language_level=3,
+                   wraparound=False, cdivision=True)
+    ext_modules = cythonize(ext_modules, compiler_directives=compdir)
 
 with open('README.md', 'r') as f:
     long_description = f.read()

@@ -10,7 +10,7 @@ from sella.internal.int_find import find_bonds
 #from sella.internal.int_find import find_bonds, find_angles, find_dihedrals
 from sella.internal.int_classes import CartToInternal
 
-_cons_shapes = dict(fix=2, bonds=2, angles=3, dihedrals=4, angle_sums=4, angle_diffs=4)
+_cons_shapes = dict(cart=2, bonds=2, angles=3, dihedrals=4, angle_sums=4, angle_diffs=4)
 
 def extract_dummy_constraints(natoms, con_user):
     con_dummy = dict()

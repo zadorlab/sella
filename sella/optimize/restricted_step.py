@@ -1,38 +1,41 @@
 import numpy as np
+import inspect
 
-from .stepper import get_stepper, NaiveStepper
+from .stepper import get_stepper, BaseStepper, NaiveStepper
 
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)
 class BaseRestrictedStep:
     synonyms = None
 
-    def __init__(self, pes, order, delta, method='qn', dx1=None,
-                 tol=1e-15, maxiter=1000):
+    def __init__(self, pes, order, delta, method='qn',
+                 tol=1e-15, maxiter=1000, d1=None):
         self.pes = pes
         self.delta = delta
-
-        stepper = get_stepper(method.lower())
+        self.d1 = d1
+        g0 = self.pes.get_g()
 
         self.scons = self.pes.get_scons()
         # TODO: Should this be HL instead of H?
-        g = self.pes.get_g() + self.pes.get_H() @ self.scons
+        g = g0 + self.pes.get_H() @ self.scons
 
-        self.dx1 = dx1
-        if self.dx1 is None:
-            self.dx1 = np.zeros_like(self.scons)
+        if inspect.isclass(method) and issubclass(method, BaseStepper):
+            stepper = method
+        else:
+            stepper = get_stepper(method.lower())
 
-        assert self.cons(self.dx1) < self.delta
-
-        if self.cons(self.dx1 + self.scons) >= self.delta:
+        if self.cons(self.scons) - self.delta > 1e-8:
             self.P = self.pes.get_Unred().T
             dx = self.P @ self.scons
             self.stepper = NaiveStepper(dx)
             self.scons[:] *= 0
         else:
             self.P = self.pes.get_Ufree().T @ self.pes.get_W()
+            d1 = self.d1
+            if d1 is not None:
+                d1 = np.linalg.lstsq(self.P.T, d1, rcond=None)[0]
             self.stepper = stepper(self.P @ g,
                                    self.pes.get_HL().project(self.P.T),
-                                   order)
+                                   order, d1=d1)
 
         self.tol = tol
         self.maxiter = maxiter
@@ -42,7 +45,7 @@ class BaseRestrictedStep:
 
     def eval(self, alpha):
         s, dsda = self.stepper.get_s(alpha)
-        stot = self.P.T @ s + self.dx1 + self.scons
+        stot = self.P.T @ s + self.scons
         val, dval = self.cons(stot, self.P.T @ dsda)
         return stot, val, dval
 
@@ -59,7 +62,6 @@ class BaseRestrictedStep:
         upper = self.stepper.alphamax
 
         for niter in range(self.maxiter):
-            #print(alpha, err, lower, upper)
             if abs(err) <= self.tol:
                 break
 
@@ -75,7 +77,7 @@ class BaseRestrictedStep:
             if np.isnan(a1) or a1 <= lower or a1 >= upper or niter > 4:
                 a2 = (lower + upper) / 2.
                 if np.isinf(a2):
-                    alpha = alpha + 1.0 * np.sign(a2)
+                    alpha = alpha + max(1, 0.5 * alpha) * np.sign(a2)
                 else:
                     alpha = a2
             else:
@@ -93,7 +95,6 @@ class BaseRestrictedStep:
     def match(cls, name):
         return name in cls.synonyms
 
-
 class TrustRegion(BaseRestrictedStep):
     synonyms = ['tr', 'trust region', 'trust-region', 'trust radius',
                 'trust-radius']
@@ -106,6 +107,20 @@ class TrustRegion(BaseRestrictedStep):
         dval = dsda @ s / val
         return val, dval
 
+class IRCTrustRegion(TrustRegion):
+    synonyms = []
+
+    def __init__(self, *args, sqrtm=None, **kwargs):
+        assert sqrtm is not None
+        self.sqrtm = sqrtm
+        TrustRegion.__init__(self, *args, **kwargs)
+        assert self.d1 is not None
+
+    def cons(self, s, dsda=None):
+        s = (s + self.d1) * self.sqrtm
+        if dsda is not None:
+            dsda = dsda * self.sqrtm
+        return TrustRegion.cons(self, s, dsda)
 
 class RestrictedAtomicStep(BaseRestrictedStep):
     synonyms = ['ras', 'restricted atomic step']

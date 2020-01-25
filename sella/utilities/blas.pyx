@@ -1,8 +1,3 @@
-# cython: language_level=3
-# cython: boundscheck=False
-# cython: wraparound=False
-# cython: cdivision=True
-
 from libc.math cimport INFINITY
 from scipy.linalg.cython_blas cimport (dasum, daxpy, dcopy, ddot, dnrm2,
                                        dscal, dswap, dgemv, dgemm, dger)

@@ -1,8 +1,4 @@
-# cython: language_level=3
-
 # cimports
-
-cimport cython
 
 from libc.math cimport sqrt, atan2
 from libc.string cimport memset
@@ -24,9 +20,6 @@ cdef int THREE = 3
 cdef int NINE = 9
 cdef int EIGHTYONE = 81
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef int cart_to_bond(int a,
                       int b,
                       double[:] dx,
@@ -78,9 +71,6 @@ cdef int cart_to_bond(int a,
            &d2q[1, 0, 0, 0], &sd_d2q)
     return info
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef int cart_to_angle(int a,
                        int b,
                        int c,
@@ -222,9 +212,6 @@ cdef int cart_to_angle(int a,
                                                  - d2q_int[1, i, 1, j])
     return 0
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef int cart_to_dihedral(int a,
                           int b,
                           int c,

@@ -6,7 +6,7 @@ from sella.utilities.math import pseudo_inverse, modified_gram_schmidt
 from test_utils import get_matrix
 
 import pyximport
-pyximport.install()
+pyximport.install(language_level=3)
 from math_wrappers import wrappers
 
 # TODO: figure out why m > n crashes

@@ -1,8 +1,4 @@
-# cython: language_level=3
-
 # cimports
-
-cimport cython
 
 from libc.math cimport fabs, acos, pi, HUGE_VAL
 from libc.string cimport memset
@@ -27,9 +23,6 @@ cdef int UNITY = 1
 cdef int THREE = 3
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef int flood_fill(int idx, int[:] nbonds, int[:, :] c10y, int[:] labels,
                     int label) nogil:
     cdef int i, j, info
@@ -43,9 +36,6 @@ cdef int flood_fill(int idx, int[:] nbonds, int[:, :] c10y, int[:] labels,
     return 0
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 def find_bonds(atoms):
     cdef int natoms = len(atoms)
     cdef int i, j, k, err
@@ -363,9 +353,6 @@ cdef int find_dummy_improper(double[:, :] pos, double[:] dpos, double[:] dx1,
     return 0
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
                 int[:, :] c10y, dummies=None, dinds_np=None):
     cdef int i, j, k, l, nj, a, b
@@ -658,9 +645,6 @@ def find_angles(atoms, double atol, int[:, :] bonds, int[:] nbonds,
             angle_diffs[:nangle_diffs])
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 def find_dihedrals(atoms, double atol, int[:, :] bonds, int[:, :] angles,
                    int[:] nbonds, int[:, :] c10y, int[:] dinds):
     cdef int i, j, k, l, a, b, err

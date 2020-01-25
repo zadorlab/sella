@@ -1,7 +1,3 @@
-# cython: language_level=3
-
-cimport cython
-
 from libc.math cimport sqrt, fabs, INFINITY
 from libc.string cimport memset
 from scipy.linalg.cython_blas cimport daxpy, dnrm2, dcopy, dgemv, ddot, dger
@@ -15,9 +11,6 @@ cdef double DUNITY = 1.
 cdef double DZERO = 0.
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef inline int normalize(double[:] x) nogil:
     """Normalizes a vector in place"""
     cdef int n = len(x)
@@ -29,9 +22,6 @@ cdef inline int normalize(double[:] x) nogil:
     return 0
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef inline int vec_sum(double[:] x, double[:] y, double[:] z,
                         double scale=1.) nogil:
     """Evaluates z[:] = x[:] + scale * y[:]"""
@@ -47,9 +37,6 @@ cdef inline int vec_sum(double[:] x, double[:] y, double[:] z,
     daxpy(&n, &scale, &y[0], &sdy, &z[0], &sdz)
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef inline void cross(double[:] x, double[:] y, double[:] z) nogil:
     """Evaluates z[:] = x[:] cross y[:]"""
     z[0] = x[1] * y[2] - y[1] * x[2]
@@ -57,9 +44,6 @@ cdef inline void cross(double[:] x, double[:] y, double[:] z) nogil:
     z[2] = x[0] * y[1] - y[0] * x[1]
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef inline void symmetrize(double* X, size_t n, size_t lda) nogil:
     """Symmetrizes matrix X by populating the lower triangle with the
     contents of the upper triangle"""
@@ -69,9 +53,6 @@ cdef inline void symmetrize(double* X, size_t n, size_t lda) nogil:
             X[j * lda + i] = X[i * lda + j]
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef inline void skew(double[:] x, double[:, :] Y, double scale=1.) nogil:
     """Fillx matrix Y with the elements of vectors scale * x such that
     Y becomes a skew-symmetric matrix"""
@@ -90,9 +71,6 @@ cdef inline void skew(double[:] x, double[:, :] Y, double scale=1.) nogil:
     Y[0, 1] = -Y[1, 0]
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
              double eps2=1e-6, int maxiter=100) nogil:
     """Orthonormalizes X in-place against itself and Y. To accomplish this, Y
@@ -108,7 +86,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
         ny = 0
         sdy = -1
     else:
-        if Y.shape[0] != n:  # pragma: no cover
+        if Y.shape[0] != n:
             return -1
         ny = Y.shape[1]
         sdy = Y.strides[0] >> 3
@@ -121,7 +99,6 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
     for i in range(nx):
         if i != m:
             X[:, m] = X[:, i]
-            #dcopy(&n, &X[0, i], &sdx, &X[0, m], &sdx)
         norm = dnrm2(&n, &X[0, m], &sdx)
         for k in range(n):
             X[k, m] /= norm
@@ -152,7 +129,7 @@ cdef int mgs(double[:, :] X, double[:, :] Y=None, double eps1=1e-15,
             elif 0. <= 1. - normtot <= eps1:
                 m += 1
                 break
-        else:  # pragma: no cover
+        else:
             return -2
 
     # Just for good measure, zero out any leftover bits of X
@@ -177,14 +154,11 @@ def modified_gram_schmidt(Xin, Yin=None, eps1=1.e-15, eps2=1.e-6,
 
     Xout = Xin.copy()
     nx = mgs(Xout, Yout, eps1=eps1, eps2=eps2, maxiter=maxiter)
-    if nx < 0:  # pragma: no cover
+    if nx < 0:
         raise RuntimeError("MGS failed.")
     return Xout[:, :nx]
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
               double[:] s, double[:, :] Ainv, double[:] work,
               double eps=1e-6) nogil:
@@ -192,9 +166,9 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
     Ainv. This is done using singular value decomposition. Additionally, saves
     the right singular values in VT. A is then populated with the columns of
     VT that correspond to the null space of the singular vectors."""
-    if A.shape[0] < n:  # pragma: no cover
+    if A.shape[0] < n:
         return -1
-    if A.shape[1] < m:  # pragma: no cover
+    if A.shape[1] < m:
         return -1
 
     cdef int minnm = min(n, m)
@@ -203,7 +177,7 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
     cdef int ldvt = VT.strides[0] >> 3
 
     cdef int ns = s.shape[0]
-    if ns < minnm:  # pragma: no cover
+    if ns < minnm:
         return -1
 
     cdef int lwork = work.shape[0]
@@ -211,7 +185,7 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
 
     dgesvd('A', 'S', &m, &n, &A[0, 0], &lda, &s[0], &VT[0, 0], &ldvt,
            &U[0, 0], &ldu, &work[0], &lwork, &info)
-    if info != 0:  # pragma: no cover
+    if info != 0:
         return -1
 
     memset(&Ainv[0, 0], 0, Ainv.shape[0] * Ainv.shape[1] * sizeof(double))
@@ -242,9 +216,6 @@ cdef int mppi(int n, int m, double[:, :] A, double[:, :] U, double[:, :] VT,
     return nsing
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 def pseudo_inverse(double[:, :] A, double eps=1e-6):
     cdef int n, m, minnm, maxnm
     n, m = A.shape[:2]
@@ -259,7 +230,7 @@ def pseudo_inverse(double[:, :] A, double eps=1e-6):
 
     nsing = mppi(n, m, A, U, VT, s, Ainv, work, eps=eps)
 
-    if nsing == -1:  # pragma: no cover
+    if nsing == -1:
         raise RuntimeError("mmpi failed!")
 
     return U, s, VT, Ainv, nsing

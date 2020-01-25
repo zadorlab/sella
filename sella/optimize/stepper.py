@@ -10,10 +10,11 @@ class BaseStepper:
     slope = None
     synonyms = None
 
-    def __init__(self, g, H, order=0):
+    def __init__(self, g, H, order=0, d1=None):
         self.g = g
         self.H = H
         self.order = order
+        self.d1 = d1
         self._stepper_init()
 
     @classmethod
@@ -21,10 +22,10 @@ class BaseStepper:
         return name in cls.synonyms
 
     def _stepper_init(self):
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover
 
     def get_s(self, alpha):
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover
 
 
 class NaiveStepper(BaseStepper):
@@ -65,6 +66,21 @@ class QuasiNewton(BaseStepper):
         sproj = self.Vg / denom
         s = -self.V @ sproj
         dsda = self.V @ (sproj / denom)
+        return s, dsda
+
+
+class QuasiNewtonIRC(QuasiNewton):
+    synonyms = []
+
+    def _stepper_init(self):
+        QuasiNewton._stepper_init(self)
+        self.Vd1 = self.V.T @ self.d1
+
+    def get_s(self, alpha):
+        denom = np.abs(self.L) + alpha
+        sproj = -(self.Vg + alpha * self.Vd1) / denom
+        s = self.V @ sproj
+        dsda = -self.V @ ((sproj + self.Vd1) / denom)
         return s, dsda
 
 

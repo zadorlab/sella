@@ -5,3 +5,6 @@ omit =
     tests
     *__init__.py
     *.pxd
+[report]
+exclude_lines =
+    pragma: no cover

@@ -1,6 +1,3 @@
-# cython: language_level=3
-
-cimport cython
 from cython.view cimport array as cvarray
 
 cimport numpy as np
@@ -62,7 +59,7 @@ cdef void init_pair_interactions(pair_interactions* pi, dict data):
     cdef int npairs
 
     cdef int nint = len(data)
-    
+
     pi[0].nint = nint
     pi[0].npairs = <int*> malloc(sizeof(int*) * nint)
     pi[0].indices = <int**> malloc(sizeof(int*) * nint)
@@ -157,7 +154,7 @@ def force_match(atoms, types=['buck', 'bond']):
     cdef double dij2
     cdef double dij
     cdef double rcut2 = rcut * rcut
-    
+
     rij_t = np.zeros(3, dtype=np.float64)
     cdef double[:] rij_t_mv = memoryview(rij_t)
 
@@ -208,7 +205,7 @@ def force_match(atoms, types=['buck', 'bond']):
                         x0.append(2.5)
                         brute_range.append((0.1, 10.0))
                     vdw_x.append(((i, j), rij_t.copy()))
-                
+
                 if do_morse:
                     vdw_x = ff_data['morse'].get(eij)
                     if vdw_x is None:
@@ -239,13 +236,13 @@ def force_match(atoms, types=['buck', 'bond']):
     init_pair_interactions(&buck_interactions, ff_data['buck'])
     init_pair_interactions(&morse_interactions, ff_data['morse'])
     init_pair_interactions(&bond_interactions, ff_data['bond'])
-    
+
     dFlin = cvarray(shape=(natoms, 3, nlin), itemsize=sizeof(double), format='d')
     dFnonlin = cvarray(shape=(natoms, 3, nnonlin, nlin), itemsize=sizeof(double), format='d')
 
     memset(&dFlin[0, 0, 0], 0, sizeof(double) * ndof * nlin)
     memset(&dFnonlin[0, 0, 0, 0], 0, sizeof(double) * ndof * nnonlin * nlin)
-    
+
     constraints = []
     if atoms.constraints:
         constraints = atoms.constraints
@@ -281,7 +278,7 @@ def force_match(atoms, types=['buck', 'bond']):
     free_pair_interactions(&bond_interactions)
 
     return hess
-    
+
 def objective(pars, int ndof, int nlin, int natoms, np.ndarray[np.float_t, ndim=2] ftrue, bint grad=False, bint ret_linpars=False):
     global dFlin
     global dFnonlin
@@ -451,9 +448,6 @@ def calc_hess(linpars, nonlinpars, natoms):
 
     return hess_np.reshape((3 * natoms, 3 * natoms))
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void update_hess(int i, int j, double* xij, double[:, :, :, :] hess, double diag, double rest) nogil:
     cdef int k
     cdef int a
@@ -479,9 +473,6 @@ cdef void update_hess(int i, int j, double* xij, double[:, :, :, :] hess, double
             hess[j, a, j, k] += hessterm
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void lj(int i, int j, int linstart, double* xij) nogil:
     cdef double dij
     cdef double dij2
@@ -492,11 +483,11 @@ cdef void lj(int i, int j, int linstart, double* xij) nogil:
     cdef int k
 
     global dFlin
-    
+
     dij2 = 0.
     for k in range(3):
         dij2 += xij[k] * xij[k]
-    
+
     dij = sqrt(dij2)
     dij8 = dij2 * dij2 * dij2 * dij2
     dij14 = dij8 * dij2 * dij2 * dij2
@@ -512,9 +503,6 @@ cdef void lj(int i, int j, int linstart, double* xij) nogil:
         dFlin[j, k, linstart] += -f6 * xij[k]
         dFlin[j, k, linstart + 1] += -f12 * xij[k]
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void lj_hess(int i, int j, double C6, double C12, double* xij, double[:, :, :, :] hess) nogil:
     cdef double dij2
     cdef double dij8
@@ -525,7 +513,7 @@ cdef void lj_hess(int i, int j, double C6, double C12, double* xij, double[:, :,
     cdef double rest
     cdef int k
     cdef int a
-     
+
 
     dij2 = 0.
     for k in range(3):
@@ -535,15 +523,12 @@ cdef void lj_hess(int i, int j, double C6, double C12, double* xij, double[:, :,
     dij10 = dij8 * dij2
     dij14 = dij10 * dij2 * dij2
     dij16 = dij8 * dij8
-    
+
     diag = -12 * C12 / dij14 + 6 * C6 / dij8
     rest = 168 * C12 / dij16 - 48 * C6 / dij10
 
     update_hess(i, j, xij, hess, diag, rest)
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void buck(int i, int j, int linstart, int nonlinstart,
                double* xij, double B) nogil:
     cdef double dij
@@ -564,11 +549,11 @@ cdef void buck(int i, int j, int linstart, int nonlinstart,
 
     dij = sqrt(dij2)
     dij8 = dij2 * dij2 * dij2 * dij2
-    
+
     expterm = exp(-B * dij)
     fexp = -B * expterm / dij
     dB = B * expterm - expterm / dij
-    
+
     f6 = 6. / dij8
 
     for k in range(3):
@@ -581,9 +566,6 @@ cdef void buck(int i, int j, int linstart, int nonlinstart,
         dFnonlin[i, k, nonlinstart, linstart] += dB * xij[k]
         dFnonlin[j, k, nonlinstart, linstart] -= dB * xij[k]
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void buck_hess(int i, int j, double A, double C6, double B, double* xij, double[:, :, :, :] hess) nogil:
     cdef double dij
     cdef double dij2
@@ -606,15 +588,12 @@ cdef void buck_hess(int i, int j, double A, double C6, double B, double* xij, do
     dij10 = dij8 * dij2
 
     expterm = exp(-B * dij)
-    
+
     diag = 6 * C6 / dij8 - A * B * expterm / dij
     rest = -48 * C6 / dij10 + A * B * expterm / dij3 + A * B * B * expterm / dij2
 
     update_hess(i, j, xij, hess, diag, rest)
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void morse(int i, int j, int linstart, int nonlinstart, double* xij, double rho) nogil:
     cdef double dij
     cdef double dij2
@@ -634,7 +613,7 @@ cdef void morse(int i, int j, int linstart, int nonlinstart, double* xij, double
         dij2 += xij[k] * xij[k]
 
     dij = sqrt(dij2)
-    
+
     expterm = exp(-rho * dij)
     expterm2 = expterm * expterm
     f_rep = -2 * rho * expterm2 / dij
@@ -655,9 +634,6 @@ cdef void morse(int i, int j, int linstart, int nonlinstart, double* xij, double
         dFnonlin[j, k, nonlinstart, linstart] -= drho_rep * xij[k]
         dFnonlin[j, k, nonlinstart, linstart + 1] -= drho_att * xij[k]
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void morse_hess(int i, int j, double A, double B, double rho, double* xij, double[:, :, :, :] hess) nogil:
     cdef double dij
     cdef double dij2
@@ -682,9 +658,6 @@ cdef void morse_hess(int i, int j, double A, double B, double rho, double* xij, 
 
     update_hess(i, j, xij, hess, diag, rest)
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void bond(int i, int j, int linstart, int nonlinstart, double* xij, double r0) nogil:
     cdef double dij
     cdef double dij2
@@ -711,9 +684,6 @@ cdef void bond(int i, int j, int linstart, int nonlinstart, double* xij, double 
         dFnonlin[i, k, nonlinstart, linstart] += dr0 * xij[k]
         dFnonlin[j, k, nonlinstart, linstart] -= dr0 * xij[k]
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
 cdef void bond_hess(int i, int j, double K, double r0, double* xij, double[:, :, :, :] hess) nogil:
     cdef double dij
     cdef double dij2

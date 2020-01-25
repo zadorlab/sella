@@ -22,8 +22,12 @@ class PES:
                  eigensolver='jd0',
                  trajectory=None,
                  eta=1e-4,
-                 v0=None):
+                 v0=None,
+                 proj_trans=True,
+                 proj_rot=True):
         self.atoms = atoms
+        self.proj_trans = proj_trans
+        self.proj_rot = proj_rot
         self.set_constraints(constraints)
         self.eigensolver = eigensolver
 
@@ -72,7 +76,9 @@ class PES:
 
     def set_constraints(self, c):
         self.con_user, self.target_user = merge_user_constraints(self.atoms, c)
-        self.cons = get_constraints(self.atoms, self.con_user, self.target_user)
+        self.cons = get_constraints(self.atoms, self.con_user, self.target_user,
+                                    proj_trans=self.proj_trans,
+                                    proj_rot=self.proj_rot)
 
     # Position getter/setter
     def set_x(self, target):

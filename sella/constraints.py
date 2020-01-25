@@ -9,7 +9,7 @@ from ase.constraints import (FixCartesian, FixAtoms, FixBondLengths,
 
 from sella.internal.int_classes import Constraints
 
-_con_kinds = ['fix', 'bonds', 'angles', 'dihedrals',
+_con_kinds = ['cart', 'bonds', 'angles', 'dihedrals',
               'angle_sums', 'angle_diffs']
 
 def _sort_indices(indices):
@@ -18,8 +18,9 @@ def _sort_indices(indices):
     return tuple(indices)
 
 
-def _add_check(arg, con):
-    ind = _sort_indices(arg)
+def _add_check(ind, con, sort=True):
+    if sort:
+        ind = _sort_indices(ind)
     ind_np = np.asarray(ind)
     for entry in con:
         if np.all(ind_np == np.asarray(entry)):
@@ -27,24 +28,24 @@ def _add_check(arg, con):
     con.append(ind)
 
 
-def _add_fix(atoms, arg, con, target):
+def _add_cart(atoms, arg, con, target):
     if isinstance(arg, Sequence):
         n = len(arg)
         if n == 1:
-            return _add_fix(atoms, arg[0], con, target)
+            return _add_cart(atoms, arg[0], con, target)
         elif n == 2:
             if isinstance(arg[1], (int, np.integer)):
                 if arg[1] >= 3:
-                    raise ValueError("Invalid fix constraint:", arg)
-                _add_check(tuple(arg), con)
+                    raise ValueError("Invalid cart constraint:", arg)
+                _add_check(tuple(arg), con, sort=False)
                 target.append(atoms.positions[tuple(arg)])
             else:
-                raise ValueError("Invalid fix constraint:", arg)
+                raise ValueError("Invalid cart constraint:", arg)
         else:
-            raise ValueError("Invalid fix constraint:", arg)
+            raise ValueError("Invalid cart constraint:", arg)
     elif isinstance(arg, (int, np.integer)):
         for i in range(3):
-            _add_check((arg, i), con)
+            _add_check((arg, i), con, sort=False)
             target.append(atoms.positions[arg, i])
 
 
@@ -131,7 +132,7 @@ def _add_angle_diff(atoms, arg, con, target):
         raise ValueError("Invalid angle diff constraint:", arg)
 
 
-_con_adders = dict(fix=_add_fix, bonds=_add_bond, angles=_add_angle,
+_con_adders = dict(cart=_add_cart, bonds=_add_bond, angles=_add_angle,
                    dihedrals=_add_dihedral, angle_sums=_add_angle_sum,
                    angle_diffs=_add_angle_diff)
 
@@ -187,11 +188,7 @@ def cons_to_dict(cons):
 
     tot = 0
     for kind in _con_kinds:
-        if kind == 'fix':
-            attr = 'cart'
-        else:
-            attr = kind
-        for row in np.asarray(getattr(cons, attr)):
+        for row in np.asarray(getattr(cons, kind)):
             con_out[kind].append(row)
             target_out[kind].append(cons.target[tot])
             tot += 1
@@ -220,20 +217,20 @@ def get_constraints(atoms, con, target, dummies=None, dinds=None,
                        **con_arrays)
 
 def _ase_constraints_to_dict(constraints):
-    fix = set()
+    cart = set()
     bonds = set()
     angles = set()
     dihedrals = set()
     for constraint in constraints:
         if isinstance(constraint, FixAtoms):
-            fix.update(set(constraint.index))
+            cart.update(set(constraint.index))
         elif isinstance(constraint, FixCartesian):
             idx = constraint.a
-            if idx in fix:
+            if idx in cart:
                 continue
             for i, xyz in enumerate(constraint.mask):
                 if xyz:
-                    fix.add((idx, i))
+                    cart.add((idx, i))
         elif isinstance(constraint, FixBondLengths):
             bonds.update(set(constraint.pairs))
         elif isinstance(constraint, FixInternals):
@@ -244,8 +241,8 @@ def _ase_constraints_to_dict(constraints):
             raise ValueError("Sella does not know how to handle the ASE {} "
                              "constraint object!".format(constraint))
     con = dict()
-    if fix:
-        con['fix'] = list(fix)
+    if cart:
+        con['cart'] = list(cart)
     if bonds:
         con['bonds'] = [_sort_indices(bond) for bond in bonds]
     if angles:
