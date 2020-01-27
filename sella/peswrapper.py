@@ -209,10 +209,10 @@ class PES:
         v0 = None
 
         if P.B is None:
-            P = np.eye(Unred.shape[1])
+            P = np.eye(len(self.get_x()))
             v0 = self.v0
             if v0 is None:
-                v0 = Unred.T @ self.get_g()
+                v0 = self.get_g() @ Unred
         else:
             P = P.asarray()
 
@@ -297,10 +297,6 @@ class InternalPES(PES):
             B = self.int.get_B(self.apos, self.dpos)
             P = B @ self.int.get_Binv(self.apos, self.dpos)
             H0 = P @ self.int.guess_hessian(self.atoms, self.dummies) @ P
-            # Invert curvature in direction of gradient
-            v0 = self.get_g()
-            v0 /= np.linalg.norm(v0)
-            H0 -= 2 * np.abs(v0.T @ H0 @ v0) * np.outer(v0, v0)
         self.set_H(H0)
 
         # Flag used to indicate that new internal coordinates are required
@@ -418,11 +414,10 @@ class InternalPES(PES):
     def get_df_pred(self, dx, g, H):
         if H is None:
             return None
-        B = self.int.get_B(self.apos, self.dpos)
-        Ured = modified_gram_schmidt(B @ B.T)
-        dx_r = self.wrap_dx(dx) @ Ured
-        g_r = g @ Ured
-        H_r = Ured.T @ H @ Ured
+        Unred = self.get_Unred()
+        dx_r = self.wrap_dx(dx) @ Unred
+        g_r = g @ Unred
+        H_r = Unred.T @ H @ Unred
         return g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
 
     # FIXME: temporary functions for backwards compatibility

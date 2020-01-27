@@ -662,9 +662,17 @@ cdef class CartToInternal:
         dq_out[:] = dq[:]
         cdef int ncba = self.ncart + self.nbonds + self.nangles
         cdef int i
+        cdef int err = 0
         with nogil:
             for i in range(self.ndihedrals):
                 dq_out[ncba + i] = (dq_out[ncba + i] + pi) % (2 * pi) - pi
+                if dq_out[ncba + i] < -pi:
+                    dq_out[ncba + i] += 2 * pi
+                if not (-pi < dq_out[ncba + i] < pi):
+                    err = 1
+                    break
+        if err == 1:
+            raise RuntimeError('dq_wrap failed unexpectedly!')
         return dq_out_np
 
     def check_for_bad_internal(CartToInternal self, double[:, :] pos,
