@@ -266,7 +266,7 @@ class PES:
         x0 = self.get_x()
         f0 = self.get_f()
         g0 = self.get_g()
-        B0 = self.H.B
+        B0 = self.H.asarray()
 
         self.set_x(x0 + dx)
 
