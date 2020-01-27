@@ -194,8 +194,11 @@ class ApproximateHessian(LinearOperator):
         return self.matmat(X)
 
     def __add__(self, other):
-        B = self.B
-        if B is None:
-            B = np.eye(self.dim)
-        return ApproximateHessian(self.dim, B + other, self.update_method,
+        if isinstance(other, ApproximateHessian):
+            other = other.B
+        if self.B is None or other is None:
+            tot = None
+        else:
+            tot = self.B + other
+        return ApproximateHessian(self.dim, tot, self.update_method,
                                   self.symm)

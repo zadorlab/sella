@@ -97,7 +97,6 @@ class Sella(Optimizer):
         self.eta = eta
         self.delta_min = self.eta
         self.constraints_tol = constraints_tol
-        self.niter = 0
         self.peskwargs = dict(gamma=gamma, threepoint=threepoint)
         self.rho = 1.
 
@@ -124,13 +123,16 @@ class Sella(Optimizer):
         s, smag = self._predict_step()
 
         # Determine if we need to call the eigensolver, then step
-        if self.eig and self.pes.H.evals is not None:
-            Unred = self.pes.get_Unred()
-            ev = self.pes.get_HL().project(Unred).evals[:self.ord] > 0
+        if self.eig:
+            if self.pes.H.evals is None:
+                ev = True
+            else:
+                Unred = self.pes.get_Unred()
+                ev = (self.pes.get_HL().project(Unred)
+                                       .evals[:self.ord] > 0).all()
         else:
             ev = False
         rho = self.pes.kick(s, ev, **self.peskwargs)
-        self.niter += 1
 
         # Update trust radius
         if rho is None:
