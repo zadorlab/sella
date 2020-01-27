@@ -46,7 +46,7 @@ with open('requirements.txt', 'r') as f:
     install_requires = f.read().strip().split()
 
 setup(name='Sella',
-      version='0.1.1',
+      version='1.0.0',
       author='Eric Hermes',
       author_email='ehermes@sandia.gov',
       long_description=long_description,
@@ -54,7 +54,7 @@ setup(name='Sella',
       packages=find_packages(),
       ext_modules=ext_modules,
       include_dirs=[np.get_include()],
-      classifiers=['Development Status :: 3 - Alpha',
+      classifiers=['Development Status :: 4 - Beta',
                    'Environment :: Console',
                    'Intended Audience :: Science/Research',
                    'License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)',
