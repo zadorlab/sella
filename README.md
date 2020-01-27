@@ -19,14 +19,14 @@ add_adsorbate(slab, 'Cu', 2.0, 'bridge')
 
 # Define any constraints. Here we fix all atoms in the bottom half
 # of the slab.
-fix = [atom.index for atom in slab if atom.position[2] < slab.cell[2, 2] / 2.]
+cart = [atom.index for atom in slab if atom.position[2] < slab.cell[2, 2] / 2.]
 
 # Set up your calculator
 slab.calc = EMT()
 
 # Set up a Sella Dynamics object
 dyn = Sella(slab,
-            constraints=dict(fix=fix),
+            constraints=dict(cart=cart),
             trajectory='test_emt.traj')
 
 dyn.run(1e-3, 1000)
