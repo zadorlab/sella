@@ -129,7 +129,7 @@ class Sella(Optimizer):
             else:
                 Unred = self.pes.get_Unred()
                 ev = (self.pes.get_HL().project(Unred)
-                                       .evals[:self.ord] > 0).all()
+                                       .evals[:self.ord] > 0).any()
         else:
             ev = False
         rho = self.pes.kick(s, ev, **self.peskwargs)

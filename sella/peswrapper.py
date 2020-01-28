@@ -340,14 +340,8 @@ class InternalPES(PES):
     # Hessian of the constraints
     def get_Hc(self):
         D_cons = self.cons.get_D(self.apos, self.dpos)
-        D_int = self.int.get_D(self.apos, self.dpos)
-
         Binv_int = self.int.get_Binv(self.apos, self.dpos)
-
-        L_cons = self.curr['L']
-        L_int = self.curr['g']
-
-        Hc = Binv_int.T @ (D_cons.ldot(L_cons) - D_int.ldot(L_int)) @ Binv_int
+        Hc = Binv_int.T @ D_cons.ldot(self.curr['L']) @ Binv_int
         return Hc
 
     def get_drdx(self):
