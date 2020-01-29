@@ -9,6 +9,10 @@ from scipy.linalg.cython_lapack cimport dlacpy, dlaset, dlascl
 from sella.utilities.blas cimport my_daxpy, my_ddot, my_dger
 from sella.utilities.math cimport vec_sum, cross, symmetrize, skew
 
+# imports
+
+import numpy as np
+
 # Constants for BLAS/LAPACK calls
 cdef double DNTWO = -2.
 cdef double DNUNITY = -1.
@@ -70,6 +74,35 @@ cdef int cart_to_bond(int a,
     dlacpy('G', &THREE, &THREE, &d2q[0, 0, 1, 0], &sd_d2q,
            &d2q[1, 0, 0, 0], &sd_d2q)
     return info
+
+def get_bond(atoms, int i, int j, grad=False):
+    cdef int natoms = len(atoms)
+    dx_np = np.zeros(3)
+    cdef double[:] dx = memoryview(dx_np)
+    cdef double[:, :] pos = memoryview(atoms.positions)
+    cdef int err
+    err = vec_sum(pos[i], pos[j], dx, -1.)
+    if err != 0:
+        raise RuntimeError("get_bond failed!")
+
+    cdef double q
+
+    if grad:
+        dq_np = np.zeros((natoms, 3))
+    else:
+        dq_np = np.empty((0, 3))
+
+    cdef double[:, :] dq = memoryview(dq_np)
+
+    d2q_np = np.empty((0, 3, 0, 3))
+    cdef double[:, :, :, :] d2q = memoryview(d2q_np)
+
+    cart_to_bond(0, 1, dx, &q, dq, d2q, grad, False)
+
+    if not grad:
+        return q
+    else:
+        return q, dq_np
 
 cdef int cart_to_angle(int a,
                        int b,

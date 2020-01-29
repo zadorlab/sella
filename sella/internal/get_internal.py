@@ -3,6 +3,7 @@ import numpy as np
 from sella.constraints import (get_constraints, merge_internal_constraints,
                                cons_to_dict)
 from .int_find2 import find_angles, find_dihedrals
+from sella.internal.int_eval import get_bond
 from sella.internal.int_find import find_bonds
 from sella.internal.int_classes import CartToInternal
 
@@ -20,16 +21,40 @@ def extract_dummy_constraints(natoms, con_user):
         con_dummy[key] = np.array(data, dtype=np.int32).reshape((-1, size))
     return con_dummy
 
+def check_bad_bonds(atoms, bonds):
+    if bonds is None:
+        out = np.empty((0, 2), dtype=np.int32)
+        return out, out
+    added_bonds = []
+    forbidden_bonds = []
+    g = -atoms.get_forces().ravel()
+    for i, j in bonds:
+        q, dqdx = get_bond(atoms, i, j, grad=True)
+        if (dqdx.ravel() @ g) > 0:
+            added_bonds.append([i, j])
+        else:
+            forbidden_bonds.append([i, j])
+    added_bonds = np.array(added_bonds, dtype=np.int32)
+    if added_bonds.size == 0:
+        added_bonds = np.empty((0, 2), dtype=np.int32)
+    forbidden_bonds = np.array(forbidden_bonds, dtype=np.int32)
+    if forbidden_bonds.size == 0:
+        forbidden_bonds = np.empty((0, 2), dtype=np.int32)
+    return added_bonds, forbidden_bonds
+
 
 def get_internal(atoms, con_user=None, target_user=None, atol=15.,
-                 dummies=None, conslast=None):
+                 dummies=None, conslast=None, check_bonds=None,
+                 check_angles=None):
     if con_user is None:
         con_user = dict()
 
     if target_user is None:
         target_user = dict()
 
-    bonds, nbonds, c10y = find_bonds(atoms)
+    added_bonds, forbidden_bonds = check_bad_bonds(atoms, check_bonds)
+
+    bonds, nbonds, c10y = find_bonds(atoms, added_bonds, forbidden_bonds)
 
     if conslast is None:
         dinds = None
@@ -42,7 +67,8 @@ def get_internal(atoms, con_user=None, target_user=None, atol=15.,
     # FIXME: This looks hideous, can it be improved?
     (angles, dummies, dinds, angle_sums,
      bcons, acons, dcons, adiffs) = find_angles(atoms, atol, bonds, nbonds,
-                                                c10y, dummies, dinds)
+                                                c10y, dummies, dinds,
+                                                check_angles)
 
     dihedrals = find_dihedrals(atoms + dummies, atol, bonds, angles, nbonds,
                                c10y, dinds)

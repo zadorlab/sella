@@ -20,7 +20,7 @@ def get_dummy(atoms, nbonds, c10y, i, j, k, atol):
                 dx1 -= dx2 * (dx1 @ dx2)
                 dx1 /= np.linalg.norm(dx1)
                 dpos = dx1 + atoms.positions[j]
-                return dpos, n, m
+                return dpos, n, m, True
 
     dx1 = atoms.get_distance(j, i, vector=True)
     dx2 = atoms.get_distance(j, k, vector=True)
@@ -34,18 +34,26 @@ def get_dummy(atoms, nbonds, c10y, i, j, k, atol):
         dpos /= np.linalg.norm(dpos)
     else:
         dpos /= dpos_norm
+    dpos += atoms.positions[j]
 
-    return dpos, i, k
+    return dpos, i, k, False
 
 
 def check_if_planar(dxs, atol):
     dxs /= np.linalg.norm(dxs, axis=1)[:, np.newaxis]
     U, s, VT = np.linalg.svd(dxs)
-    angles = np.arccos(dxs @ VT[:, 2])
-    return np.max(angles) - np.min(angles) > atol
+    angles = np.arccos(dxs @ VT[:, 2]) * 180 / np.pi
+    return np.max(angles) - np.min(angles) < atol
 
+def check_angle(atoms, i, j, k, atol, bad_angles):
+    if bad_angles is not None:
+        for a, b, c in bad_angles:
+            if b == j and ((a == i and c == k) or (a == k and c == i)):
+                return False
+    return atol < atoms.get_angle(i, j, k) < 180 - atol
 
-def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
+def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None,
+                bad_angles=None):
     atoms = atoms.copy()
     natoms = len(atoms)
 
@@ -71,23 +79,26 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None):
             raise RuntimeError("Atom {} has no bonds!".format(j))
         elif nj == 2:
             i, k = c10y[j, :2]
-            if atol < atoms.get_angle(i, j, k) < 180 - atol:
+            if check_angle(atoms, i, j, k, atol, bad_angles):
                 angles.append([i, j, k])
             elif dinds[j] < 0:
                 dinds[j] = natoms + ndummies
-                dpos, a, b = get_dummy(atoms, nbonds, c10y, i, j, k, atol)
+                dpos, a, b, proper = get_dummy(atoms, nbonds, c10y, i, j, k, atol)
                 dummies += Atom('X', dpos)
 
                 bond_constraints.append([j, dinds[j]])
                 angle_constraints.append([a, j, dinds[j]])
-                dihedral_constraints.append([b, a, j, dinds[j]])
+                if proper:
+                    dihedral_constraints.append([b, a, j, dinds[j]])
+                else:
+                    dihedral_constraints.append([b, j, dinds[j], a])
 
                 ndummies += 1
         else:
             linear = []
             for a, i in enumerate(c10y[j, :nj-1]):
                 for k in c10y[j, a+1:nj]:
-                    if atol < atoms.get_angle(i, j, k) < 180 - atol:
+                    if check_angle(atoms, i, j, k, atol, bad_angles):
                         angles.append([i, j, k])
                     else:
                         linear.append(sorted([i, k], key=lambda x: atoms.get_distance(x, j)))

@@ -59,6 +59,7 @@ class PES:
         self.set_H(H0)
 
         self.savepoint = dict(apos=None, dpos=None)
+        self.first_diag = True
 
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
@@ -206,13 +207,16 @@ class PES:
         Unred = self.get_Unred()
 
         P = self.get_HL().project(Unred)
-        v0 = None
 
-        if P.B is None:
-            P = np.eye(len(self.get_x()))
+        if P.B is None or self.first_diag:
             v0 = self.v0
             if v0 is None:
                 v0 = self.get_g() @ Unred
+        else:
+            v0 = None
+
+        if P.B is None:
+            P = np.eye(len(self.get_x()))
         else:
             P = P.asarray()
 
@@ -237,6 +241,8 @@ class PES:
 
         # Update the approximate Hessian
         self.H.update(Vs, AVs)
+
+        self.first_diag = False
 
     # FIXME: temporary functions for backwards compatibility
     def get_projected_forces(self):
@@ -300,7 +306,7 @@ class InternalPES(PES):
         self.set_H(H0)
 
         # Flag used to indicate that new internal coordinates are required
-        self.bad_int = False
+        self.bad_int = None
 
     dpos = property(lambda self: self.dummies.positions.copy())
 
@@ -317,9 +323,10 @@ class InternalPES(PES):
             ode.step()
             y = ode.y
             t0 = ode.t
-            if self.int.check_for_bad_internal(self.apos, self.dpos):
+            self.bad_int = self.int.check_for_bad_internal(self.apos,
+                                                           self.dpos)
+            if self.bad_int is not None:
                 print('Bad internals found!')
-                self.bad_int = True
                 break
             if ode.nfev > 1000:
                 view(self.atoms + self.dummies)
@@ -341,7 +348,11 @@ class InternalPES(PES):
     def get_Hc(self):
         D_cons = self.cons.get_D(self.apos, self.dpos)
         Binv_int = self.int.get_Binv(self.apos, self.dpos)
-        Hc = Binv_int.T @ D_cons.ldot(self.curr['L']) @ Binv_int
+        B_cons = self.cons.get_B(self.apos, self.dpos)
+        D_int = self.int.get_D(self.apos, self.dpos)
+        L_int = self.curr['L'] @ B_cons @ Binv_int
+        Hc = Binv_int.T @ (D_cons.ldot(self.curr['L'])
+                           - D_int.ldot(L_int)) @ Binv_int
         return Hc
 
     def get_drdx(self):
@@ -351,9 +362,11 @@ class InternalPES(PES):
     def _calc_basis(self):
         drdx = self.get_drdx()
         Ucons = modified_gram_schmidt(drdx.T)
+        na = 3 * len(self.atoms)
         B = self.int.get_B(self.apos, self.dpos)
+        Udummy = modified_gram_schmidt(B[:, na:])
         Binv = self.int.get_Binv(self.apos, self.dpos)
-        Unred = modified_gram_schmidt(B @ Binv)
+        Unred = modified_gram_schmidt(B @ Binv, Udummy)
         Ufree = modified_gram_schmidt(Unred, Ucons)
         return drdx, Ucons, Unred, Ufree
 
@@ -364,9 +377,18 @@ class InternalPES(PES):
 
     def update_internals(self, dx):
         self._update(True)
+
+        if self.bad_int is None:
+            check_bonds = None
+            check_angles = None
+        else:
+            check_bonds = self.bad_int['bonds']
+            check_angles = self.bad_int['angles']
+
         # Find new internals, constraints, and dummies
         out = get_internal(self.atoms, self.con_user, self.target_user,
-                           dummies=self.dummies, conslast=self.cons)
+                           dummies=self.dummies, conslast=self.cons,
+                           check_bonds=check_bonds, check_angles=check_angles)
         new_int, new_cons, new_dummies = out
         nold = 3 * (len(self.atoms) + len(self.dummies))
 
@@ -394,7 +416,6 @@ class InternalPES(PES):
         H = self.get_H().asarray()
         Hcart = Blast.T @ H @ Blast + Dlast.ldot(self.curr['g'])
         Hnew = Binv.T[:, :nold]@Hcart@Binv[:nold] - Binv.T@D.ldot(g) @ Binv
-        Hnew += P2.T @ new_int.guess_hessian(self.atoms, new_dummies) @ P2.T
         self.dim = len(x)
         self.set_H(Hnew)
 
@@ -446,20 +467,17 @@ class InternalPES(PES):
     def kick(self, dx, diag=False, **diag_kwargs):
         ratio = PES.kick(self, dx, diag=diag, **diag_kwargs)
 
-        if self.bad_int:
+        if self.bad_int is not None:
             self.update_internals(dx)
-            self.bad_int = False
+            self.bad_int = None
 
         return ratio
 
     def _update_H(self):
         if self.last['x'] is None or self.last['g'] is None:
             return
-        Unred = self.get_Unred()
-        P = Unred @ Unred.T
-        dx = P @ self.wrap_dx(self.curr['x'] - self.last['x'])
-        dg = P @ (self.curr['g'] - self.last['g'])
-        self.H = self.H.project(P)
+        dx = self.wrap_dx(self.curr['x'] - self.last['x'])
+        dg = self.curr['g'] - self.last['g']
         self.H.update(dx, dg)
 
     def write_traj(self):

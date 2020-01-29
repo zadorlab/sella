@@ -689,49 +689,49 @@ cdef class CartToInternal:
         dx_np = np.zeros(3, dtype=np.float64)
         cdef double[:] dx = memoryview(dx_np)
         cdef int sddx = dx.strides[0] >> 3
-        cdef double dist
-        cdef double factr
+        cdef double dist, rcovij
+        cdef double dxmin
+        bond_check_np = np.zeros((self.nbonds, 2), dtype=np.int32)
+        cdef int[:, :] bond_check = memoryview(bond_check_np)
+        angle_check_np = np.zeros((self.nangles, 3), dtype=np.int32)
+        cdef int[:, :] angle_check = memoryview(angle_check_np)
+        cdef int nbond_check = 0
+        cdef int nangle_check = 0
+
         with nogil:
             start = self.ncart + self.nbonds
             for i in range(self.nangles):
                 if not (self.atol < self.q1[start + i] < pi - self.atol):
+                    angle_check[nangle_check, :] = self.angles[i]
+                    nangle_check += 1
                     bad = True
-                    break
 
-            if not bad:
-                # Ignore dummy atoms for this check
-                for i in range(self.nreal - 1):
-                    for j in range(i + 1, self.nreal):
+            # Ignore dummy atoms for this check
+            for i in range(self.nreal - 1):
+                for j in range(i + 1, self.nreal):
+                    if self.bmat[i, j]:
+                        dxmin = 0.5
+                    else:
+                        dxmin = 1.25
+                    info = vec_sum(self.pos[i], self.pos[j], dx, -1.)
+                    if info != 0:  break
+                    dist = dnrm2(&THREE, &dx[0], &sddx)
+                    rcovij = self.rcov[i] + self.rcov[j]
+                    if dist < dxmin * rcovij:
                         if self.bmat[i, j]:
-                            factr = 0.5
-                        else:
-                            factr = 1.25
-                        info = vec_sum(self.pos[i], self.pos[j], dx, -1.)
-                        if info != 0:  break
-                        dist = dnrm2(&THREE, &dx[0], &sddx)
-                        if dist < factr * (self.rcov[i] + self.rcov[j]):
-                            bad = True
-                            break
-                    if bad or info != 0:  break
+                            bond_check[nbond_check, 0] = i
+                            bond_check[nbond_check, 1] = j
+                            nbond_check += 1
+                        bad = True
+                if info != 0:  break
 
-            # FIXME: implement bond distance check in peswrapper
-            ## Check for too-short bonds
-            #start = self.ncart
-            #for i in range(self.nbonds):
-            #    if self.q1[start + i] < 0.5:  # FIXME: make this a parameter
-            #        bad = True
-            #        break
-
-            ## Check for near-linear angles
-            #if not bad:
-            #    start += self.nbonds
-            #    for i in range(self.nangles):
-            #        if not (self.atol < self.q1[start + i] < pi - self.atol):
-            #            bad = True
-            #            break
         if info != 0:
             raise RuntimeError("Failed while checking for bad internals!")
-        return bad
+        if bad:
+            check = {'bonds': bond_check_np[:nbond_check],
+                     'angles': angle_check_np[:nangle_check]}
+            return check
+        return None
 
 
 cdef class Constraints(CartToInternal):

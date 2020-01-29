@@ -36,11 +36,14 @@ cdef int flood_fill(int idx, int[:] nbonds, int[:, :] c10y, int[:] labels,
     return 0
 
 
-def find_bonds(atoms):
+def find_bonds(atoms, int[:, :] added_bonds, int[:, :] forbidden_bonds):
     cdef int natoms = len(atoms)
-    cdef int i, j, k, err
+    cdef int i, j, k, err, a, b
     cdef int nbonds_tot = 0
-    cdef double scale = 1.5
+    cdef double scale = 1.25
+
+    cdef int nadded = len(added_bonds)
+    cdef int nforbidden = len(forbidden_bonds)
 
     #bonds_np = np.zeros((natoms * _MAX_BONDS // 2, 2), dtype=np.int32)
     #cdef int[:, :] bonds = memoryview(bonds_np)
@@ -54,16 +57,48 @@ def find_bonds(atoms):
     nbonds_np = np.zeros(natoms, dtype=np.int32)
     cdef int[:] nbonds = memoryview(nbonds_np)
 
-    labels_np = np.arange(natoms, dtype=np.int32)
+    labels_np = -np.ones(natoms, dtype=np.int32)
     cdef int[:] labels = memoryview(labels_np)
     cdef int nlabels = natoms
 
     c10y_np = -np.ones((natoms, _MAX_BONDS), dtype=np.int32)
     cdef int[:, :] c10y = memoryview(c10y_np)
 
+    cdef bint forbidden
+
     with nogil:
+        # Set up initial added bonds
+        for i in range(nadded):
+            j = added_bonds[i, 0]
+            k = added_bonds[i, 1]
+            c10y[j, nbonds[j]] = k
+            c10y[k, nbonds[k]] = j
+            nbonds[j] += 1
+            nbonds[k] += 1
+
         # Loop until all atoms share the same label
-        while nlabels > 1 and err == 0:
+        while err == 0:
+            # Rules for labeling: two atoms must have the same label if
+            # they are connected, directly or indirectly. Disconnected
+            # subfragments must have different labels.
+            #
+            # This is done by assigning atom 0 the label 0, then walking
+            # the connectivity tree s.t. all atoms connected to 0 also
+            # have the same label. Once this is complete, the label is
+            # incremented and assigned to the next unlabeled atom. This
+            # process is repeated until all atoms are labeled.
+            #
+            # If all atoms have the same label, that means the bonding
+            # network is fully connected, and we can move on.
+            nlabels = 0
+            for i in range(natoms):
+                if labels[i] == -1:
+                    labels[i] = nlabels
+                    flood_fill(i, nbonds, c10y, labels, nlabels)
+                    nlabels += 1
+            if nlabels == 1:
+                break
+
             # Loop over all pairs of atoms s.t. i < j
             for i in range(natoms):
                 for j in range(i + 1, natoms):
@@ -76,6 +111,17 @@ def find_bonds(atoms):
                     # Check whether the two atoms are within the scaled
                     # bonding cutoff
                     if rij[i, j] <= scale * (rcov[i] + rcov[j]):
+                        # Check whether this bond is forbidden
+                        forbidden = False
+                        for k in range(nforbidden):
+                            a = forbidden_bonds[k, 0]
+                            b = forbidden_bonds[k, 1]
+                            if (i == a and j == b) or (i == b and j == a):
+                                forbidden = True
+                                break
+                        if forbidden:
+                            continue
+
                         # Each atom can only have at most _MAX_BONDS bonding
                         # partners, raise an error if this is violated
                         if (nbonds[i] >= _MAX_BONDS):
@@ -116,24 +162,6 @@ def find_bonds(atoms):
             for i in range(natoms):
                 labels[i] = -1
 
-            # Rules for labeling: two atoms must have the same label if
-            # they are connected, directly or indirectly. Disconnected
-            # subfragments must have different labels.
-            #
-            # This is done by assigning atom 0 the label 0, then walking
-            # the connectivity tree s.t. all atoms connected to 0 also
-            # have the same label. Once this is complete, the label is
-            # incremented and assigned to the next unlabeled atom. This
-            # process is repeated until all atoms are labeled.
-            #
-            # If all atoms have the same label, that means the bonding
-            # network is fully connected, and we can move on.
-            nlabels= 0
-            for i in range(natoms):
-                if labels[i] == -1:
-                    labels[i] = nlabels
-                    flood_fill(i, nbonds, c10y, labels, nlabels)
-                    nlabels += 1
             scale *= 1.05
 
     bonds_np = np.zeros((nbonds_tot, 2), dtype=np.int32)
