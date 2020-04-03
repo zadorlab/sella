@@ -85,7 +85,9 @@ class PES:
 
     # Position getter/setter
     def set_x(self, target):
+        diff = target - self.get_x()
         self.atoms.positions = target.reshape((-1, 3))
+        return diff, diff, self.curr.get('g', np.zeros_like(diff))
 
     def get_x(self):
         return self.apos.ravel().copy()
@@ -157,6 +159,7 @@ class PES:
                 return False
         drdx, Ucons, Unred, Ufree = self._calc_basis()
 
+
         if feval:
             f, g = self.eval()
             L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
@@ -169,18 +172,15 @@ class PES:
             self.last = self.curr
             self.curr = dict(x=x, f=f, g=g, drdx=drdx, Ucons=Ucons,
                              Unred=Unred, Ufree=Ufree, L=L)
-            self._update_H()
         else:
             self.curr['f'] = f
             self.curr['g'] = g
             self.curr['L'] = L
         return True
 
-    def _update_H(self):
+    def _update_H(self, dx, dg):
         if self.last['x'] is None or self.last['g'] is None:
             return
-        dx = self.wrap_dx(self.curr['x'] - self.last['x'])
-        dg = self.curr['g'] - self.last['g']
         self.H.update(dx, dg)
 
     def get_f(self):
@@ -274,15 +274,18 @@ class PES:
         g0 = self.get_g()
         B0 = self.H.asarray()
 
-        self.set_x(x0 + dx)
+        dx_initial, dx_final, g_par = self.set_x(x0 + dx)
 
-        dx_actual = self.wrap_dx(self.get_x() - x0)
-        df_pred = self.get_df_pred(dx_actual, g0, B0)
+        #dx_actual = self.wrap_dx(self.get_x() - x0)
+        df_pred = self.get_df_pred(dx_initial, g0, B0)
+        dg_actual = self.get_g() - g_par
         df_actual = self.get_f() - f0
         if df_pred is None:
             ratio = None
         else:
             ratio = df_actual / df_pred
+
+        self._update_H(dx_final, dg_actual)
 
         if diag:
             self.diag(**diag_kwargs)
@@ -312,11 +315,13 @@ class InternalPES(PES):
 
     # Position getter/setter
     def set_x(self, target):
-        dx = self.int.dq_wrap(target - self.get_x())
+        dx = target - self.get_x()
 
         t0 = 0.
+        Binv = self.int.get_Binv(self.apos, self.dpos)
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
-                        self.int.get_Binv(self.apos, self.dpos) @ dx))
+                        Binv @ dx,
+                        Binv @ self.curr.get('g', np.zeros_like(dx))))
         ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
 
         while ode.status == 'running':
@@ -336,10 +341,17 @@ class InternalPES(PES):
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
 
+
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)
-        self.atoms.positions = y[:nxa].reshape((-1, 3))
-        self.dummies.positions = y[nxa:nxa + nxd].reshape((-1, 3))
+        y = y.reshape((3, nxa + nxd))
+        self.atoms.positions = y[0, :nxa].reshape((-1, 3))
+        self.dummies.positions = y[0, nxa:].reshape((-1, 3))
+        B = self.int.get_B(self.apos, self.dpos)
+        dx_final = t0 * B @ y[1]
+        g_final = B @ y[2]
+        dx_initial = t0 * dx
+        return dx_initial, dx_final, g_final
 
     def get_x(self):
         return self.int.get_q(self.apos, self.dpos)
@@ -430,7 +442,8 @@ class InternalPES(PES):
         if H is None:
             return None
         Unred = self.get_Unred()
-        dx_r = self.wrap_dx(dx) @ Unred
+        dx_r = dx @ Unred
+        #dx_r = self.wrap_dx(dx) @ Unred
         g_r = g @ Unred
         H_r = Unred.T @ H @ Unred
         return g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
@@ -450,19 +463,20 @@ class InternalPES(PES):
     def _q_ode(self, t, y):
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)
-        x, dxdt = y.reshape((2, nxa + nxd))
+        x, dxdt, g = y.reshape((3, nxa + nxd))
 
-        dydt = np.zeros_like(y)
-        dydt[:nxa + nxd] = dxdt
+        dydt = np.zeros((3, nxa + nxd))
+        dydt[0] = dxdt
 
         self.atoms.positions = x[:nxa].reshape((-1, 3)).copy()
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
         D = self.int.get_D(self.apos, self.dpos)
         Binv = self.int.get_Binv(self.apos, self.dpos)
-        dydt[nxa + nxd:] = -Binv @ D.ddot(dxdt, dxdt)
+        dydt[1] = -Binv @ D.ddot(dxdt, dxdt)
+        dydt[2] = -Binv @ D.ddot(dxdt, g)
 
-        return dydt
+        return dydt.ravel()
 
     def kick(self, dx, diag=False, **diag_kwargs):
         ratio = PES.kick(self, dx, diag=diag, **diag_kwargs)
@@ -472,13 +486,6 @@ class InternalPES(PES):
             self.bad_int = None
 
         return ratio
-
-    def _update_H(self):
-        if self.last['x'] is None or self.last['g'] is None:
-            return
-        dx = self.wrap_dx(self.curr['x'] - self.last['x'])
-        dg = self.curr['g'] - self.last['g']
-        self.H.update(dx, dg)
 
     def write_traj(self):
         if self.traj is not None:
@@ -491,7 +498,7 @@ class InternalPES(PES):
             self.traj.write(atoms_tmp)
 
     def _update(self, feval=True):
-        if not PES._update(self, feval=True):
+        if not PES._update(self, feval=feval):
             return
 
         B = self.int.get_B(self.apos, self.dpos)

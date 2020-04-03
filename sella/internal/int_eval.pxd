@@ -14,3 +14,9 @@ cdef int cart_to_dihedral(int a, int b, int c, int d, double[:] dx1,
                           double[:, :] dq, double[:, :, :, :] d2q,
                           double[:, :, :, :] work, bint gradient=?,
                           bint curvature=?) nogil
+
+cdef int cart_to_dihedral_mod(int a, int b, int c, int d, double[:] dx1,
+                              double[:] dx2, double[:] dx3, double* q,
+                              double[:, :] dq, double[:, :, :, :] d2q,
+                              double[:, :, :, :] work, bint gradient=?,
+                              bint curvature=?) nogil

@@ -55,6 +55,13 @@ cdef class CartToInternal:
                              double conv, double At=?, double Bt=?,
                              double Ct=?, double Dt=?, double Et=?) nogil
 
+    cdef bint check_angle(CartToInternal self, double angle) nogil
+
+    cdef int get_dx(CartToInternal self, int i, int j, double[:] dx) nogil
+
+    cdef int check_dihedrals(CartToInternal self, int[:, :] dihedral_check,
+                             double[:, :] work) nogil
+
 cdef class Constraints(CartToInternal):
     cdef bint proj_trans, proj_rot, calc_res
     cdef int ninternal, nrot, ntrans

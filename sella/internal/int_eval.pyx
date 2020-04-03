@@ -1,6 +1,6 @@
 # cimports
 
-from libc.math cimport sqrt, atan2
+from libc.math cimport sqrt, atan2, sin, cos, pi
 from libc.string cimport memset
 
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dger, dsyr, dsyr2
@@ -23,6 +23,16 @@ cdef int UNITY = 1
 cdef int THREE = 3
 cdef int NINE = 9
 cdef int EIGHTYONE = 81
+
+def test_bond(pos):
+    cdef double q
+    dx = pos[1] - pos[0]
+    dq = np.zeros((2, 3), dtype=float)
+    d2q = np.zeros((2, 3, 2, 3), dtype=float)
+    cdef int err = cart_to_bond(0, 1, dx, &q, dq, d2q, True, True)
+    if err != 0:
+        raise RuntimeError
+    return q, dq, d2q
 
 cdef int cart_to_bond(int a,
                       int b,
@@ -103,6 +113,18 @@ def get_bond(atoms, int i, int j, grad=False):
         return q
     else:
         return q, dq_np
+
+def test_angle(pos):
+    cdef double q
+    dx1 = pos[1] - pos[0]
+    dx2 = pos[2] - pos[1]
+    dq = np.zeros((3, 3), dtype=float)
+    d2q = np.zeros((3, 3, 3, 3), dtype=float)
+    work = np.zeros((11, 3, 3, 3), dtype=float)
+    cdef int err = cart_to_angle(0, 1, 2, dx1, dx2, &q, dq, d2q, work, True, True)
+    if err != 0:
+        raise RuntimeError
+    return q, dq, d2q
 
 cdef int cart_to_angle(int a,
                        int b,
@@ -244,6 +266,20 @@ cdef int cart_to_angle(int a,
             d2q[1, i, 2, j] = d2q[2, j, 1, i] = (d2q_int[0, i, 1, j]
                                                  - d2q_int[1, i, 1, j])
     return 0
+
+
+def test_dihedral(pos):
+    cdef double q
+    dx1 = pos[1] - pos[0]
+    dx2 = pos[2] - pos[1]
+    dx3 = pos[3] - pos[2]
+    dq = np.zeros((4, 3), dtype=float)
+    d2q = np.zeros((4, 3, 4, 3), dtype=float)
+    work = np.zeros((11, 3, 3, 3), dtype=float)
+    cdef int err = cart_to_dihedral(0, 1, 2, 3, dx1, dx2, dx3, &q, dq, d2q, work, True, True)
+    if err != 0:
+        raise RuntimeError
+    return q, dq, d2q
 
 cdef int cart_to_dihedral(int a,
                           int b,
@@ -409,7 +445,7 @@ cdef int cart_to_dihedral(int a,
     tmp2 = denom / tmp1
     tmp3 = -numer / tmp1
     # can't use my_daxpy here, because we are reinterpreting a 4d array
-    # as a vector, and there doesn't seem to be a pure python way to
+    # as a vector, and there doesn't seem to be a pure cython way to
     # reshape a typed memoryview
     daxpy(&EIGHTYONE, &tmp2, &d2numer[0, 0, 0, 0], &sd_work,
           &d2q_int[0, 0, 0, 0], &sd_work)
@@ -445,4 +481,130 @@ cdef int cart_to_dihedral(int a,
 
             d2q[2, i, 3, j] = d2q[3, j, 2, i] = (d2q_int[1, i, 2, j]
                                                  - d2q_int[2, i, 2, j])
+    return 0
+
+
+def test_dihedral_mod(pos):
+    cdef double q
+    dx1 = pos[1] - pos[0]
+    dx2 = pos[2] - pos[1]
+    dx3 = pos[3] - pos[2]
+    dq = np.zeros((4, 3), dtype=float)
+    d2q = np.zeros((4, 3, 4, 3), dtype=float)
+    work = np.zeros((11, 3, 3, 3), dtype=float)
+    cdef int err = cart_to_dihedral_mod(0, 1, 2, 3, dx1, dx2, dx3, &q, dq, d2q, work, True, True)
+    if err != 0:
+        raise RuntimeError
+    return q, dq, d2q
+
+
+cdef int cart_to_dihedral_mod(int a,
+                              int b,
+                              int c,
+                              int d,
+                              double[:] dx1,
+                              double[:] dx2,
+                              double[:] dx3,
+                              double* q,
+                              double[:, :] dq,
+                              double[:, :, :, :] d2q,
+                              double[:, :, :, :] work,
+                              bint gradient=False,
+                              bint curvature=False) nogil:
+    cdef int err, n, m, i, j
+    cdef double tau, alpha, beta, sina, sinb, cosa, cosb
+    cdef double[:, :] dalpha, dbeta
+    cdef double[:, :, :, :] d2alpha, d2beta
+    err = cart_to_dihedral(a, b, c, d, dx1, dx2, dx3, &tau, dq,
+                           d2q, work, gradient, curvature)
+    if err != 0:  return err
+
+    # clear out work
+    memset(&work[0, 0, 0, 0], 0, 297 * sizeof(double))
+
+    dalpha = work[0, 0]
+    dbeta = work[0, 1]
+    d2alpha = work[1:4]
+    d2beta = work[4:7]
+    err = cart_to_angle(0, 1, 2, dx1, dx2, &alpha, dalpha, d2alpha,
+                        work[7:], gradient, curvature)
+    if err != 0:  return err
+
+    err = cart_to_angle(0, 1, 2, dx2, dx3, &beta, dbeta, d2beta,
+                        work[7:], gradient, curvature)
+    if err != 0:  return err
+
+    sina = sin(alpha)
+    sinb = sin(beta)
+
+    q[0] = tau * sina * sinb
+
+    if not (gradient or curvature):
+        return 0
+
+    cosa = cos(alpha)
+    cosb = cos(beta)
+
+    # do curvature before gradient so that we still have dtau/dx
+    if curvature:
+        # So, I realize how awful this looks...
+        # It is awful...
+        # I will come up with a better way of doing this.
+        # tau^2
+        for m in range(4):
+            for i in range(3):
+                for n in range(4):
+                    for j in range(3):
+                        d2q[m, i, n, j] *= sina * sinb
+
+        # tau alpha, alpha tau, tau beta, beta tau
+        for i in range(3):
+            for m in range(3):
+                for j in range(3):
+                    d2q[0, i, m, j] += cosa * sinb * dq[a, i] * dalpha[m, j]
+                    d2q[1, i, m, j] += cosa * sinb * dq[b, i] * dalpha[m, j]
+                    d2q[2, i, m, j] += cosa * sinb * dq[c, i] * dalpha[m, j]
+                    d2q[3, i, m, j] += cosa * sinb * dq[d, i] * dalpha[m, j]
+
+                    d2q[m, j, 0, i] += cosa * sinb * dq[a, i] * dalpha[m, j]
+                    d2q[m, j, 1, i] += cosa * sinb * dq[b, i] * dalpha[m, j]
+                    d2q[m, j, 2, i] += cosa * sinb * dq[c, i] * dalpha[m, j]
+                    d2q[m, j, 3, i] += cosa * sinb * dq[d, i] * dalpha[m, j]
+
+                    d2q[0, i, m + 1, j] += sina * cosb * dq[a, i] * dbeta[m, j]
+                    d2q[1, i, m + 1, j] += sina * cosb * dq[b, i] * dbeta[m, j]
+                    d2q[2, i, m + 1, j] += sina * cosb * dq[c, i] * dbeta[m, j]
+                    d2q[3, i, m + 1, j] += sina * cosb * dq[d, i] * dbeta[m, j]
+
+                    d2q[m + 1, j, 0, i] += sina * cosb * dq[a, i] * dbeta[m, j]
+                    d2q[m + 1, j, 1, i] += sina * cosb * dq[b, i] * dbeta[m, j]
+                    d2q[m + 1, j, 2, i] += sina * cosb * dq[c, i] * dbeta[m, j]
+                    d2q[m + 1, j, 3, i] += sina * cosb * dq[d, i] * dbeta[m, j]
+
+
+        # alpha alpha, alpha^2, alpha beta, beta alpha, beta beta, beta^2
+        for n in range(3):
+            for i in range(3):
+                for m in range(3):
+                    for j in range(3):
+                        d2q[n, i, m, j] -= tau * sina * sinb * dalpha[n, i] * dalpha[m, j]
+                        d2q[n, i, m, j] += tau * cosa * sinb * d2alpha[n, i, m, j]
+                        d2q[n, i, m + 1, j] += tau * cosa * cosb * dalpha[n, i] * dbeta[m, j]
+                        d2q[m + 1, j, n, i] += tau * cosa * cosb * dalpha[n, i] * dbeta[m, j]
+                        d2q[n + 1, i, m + 1, j] -= tau * sina * sinb * dbeta[n, i] * dbeta[m, j]
+                        d2q[n + 1, i, m + 1, j] += tau * sina * cosb * d2beta[n, i, m, j]
+
+    for i in range(3):
+        dq[a, i] *= sina * sinb
+        dq[a, i] += tau * cosa * sinb * dalpha[0, i]
+
+        dq[b, i] *= sina * sinb
+        dq[b, i] += tau * (cosa * sinb * dalpha[1, i] + sina * cosb * dbeta[0, i])
+
+        dq[c, i] *= sina * sinb
+        dq[c, i] += tau * (cosa * sinb * dalpha[2, i] + sina * cosb * dbeta[1, i])
+
+        dq[d, i] *= sina * sinb
+        dq[d, i] += tau * sina * cosb * dbeta[2, i]
+
     return 0

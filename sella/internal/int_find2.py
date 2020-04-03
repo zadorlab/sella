@@ -4,27 +4,15 @@ from ase import Atom, Atoms
 _MAX_BONDS = 20
 
 
-def get_dummy(atoms, nbonds, c10y, i, j, k, atol):
+def get_dummy(atoms, nbonds, c10y, i, j, k, atol, bad_angles):
     i, k = sorted([i, k], key=lambda x: atoms.get_distance(x, j))
-    for n in [i, k]:
-        for m in sorted(c10y[n, :nbonds[n]],
-                        key=lambda x: atoms.get_distance(x, n)):
-            if m in [i, j, k]:
-                continue
-            if atol < atoms.get_angle(j, n, m) < 180 - atol:
-                dx1 = atoms.get_distance(m, n, vector=True)
-                dx1 /= np.linalg.norm(dx1)
-
-                dx2 = atoms.get_distance(n, j, vector=True)
-                dx2 /= np.linalg.norm(dx2)
-                dx1 -= dx2 * (dx1 @ dx2)
-                dx1 /= np.linalg.norm(dx1)
-                dpos = dx1 + atoms.positions[j]
-                return dpos, n, m, True
 
     dx1 = atoms.get_distance(j, i, vector=True)
+    dx1 /= np.linalg.norm(dx1)
     dx2 = atoms.get_distance(j, k, vector=True)
-    dpos = np.cross(dx1, dx2)
+    dx2 /= np.linalg.norm(dx2)
+    dpos = dx1 + dx2
+    dpos -= dx1 * (dpos @ dx1)
     dpos_norm = np.linalg.norm(dpos)
     if dpos_norm < 1e-4:
         dim = np.argmin(np.abs(dx1))
@@ -67,6 +55,7 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None,
         dinds = -np.ones(natoms, dtype=np.int32)
 
     angles = []
+    dihedrals = []
 
     bond_constraints = []
     angle_constraints = []
@@ -83,7 +72,7 @@ def find_angles(atoms, atol, bonds, nbonds, c10y, dummies=None, dinds=None,
                 angles.append([i, j, k])
             elif dinds[j] < 0:
                 dinds[j] = natoms + ndummies
-                dpos, a, b, proper = get_dummy(atoms, nbonds, c10y, i, j, k, atol)
+                dpos, a, b, proper = get_dummy(atoms, nbonds, c10y, i, j, k, atol, bad_angles)
                 dummies += Atom('X', dpos)
 
                 bond_constraints.append([j, dinds[j]])

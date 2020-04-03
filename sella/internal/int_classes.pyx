@@ -1,12 +1,12 @@
 # cimports
 
-from libc.math cimport fabs, exp, pi, sqrt, copysign
+from libc.math cimport fabs, exp, pi, sqrt, copysign, acos
 from libc.string cimport memset
 from libc.stdint cimport uint8_t
 
 from scipy.linalg.cython_blas cimport daxpy, ddot, dnrm2, dgemv, dcopy
 
-from sella.utilities.blas cimport my_ddot, my_daxpy, my_dgemv
+from sella.utilities.blas cimport my_ddot, my_daxpy, my_dgemv, my_dnrm2
 from sella.utilities.math cimport (vec_sum, mgs, cross,
                                    normalize, mppi)
 from sella.internal.int_eval cimport (cart_to_bond, cart_to_angle,
@@ -78,6 +78,7 @@ cdef class CartToInternal:
                                                     4, 3), dtype=np.float64))
         self.work1 = memoryview(np.zeros((11, 3, 3, 3), dtype=np.float64))
         self.work2 = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
+
 
         # Things for SVD
         self.lwork = 2 * max(3 * self.nmin + self.nmax, 5 * self.nmin, 1)
@@ -693,27 +694,37 @@ cdef class CartToInternal:
         cdef double dxmin
         bond_check_np = np.zeros((self.nbonds, 2), dtype=np.int32)
         cdef int[:, :] bond_check = memoryview(bond_check_np)
+        cdef int nbond_check = 0
+
         angle_check_np = np.zeros((self.nangles, 3), dtype=np.int32)
         cdef int[:, :] angle_check = memoryview(angle_check_np)
-        cdef int nbond_check = 0
         cdef int nangle_check = 0
 
+        dihedral_check_np = np.zeros((self.ndihedrals, 4), dtype=np.int32)
+        cdef int[:, :] dihedral_check = memoryview(dihedral_check_np)
+        cdef int ndihedral_check = 0
+
+        work_np = np.zeros((2, 3), dtype=np.float64)
+        cdef double[:, :] work = memoryview(work_np)
+
         with nogil:
+            # Check whether there are any linear angles
             start = self.ncart + self.nbonds
             for i in range(self.nangles):
-                if not (self.atol < self.q1[start + i] < pi - self.atol):
+                if not self.check_angle(self.q1[start + i]):
                     angle_check[nangle_check, :] = self.angles[i]
                     nangle_check += 1
                     bad = True
 
-            # Ignore dummy atoms for this check
+            # Check whether any atoms are too close, using a different
+            # threshold for bonded and nonbonded atoms.
             for i in range(self.nreal - 1):
                 for j in range(i + 1, self.nreal):
                     if self.bmat[i, j]:
                         dxmin = 0.5
                     else:
                         dxmin = 1.25
-                    info = vec_sum(self.pos[i], self.pos[j], dx, -1.)
+                    info = self.get_dx(i, j, dx)
                     if info != 0:  break
                     dist = dnrm2(&THREE, &dx[0], &sddx)
                     rcovij = self.rcov[i] + self.rcov[j]
@@ -725,13 +736,56 @@ cdef class CartToInternal:
                         bad = True
                 if info != 0:  break
 
+            ndihedral_check = self.check_dihedrals(dihedral_check, work)
+            if ndihedral_check < 0:
+                info = ndihedral_check
+            elif ndihedral_check > 0:
+                bad = True
+
         if info != 0:
             raise RuntimeError("Failed while checking for bad internals!")
         if bad:
             check = {'bonds': bond_check_np[:nbond_check],
-                     'angles': angle_check_np[:nangle_check]}
+                     'angles': angle_check_np[:nangle_check],
+                     'dihedrals': dihedral_check_np[:ndihedral_check]}
             return check
         return None
+
+    cdef bint check_angle(CartToInternal self, double angle) nogil:
+        return (self.atol < angle < pi - self.atol)
+
+    cdef int get_dx(CartToInternal self, int i, int j, double[:] dx) nogil:
+        # TODO: implement PBC
+        return vec_sum(self.pos[j], self.pos[i], dx, -1.)
+
+    cdef int check_dihedrals(CartToInternal self,
+                             int[:, :] dihedral_check,
+                             double[:, :] work) nogil:
+        cdef int ndihedral_check = 0
+        cdef int n, m, i, j, k, l
+        cdef double adotb, anorm, bnorm, angle
+        for n in range(self.ndihedrals):
+            for m in range(2):
+                i = self.dihedrals[n, m + 0]
+                j = self.dihedrals[n, m + 1]
+                k = self.dihedrals[n, m + 2]
+
+                info = self.get_dx(i, j, work[0])
+                if info != 0:  break
+                info = self.get_dx(k, j, work[1])
+                if info != 0:  break
+                adotb = my_ddot(work[0], work[1])
+                anorm = my_dnrm2(work[0])
+                bnorm = my_dnrm2(work[1])
+                angle = acos(adotb / (anorm * bnorm))
+                if not self.check_angle(angle):
+                    dihedral_check[ndihedral_check, :] = self.dihedrals[n]
+                    ndihedral_check += 1
+            if info != 0:  break
+        if info != 0:
+            return info
+
+        return ndihedral_check
 
 
 cdef class Constraints(CartToInternal):
