@@ -5,20 +5,19 @@ from libc.stdint cimport uint8_t
 cdef class CartToInternal:
     cdef bint grad, curv, calc_required
     cdef public int natoms, nreal, ndummies, nbonds, nangles, ndihedrals
-    cdef public int nangle_sums, nangle_diffs, ncart
+    cdef public int ncart
     cdef int nq, nx, nint, next, lwork, nmin, nmax
-    cdef public int[:] dinds
-    cdef public int[:, :] cart, bonds, angles, dihedrals, angle_sums
-    cdef public int[:, :] angle_diffs
-    cdef uint8_t[:, :] bmat
+    cdef public int[:] dinds, tneg
+    cdef public int[:, :] cart, bonds, angles, dihedrals
+    cdef uint8_t[:, :, :] bmat
+    cdef uint8_t[:] bulklike
     cdef double[:] rcov, center
     cdef double[:] q1
-    cdef double[:, :] pos, work2
+    cdef double[:, :] pos, work2, cellvecs
     cdef double[:] dx1, dx2, dx3, work3, sing
     cdef double[:, :, :] dq
     cdef double[:, :, :, :] work1
     cdef double[:, :, :, :, :] d2q_bonds, d2q_angles, d2q_dihedrals
-    cdef double[:, :, :, :, :] d2q_angle_sums, d2q_angle_diffs
     cdef double[:, :] Uint, Uext, Binv, Usvd
     cdef double atol
     cdef dict __dict__
@@ -36,11 +35,6 @@ cdef class CartToInternal:
     cdef int _U_update(CartToInternal self, double[:, :] pos,
                        double[:, :] dummypos=?, bint force=?) nogil except -1
 
-    cdef int _angle_sum_diff(CartToInternal self, int[:] indices, double sign,
-                             double* q, double[:, :] dq,
-                             double[:, :, :, :] d2q,
-                             bint grad, bint curv) nogil
-
     cdef double _h0_bond(CartToInternal self, int a, int b, double[:, :] rij,
                          double[:] rcov, double conv, double Ab=?,
                          double Bb=?) nogil
@@ -57,7 +51,8 @@ cdef class CartToInternal:
 
     cdef bint check_angle(CartToInternal self, double angle) nogil
 
-    cdef int get_dx(CartToInternal self, int i, int j, double[:] dx) nogil
+    cdef int get_dx(CartToInternal self, int i, int j, int nj,
+                    double[:] dx) nogil
 
     cdef int check_dihedrals(CartToInternal self, int[:, :] dihedral_check,
                              double[:, :] work) nogil
@@ -82,12 +77,10 @@ cdef class Constraints(CartToInternal):
 
 
 cdef class D2q:
-    cdef int natoms, ncart, nbonds, nangles, ndihedrals, nangle_sums
-    cdef int nangle_diffs
+    cdef int natoms, ncart, nbonds, nangles, ndihedrals
     cdef int nq, nx, sw1, sw2, sw3
-    cdef int[:, :] bonds, angles, dihedrals, angle_sums, angle_diffs
+    cdef int[:, :] bonds, angles, dihedrals
     cdef double[:, :, :, :, :] Dbonds, Dangles, Ddihedrals
-    cdef double[:, :, :, :, :] Dangle_sums, Dangle_diffs
     cdef double[:, :] work1, work2, work3
 
     cdef int _ld(D2q self, size_t start, size_t nq, size_t nind,

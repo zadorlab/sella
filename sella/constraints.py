@@ -1,14 +1,15 @@
+from typing import Dict, List
 from collections import Sequence
 
 import numpy as np
 
+from ase import Atoms
 from ase.constraints import (FixCartesian, FixAtoms, FixBondLengths,
                              FixInternals)
 
 from sella.internal.int_classes import Constraints
 
-_con_kinds = ['cart', 'bonds', 'angles', 'dihedrals',
-              'angle_sums', 'angle_diffs']
+_con_kinds = ['cart', 'bonds', 'angles', 'dihedrals']
 
 
 def _sort_indices(indices):
@@ -271,3 +272,62 @@ def project_rotation(x0, center=None, axes=None):
     vecs, lams, _ = np.linalg.svd(rots)
     indices = [i for i, lam in enumerate(lams) if abs(lam) > 1e-12]
     return vecs[:, indices]
+
+
+class ConstraintBuilder:
+    shapes = dict(cart=2, bonds=3, angles=5, dihedrals=7)
+
+    def __init__(
+        self,
+        user_cons: Dict[str, np.ndarray] = None,
+        user_target: Dict[str, np.ndarray] = None
+    ) -> None:
+        self.user_cons = user_cons
+        if self.user_cons is None:
+            self.user_cons = dict()
+        self.user_target = user_target
+        if self.user_target is None:
+            self.user_target = dict()
+
+        for key in self.shapes.keys():
+            if key not in self.user_cons:
+                self.user_cons[key] = []
+            if key not in self.user_target:
+                self.user_target[key] = []
+
+        self.dummy_cons = {key: [] for key in self.shapes.keys()}
+
+    def add_constraint(self, key: str, *args: List[int]) -> None:
+        assert len(args) == self.shapes[key]
+        self.dummy_cons[key].append(args)
+
+    def get_constraints(self, atoms: Atoms, dummies: Atoms,
+                        dinds: np.ndarray) -> Constraints:
+        con_out = self.user_cons.copy()
+        target_out = self.user_target.copy()
+
+        for arg in self.dummy_cons['bonds']:
+            con_out['bonds'].append(_sort_indices(arg))
+            target_out['bonds'].append(1.)
+
+        for arg in self.dummy_cons['angles']:
+            con_out['angles'].append(_sort_indices(arg))
+            target_out['angles'].append(np.pi / 2.)
+
+        for arg in self.dummy_cons['dihedrals']:
+            con_out['dihedrals'].append(_sort_indices(arg))
+            target_out['dihedrals'].append(np.pi)
+
+        for key, val in con_out.items():
+            shape = self.shapes[key]
+            con_out[key] = np.array(val, dtype=np.int32).reshape((-1, shape))
+
+        target_all = []
+        for kind in _con_kinds:
+            target_all += target_out.get(kind, [])
+            if np.asarray(con_out[kind]).size == 0:
+                con_out[kind] = None
+        target_all = np.array(target_all, dtype=np.float64)
+
+        return Constraints(atoms, target_all, dummies=dummies, dinds=dinds,
+                           proj_trans=False, proj_rot=False, **con_out)

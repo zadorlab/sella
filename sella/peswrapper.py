@@ -9,9 +9,9 @@ from ase.io.trajectory import Trajectory
 from sella.utilities.math import modified_gram_schmidt
 from sella.hessian_update import symmetrize_Y
 from sella.linalg import NumericalHessian, ApproximateHessian
-from sella.constraints import get_constraints, merge_user_constraints
+from sella.constraints import get_constraints, merge_user_constraints, ConstraintBuilder
 from sella.eigensolvers import rayleigh_ritz
-from sella.internal.get_internal import get_internal
+from sella.internal.get_internal import InternalBuilder
 
 
 class PES:
@@ -56,6 +56,7 @@ class PES:
         self.dummies = None
 
         self.dim = 3 * len(atoms)
+        self.ncart = self.dim
         self.set_H(H0)
 
         self.savepoint = dict(apos=None, dpos=None)
@@ -97,7 +98,7 @@ class PES:
         return self.H
 
     def set_H(self, target):
-        self.H = ApproximateHessian(self.dim, target)
+        self.H = ApproximateHessian(self.dim, self.ncart, target)
 
     # Hessian of the constraints
     def get_Hc(self):
@@ -295,18 +296,29 @@ class PES:
 
 class InternalPES(PES):
     def __init__(self, atoms, *args, H0=None, angles=True, dihedrals=True,
-                 extra_bonds=None, **kwargs):
+                 extra_bonds=None, atol=15, **kwargs):
         PES.__init__(self, atoms, *args, H0=None, **kwargs)
-        self.int, self.cons, self.dummies = get_internal(atoms, self.con_user,
-                                                         self.target_user)
+        self.atol = atol
+        self.conbuilder = ConstraintBuilder(self.con_user, self.target_user)
+        intbuilder = InternalBuilder(self.atoms, self.conbuilder)
+        intbuilder.find_bonds()
+        intbuilder.find_angles(self.atol)
+        intbuilder.find_dihedrals()
+        self.int = intbuilder.to_internal()
+        self.cons = intbuilder.to_constraints()
+        self.dummies = intbuilder.dummies
+        self.dinds = intbuilder.dinds
+
         self.dim = len(self.get_x())
+        self.ncart = self.int.ncart
         if H0 is None:
             # Construct guess hessian and zero out components in
             # infeasible subspace
             B = self.int.get_B(self.apos, self.dpos)
             P = B @ self.int.get_Binv(self.apos, self.dpos)
-            H0 = P @ self.int.guess_hessian(self.atoms, self.dummies) @ P
+            H0 = P @ self.int.guess_hessian(self.atoms, self.dummies, h0cart=1) @ P
         self.set_H(H0)
+        self.H.initialized = False
 
         # Flag used to indicate that new internal coordinates are required
         self.bad_int = None
@@ -328,8 +340,9 @@ class InternalPES(PES):
             ode.step()
             y = ode.y
             t0 = ode.t
-            self.bad_int = self.int.check_for_bad_internal(self.apos,
-                                                           self.dpos)
+            self.bad_int = self.int.check_for_bad_internal(
+                self.apos, self.dpos
+            )
             if self.bad_int is not None:
                 print('Bad internals found!')
                 break
@@ -398,10 +411,14 @@ class InternalPES(PES):
             check_angles = self.bad_int['angles']
 
         # Find new internals, constraints, and dummies
-        out = get_internal(self.atoms, self.con_user, self.target_user,
-                           dummies=self.dummies, conslast=self.cons,
-                           check_bonds=check_bonds, check_angles=check_angles)
-        new_int, new_cons, new_dummies = out
+        intbuilder = InternalBuilder(self.atoms, self.conbuilder, self.dummies,
+                                     self.dinds)
+        intbuilder.find_bonds(check_bonds)
+        intbuilder.find_angles(self.atol, check_angles)
+        intbuilder.find_dihedrals()
+        new_int = intbuilder.to_internal()
+        new_cons = intbuilder.to_constraints()
+        new_dummies = intbuilder.dummies
         nold = 3 * (len(self.atoms) + len(self.dummies))
 
         # Calculate B matrix and its inverse for new and old internals

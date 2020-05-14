@@ -17,12 +17,13 @@ else:
 
 cy_suff = '.pyx' if use_cython else '.c'
 
-cy_files = [['force_match'],
-            ['internal', 'int_eval'],
-            ['internal', 'int_find'],
-            ['internal', 'int_classes'],
-            ['utilities', 'blas'],
-            ['utilities', 'math']]
+cy_files = [
+    ['force_match'],
+    ['internal', 'int_eval'],
+    ['internal', 'int_classes'],
+    ['utilities', 'blas'],
+    ['utilities', 'math']
+]
 
 macros = []
 if debug:

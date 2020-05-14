@@ -72,10 +72,6 @@ cdef class CartToInternal:
                                               dtype=np.float64))
         self.d2q_dihedrals = memoryview(np.zeros((self.ndihedrals, 4, 3, 4, 3),
                                                  dtype=np.float64))
-        self.d2q_angle_sums = memoryview(np.zeros((self.nangle_sums, 4, 3,
-                                                   4, 3), dtype=np.float64))
-        self.d2q_angle_diffs = memoryview(np.zeros((self.nangle_diffs, 4, 3,
-                                                    4, 3), dtype=np.float64))
         self.work1 = memoryview(np.zeros((11, 3, 3, 3), dtype=np.float64))
         self.work2 = memoryview(np.zeros((self.natoms, 3), dtype=np.float64))
 
@@ -105,14 +101,15 @@ cdef class CartToInternal:
                   int[:, :] bonds=None,
                   int[:, :] angles=None,
                   int[:, :] dihedrals=None,
-                  int[:, :] angle_sums=None,
-                  int[:, :] angle_diffs=None,
+                  uint8_t[:] bulklike=None,
+                  int[:] tneg=None,
+                  double[:, :] cellvecs=None,
                   dummies=None,
                   int[:] dinds=None,
                   double atol=15,
                   **kwargs):
 
-        cdef int i, a, b
+        cdef int i, a, b, n
         cdef size_t sd = sizeof(double)
 
         self.nreal = len(atoms)
@@ -132,7 +129,11 @@ cdef class CartToInternal:
         for i in range(self.ndummies):
             self.rcov[self.nreal + i] = covalent_radii[0].copy()
 
-        bmat_np = np.zeros((self.natoms, self.natoms), dtype=np.uint8)
+        self.cellvecs = cellvecs
+        self.tneg = tneg
+
+        bmat_np = np.zeros((self.natoms, self.natoms, len(self.cellvecs)),
+                           dtype=np.uint8)
         self.bmat = memoryview(bmat_np)
 
         self.nx = 3 * self.natoms
@@ -152,7 +153,8 @@ cdef class CartToInternal:
         for i in range(self.nbonds):
             a = self.bonds[i, 0]
             b = self.bonds[i, 1]
-            self.bmat[a, b] = self.bmat[b, a] = True
+            n = self.bonds[i, 2]
+            self.bmat[a, b, n] = self.bmat[b, a, self.tneg[n]] = True
 
         if angles is None:
             self.angles = memoryview(np.empty((0, 3), dtype=np.int32))
@@ -166,27 +168,20 @@ cdef class CartToInternal:
             self.dihedrals = dihedrals
         self.ndihedrals = len(self.dihedrals)
 
-        if angle_sums is None:
-            self.angle_sums = memoryview(np.empty((0, 4), dtype=np.int32))
+        if bulklike is None:
+            self.bulklike = memoryview(np.zeros(self.nreal, dtype=bool))
         else:
-            self.angle_sums = angle_sums
-        self.nangle_sums = len(self.angle_sums)
-
-        if angle_diffs is None:
-            self.angle_diffs = memoryview(np.empty((0, 4), dtype=np.int32))
-        else:
-            self.angle_diffs = angle_diffs
-        self.nangle_diffs = len(self.angle_diffs)
+            self.bulklike = bulklike
 
         if dinds is None:
             self.dinds = memoryview(-np.ones(self.nreal, dtype=np.int32))
         else:
             self.dinds = dinds
 
-        self.nq = (self.ncart + self.nbonds + self.nangles
-                   + self.ndihedrals + self.nangle_sums + self.nangle_diffs)
+        self.nq = self.ncart + self.nbonds + self.nangles + self.ndihedrals
 
         self.atol = pi * atol / 180.
+        self.tneg = tneg
 
 
     def get_q(self, double[:, :] pos, double[:, :] dummypos=None):
@@ -219,11 +214,10 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
 
-        return D2q(self.natoms, self.ncart,
-                   self.bonds, self.angles, self.dihedrals, self.angle_sums,
-                   self.angle_diffs, self.d2q_bonds,
-                   self.d2q_angles, self.d2q_dihedrals, self.d2q_angle_sums,
-                   self.d2q_angle_diffs)
+        return D2q(
+            self.natoms, self.ncart, self.bonds, self.angles, self.dihedrals,
+            self.d2q_bonds, self.d2q_angles, self.d2q_dihedrals
+        )
 
     cdef bint _validate_pos(CartToInternal self, double[:, :] pos,
                             double[:, :] dummypos=None) nogil:
@@ -274,7 +268,7 @@ cdef class CartToInternal:
         self.calc_required = True
         self.grad = grad or curv
         self.curv = curv
-        cdef size_t n, m, i, j, k, l
+        cdef size_t n, m, i, j, k, l, nj, nk, nl
         cdef int info, err
         cdef size_t sd = sizeof(double)
 
@@ -295,12 +289,6 @@ cdef class CartToInternal:
         if self.ndihedrals > 0:
             memset(&self.d2q_dihedrals[0, 0, 0, 0, 0], 0,
                    self.ndihedrals * 144 * sd)
-        if self.nangle_sums > 0:
-            memset(&self.d2q_angle_sums[0, 0, 0, 0, 0], 0,
-                   self.nangle_sums * 144 * sd)
-        if self.nangle_diffs > 0:
-            memset(&self.d2q_angle_diffs[0, 0, 0, 0, 0], 0,
-                   self.nangle_diffs * 144 * sd)
         memset(&self.work1[0, 0, 0, 0], 0, 297 * sd)
         memset(&self.work2[0, 0], 0, self.nx * sd)
 
@@ -319,8 +307,11 @@ cdef class CartToInternal:
         for n in range(self.nbonds):
             i = self.bonds[n, 0]
             j = self.bonds[n, 1]
-            err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
+            nj = self.bonds[n, 2]
+            err = self.get_dx(i, j, nj, self.dx1)
+
             if err != 0: return err
+
             info = cart_to_bond(i, j, self.dx1, &self.q1[m + n],
                                 self.dq[m + n], self.d2q_bonds[n], grad, curv)
             if info < 0: return info
@@ -330,10 +321,14 @@ cdef class CartToInternal:
             i = self.angles[n, 0]
             j = self.angles[n, 1]
             k = self.angles[n, 2]
-            err = vec_sum(self.pos[k], self.pos[j], self.dx2, -1.)
+            nj = self.angles[n, 3]
+            nk = self.angles[n, 4]
+
+            err = self.get_dx(i, j, nj, self.dx1)
             if err != 0: return err
-            err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
+            err = self.get_dx(j, k, nk, self.dx2)
             if err != 0: return err
+
             info = cart_to_angle(i, j, k, self.dx1, self.dx2, &self.q1[m + n],
                                  self.dq[m + n], self.d2q_angles[n],
                                  self.work1, grad, curv)
@@ -345,32 +340,21 @@ cdef class CartToInternal:
             j = self.dihedrals[n, 1]
             k = self.dihedrals[n, 2]
             l = self.dihedrals[n, 3]
-            err = vec_sum(self.pos[l], self.pos[k], self.dx3, -1.)
+            nj = self.dihedrals[n, 4]
+            nk = self.dihedrals[n, 5]
+            nl = self.dihedrals[n, 6]
+
+            err = self.get_dx(i, j, nj, self.dx1)
             if err != 0: return err
-            err = vec_sum(self.pos[k], self.pos[j], self.dx2, -1.)
+            err = self.get_dx(j, k, nk, self.dx2)
             if err != 0: return err
-            err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
+            err = self.get_dx(k, l, nl, self.dx3)
             if err != 0: return err
+
             info = cart_to_dihedral(i, j, k, l, self.dx1, self.dx2, self.dx3,
                                     &self.q1[m + n], self.dq[m + n],
                                     self.d2q_dihedrals[n], self.work1,
                                     grad, curv)
-            if info < 0:
-                return info
-
-        m += self.ndihedrals
-        for n in range(self.nangle_sums):
-            info = self._angle_sum_diff(self.angle_sums[n], 1.,
-                                        &self.q1[m + n], self.dq[m + n],
-                                        self.d2q_angle_sums[n], grad, curv)
-            if info < 0:
-                return info
-
-        m += self.nangle_sums
-        for n in range(self.nangle_diffs):
-            info = self._angle_sum_diff(self.angle_diffs[n], -1.,
-                                        &self.q1[m + n], self.dq[m + n],
-                                        self.d2q_angle_diffs[n], grad, curv)
             if info < 0:
                 return info
 
@@ -415,76 +399,6 @@ cdef class CartToInternal:
         self.calc_required = False
         return 0
 
-
-    cdef int _angle_sum_diff(CartToInternal self,
-                             int[:] indices,
-                             double sign,
-                             double* q,
-                             double[:, :] dq,
-                             double[:, :, :, :] d2q,
-                             bint grad,
-                             bint curv) nogil:
-        cdef int err
-        cdef size_t i, j, k, l, m
-        cdef size_t sd = sizeof(double)
-        memset(&self.work1[0, 0, 0, 0], 0, 297 * sd)
-        memset(&self.work2[0, 0], 0, self.nx * sd)
-        i = indices[0]
-        j = indices[1]
-        k = indices[2]
-        l = indices[3]
-
-        # First part of the angle sum/diff
-        err = vec_sum(self.pos[l], self.pos[j], self.dx2, -1.)
-        if err != 0: return err
-        err = vec_sum(self.pos[j], self.pos[i], self.dx1, -1.)
-        if err != 0: return err
-        info = cart_to_angle(i, j, l, self.dx1, self.dx2,
-                             q, dq, self.work1[4:7], self.work1,
-                             grad, curv)
-        # Second part
-        self.dx1[:] = self.pos[j, :]
-        daxpy(&THREE, &DNUNITY, &self.pos[k, 0], &UNITY, &self.dx1[0], &UNITY)
-        err = cart_to_angle(k, j, l, self.dx1, self.dx2,
-                            &self.work1[3, 0, 0, 0], self.work2,
-                            self.work1[7:10], self.work1,
-                            grad, curv)
-        if err != 0: return err
-
-        # Combine results
-        q[0] += sign * self.work1[3, 0, 0, 0]
-        if grad or curv:
-            daxpy(&self.nx, &sign, &self.work2[0, 0], &UNITY,
-                  &dq[0, 0], &UNITY)
-
-        # Combine second derivatives
-        for i in range(3):
-            d2q[0, i, 0, :] = self.work1[4, i, 0, :]
-            d2q[0, i, 1, :] = self.work1[4, i, 1, :]
-            d2q[0, i, 3, :] = self.work1[4, i, 2, :]
-
-            d2q[1, i, 0, :] = self.work1[5, i, 0, :]
-            d2q[1, i, 1, :] = self.work1[5, i, 1, :]
-            d2q[1, i, 3, :] = self.work1[5, i, 2, :]
-
-            d2q[3, i, 0, :] = self.work1[6, i, 0, :]
-            d2q[3, i, 1, :] = self.work1[6, i, 1, :]
-            d2q[3, i, 3, :] = self.work1[6, i, 2, :]
-
-        for i in range(3):
-            my_daxpy(sign, self.work1[7, i, 0], d2q[2, i, 2])
-            my_daxpy(sign, self.work1[7, i, 1], d2q[2, i, 1])
-            my_daxpy(sign, self.work1[7, i, 2], d2q[2, i, 3])
-
-            my_daxpy(sign, self.work1[8, i, 0], d2q[1, i, 2])
-            my_daxpy(sign, self.work1[8, i, 1], d2q[1, i, 1])
-            my_daxpy(sign, self.work1[8, i, 2], d2q[1, i, 3])
-
-            my_daxpy(sign, self.work1[9, i, 0], d2q[3, i, 2])
-            my_daxpy(sign, self.work1[9, i, 1], d2q[3, i, 1])
-            my_daxpy(sign, self.work1[9, i, 2], d2q[3, i, 3])
-        return 0
-
     def guess_hessian(self, atoms, dummies=None, double h0cart=70.):
         if (dummies is None or len(dummies) == 0) and self.ndummies > 0:
             raise ValueError("Must provide dummy atoms!")
@@ -511,7 +425,7 @@ cdef class CartToInternal:
 
         cdef int i
         cdef int n
-        cdef int a, b, c, d
+        cdef int a, b, c, d, nb, nc, err
         cdef double Hartree = units.Hartree
         cdef double Bohr = units.Bohr
         cdef double rcovab, rcovbc
@@ -520,6 +434,7 @@ cdef class CartToInternal:
         # FIXME: for some reason, this fails at runtime when the gil
         # has been released
         with nogil:
+            err = 0
             for i in range(self.nbonds):
                 nbonds[self.bonds[i, 0]] += 1
                 nbonds[self.bonds[i, 1]] += 1
@@ -536,67 +451,47 @@ cdef class CartToInternal:
 
             conv = Hartree / Bohr**2
             for i in range(self.nbonds):
+                if err != 0: break
                 a = self.bonds[i, 0]
                 b = self.bonds[i, 1]
-                h0[n] = _h0_bond(rij[a, b], rcov[a] + rcov[b], conv)
-                #h0[n] = self._h0_bond(self.bonds[i, 0], self.bonds[i, 1],
-                #                      rij, rcov, conv)
+                nb = self.bonds[i, 2]
+                err = self.get_dx(a, b, nb, self.dx1)
+                if err != 0: break
+                h0[n] = _h0_bond(my_dnrm2(self.dx1), rcov[a] + rcov[b], conv)
                 n += 1
 
             conv = Hartree
             for i in range(self.nangles):
+                if err != 0: break
                 a = self.angles[i, 0]
                 b = self.angles[i, 1]
                 c = self.angles[i, 2]
-                h0[n] = _h0_angle(rij[a, b], rij[b, c], rcov[a] + rcov[b],
-                                  rcov[b] + rcov[c], conv)
-                #h0[n] = self._h0_angle(self.angles[i, 0], self.angles[i, 1],
-                #                       self.angles[i, 2], rij, rcov, conv)
+                nb = self.angles[i, 3]
+                nc = self.angles[i, 4]
+                err = self.get_dx(a, b, nb, self.dx1)
+                if err != 0: break
+                err = self.get_dx(b, c, nc, self.dx2)
+                if err != 0: break
+                h0[n] = _h0_angle(
+                    my_dnrm2(self.dx1), my_dnrm2(self.dx2), rcov[a] + rcov[b],
+                    rcov[b] + rcov[c], conv
+                )
                 n += 1
 
             for i in range(self.ndihedrals):
+                if err != 0: break
                 b = self.dihedrals[i, 1]
                 c = self.dihedrals[i, 2]
-                h0[n] = _h0_dihedral(rij[b, c], rcov[b] + rcov[c],
-                                     nbonds[b] + nbonds[c] - 2, conv)
-                #h0[n] = self._h0_dihedral(self.dihedrals[i, 0],
-                #                          self.dihedrals[i, 1],
-                #                          self.dihedrals[i, 2],
-                #                          self.dihedrals[i, 3],
-                #                          nbonds, rij, rcov, conv)
+                nc = self.dihedrals[i, 5]
+                err = self.get_dx(b, c, nc, self.dx1)
+                if err != 0: break
+                h0[n] = _h0_dihedral(
+                    my_dnrm2(self.dx1), rcov[b] + rcov[c],
+                    nbonds[b] + nbonds[c] - 2, conv
+                )
                 n += 1
-
-            for i in range(self.nangle_sums):
-                a = self.angle_sums[i, 0]
-                b = self.angle_sums[i, 1]
-                c = self.angle_sums[i, 2]
-                h0[n] = _h0_angle(rij[a, b], rij[b, c], rcov[a] + rcov[b],
-                                  rcov[b] + rcov[c], conv)
-                #h0[n] = self._h0_angle(self.angle_sums[i, 0],
-                #                       self.angle_sums[i, 1],
-                #                       self.angle_sums[i, 3],
-                #                       rij, rcov, conv)
-                #h0[n] += self._h0_angle(self.angle_sums[i, 2],
-                #                        self.angle_sums[i, 1],
-                #                        self.angle_sums[i, 3],
-                #                        rij, rcov, conv)
-                n += 1
-
-            for i in range(self.nangle_diffs):
-                a = self.angle_diffs[i, 0]
-                b = self.angle_diffs[i, 1]
-                c = self.angle_diffs[i, 2]
-                h0[n] = _h0_angle(rij[a, b], rij[b, c], rcov[a] + rcov[b],
-                                  rcov[b] + rcov[c], conv)
-                #h0[n] = self._h0_angle(self.angle_diffs[i, 0],
-                #                       self.angle_diffs[i, 1],
-                #                       self.angle_diffs[i, 3],
-                #                       rij, rcov, conv)
-                #h0[n] -= self._h0_angle(self.angle_diffs[i, 2],
-                #                        self.angle_diffs[i, 1],
-                #                        self.angle_diffs[i, 3],
-                #                        rij, rcov, conv)
-                n += 1
+        if err != 0:
+            raise RuntimeError("Model Hessian evaluation failed!")
 
         return np.diag(np.abs(h0_np))
 
@@ -685,22 +580,22 @@ cdef class CartToInternal:
             raise RuntimeError("Internal update failed with error code {}"
                                "".format(info))
         cdef int start
-        cdef int i, j
+        cdef int i, j, n
         cdef bint bad = False
         dx_np = np.zeros(3, dtype=np.float64)
         cdef double[:] dx = memoryview(dx_np)
         cdef int sddx = dx.strides[0] >> 3
         cdef double dist, rcovij
         cdef double dxmin
-        bond_check_np = np.zeros((self.nbonds, 2), dtype=np.int32)
+        bond_check_np = np.zeros((self.nbonds, 3), dtype=np.int32)
         cdef int[:, :] bond_check = memoryview(bond_check_np)
         cdef int nbond_check = 0
 
-        angle_check_np = np.zeros((self.nangles, 3), dtype=np.int32)
+        angle_check_np = np.zeros((self.nangles, 5), dtype=np.int32)
         cdef int[:, :] angle_check = memoryview(angle_check_np)
         cdef int nangle_check = 0
 
-        dihedral_check_np = np.zeros((self.ndihedrals, 4), dtype=np.int32)
+        dihedral_check_np = np.zeros((self.ndihedrals, 7), dtype=np.int32)
         cdef int[:, :] dihedral_check = memoryview(dihedral_check_np)
         cdef int ndihedral_check = 0
 
@@ -718,22 +613,28 @@ cdef class CartToInternal:
 
             # Check whether any atoms are too close, using a different
             # threshold for bonded and nonbonded atoms.
-            for i in range(self.nreal - 1):
-                for j in range(i + 1, self.nreal):
-                    if self.bmat[i, j]:
-                        dxmin = 0.5
-                    else:
-                        dxmin = 1.25
-                    info = self.get_dx(i, j, dx)
-                    if info != 0:  break
-                    dist = dnrm2(&THREE, &dx[0], &sddx)
-                    rcovij = self.rcov[i] + self.rcov[j]
-                    if dist < dxmin * rcovij:
-                        if self.bmat[i, j]:
-                            bond_check[nbond_check, 0] = i
-                            bond_check[nbond_check, 1] = j
-                            nbond_check += 1
-                        bad = True
+            for i in range(self.nreal):
+                for j in range(i, self.nreal):
+                    if self.bulklike[i] and self.bulklike[j]:
+                        continue
+                    for n in range(len(self.cellvecs)):
+                        if i == j and n == 0:
+                            continue
+                        if self.bmat[i, j, n]:
+                            dxmin = 0.5
+                        else:
+                            dxmin = 1.25
+                        info = self.get_dx(i, j, n, dx)
+                        if info != 0:  break
+                        dist = dnrm2(&THREE, &dx[0], &sddx)
+                        rcovij = self.rcov[i] + self.rcov[j]
+                        if dist < dxmin * rcovij:
+                            if self.bmat[i, j, n]:
+                                bond_check[nbond_check, 0] = i
+                                bond_check[nbond_check, 1] = j
+                                bond_check[nbond_check, 2] = n
+                                nbond_check += 1
+                            bad = True
                 if info != 0:  break
 
             ndihedral_check = self.check_dihedrals(dihedral_check, work)
@@ -754,25 +655,29 @@ cdef class CartToInternal:
     cdef bint check_angle(CartToInternal self, double angle) nogil:
         return (self.atol < angle < pi - self.atol)
 
-    cdef int get_dx(CartToInternal self, int i, int j, double[:] dx) nogil:
-        # TODO: implement PBC
-        return vec_sum(self.pos[j], self.pos[i], dx, -1.)
+    cdef int get_dx(CartToInternal self, int i, int j, int nj,
+                    double[:] dx) nogil:
+        err = vec_sum(self.pos[j], self.pos[i], dx, -1.)
+        if err != 0: return err
+        return my_daxpy(1., self.cellvecs[nj], dx)
 
     cdef int check_dihedrals(CartToInternal self,
                              int[:, :] dihedral_check,
                              double[:, :] work) nogil:
         cdef int ndihedral_check = 0
-        cdef int n, m, i, j, k, l
+        cdef int n, m, i, j, k, l, nj, nk
         cdef double adotb, anorm, bnorm, angle
         for n in range(self.ndihedrals):
             for m in range(2):
                 i = self.dihedrals[n, m + 0]
                 j = self.dihedrals[n, m + 1]
                 k = self.dihedrals[n, m + 2]
+                nj = self.dihedrals[n, m + 4]
+                nk = self.dihedrals[n, m + 5]
 
-                info = self.get_dx(i, j, work[0])
+                info = self.get_dx(i, j, nj, work[0])
                 if info != 0:  break
-                info = self.get_dx(k, j, work[1])
+                info = self.get_dx(k, j, self.tneg[nk], work[1])
                 if info != 0:  break
                 adotb = my_ddot(work[0], work[1])
                 anorm = my_dnrm2(work[0])
@@ -986,19 +891,17 @@ cdef class Constraints(CartToInternal):
 
 
 cdef class D2q:
-    def __cinit__(D2q self,
-                  int natoms,
-                  int ncart,
-                  int[:, :] bonds,
-                  int[:, :] angles,
-                  int[:, :] dihedrals,
-                  int[:, :] angle_sums,
-                  int[:, :] angle_diffs,
-                  double[:, :, :, :, :] Dbonds,
-                  double[:, :, :, :, :] Dangles,
-                  double[:, :, :, :, :] Ddihedrals,
-                  double[:, :, :, :, :] Dangle_sums,
-                  double[:, :, :, :, :] Dangle_diffs):
+    def __cinit__(
+        D2q self,
+        int natoms,
+        int ncart,
+        int[:, :] bonds,
+        int[:, :] angles,
+        int[:, :] dihedrals,
+        double[:, :, :, :, :] Dbonds,
+        double[:, :, :, :, :] Dangles,
+        double[:, :, :, :, :] Ddihedrals
+    ):
         self.natoms = natoms
         self.nx = 3 * self.natoms
 
@@ -1013,14 +916,7 @@ cdef class D2q:
         self.dihedrals = dihedrals
         self.ndihedrals = len(self.dihedrals)
 
-        self.angle_sums = angle_sums
-        self.nangle_sums = len(self.angle_sums)
-
-        self.angle_diffs = angle_diffs
-        self.nangle_diffs = len(self.angle_diffs)
-
-        self.nq = (self.nbonds + self.nangles + self.ndihedrals
-                   + self.nangle_sums + self.nangle_diffs)
+        self.nq = self.ncart + self.nbonds + self.nangles + self.ndihedrals
 
         self.Dbonds = memoryview(np.zeros((self.nbonds, 2, 3, 2, 3),
                                           dtype=np.float64))
@@ -1033,14 +929,6 @@ cdef class D2q:
         self.Ddihedrals = memoryview(np.zeros((self.ndihedrals, 4, 3, 4, 3),
                                               dtype=np.float64))
         self.Ddihedrals[...] = Ddihedrals
-
-        self.Dangle_sums = memoryview(np.zeros((self.nangle_sums, 4, 3, 4, 3),
-                                               dtype=np.float64))
-        self.Dangle_sums[...] = Dangle_sums
-
-        self.Dangle_diffs = memoryview(np.zeros((self.nangle_diffs, 4, 3, 4, 3),
-                                                dtype=np.float64))
-        self.Dangle_diffs[...] = Dangle_diffs
 
         self.work1 = memoryview(np.zeros((4, 3), dtype=np.float64))
         self.work2 = memoryview(np.zeros((4, 3), dtype=np.float64))
@@ -1065,12 +953,6 @@ cdef class D2q:
             m += self.nangles
             self._ld(m, self.ndihedrals, 4, self.dihedrals, self.Ddihedrals,
                      v1, res)
-            m += self.ndihedrals
-            self._ld(m, self.nangle_sums, 4, self.angle_sums, self.Dangle_sums,
-                     v1, res)
-            m += self.nangle_sums
-            self._ld(m, self.nangle_diffs, 4, self.angle_diffs,
-                     self.Dangle_diffs, v1, res)
         return result_np.reshape((self.nx, self.nx))
 
     cdef int _ld(D2q self,
@@ -1109,12 +991,6 @@ cdef class D2q:
             m += self.nangles
             self._rd(m, self.ndihedrals, 4, self.dihedrals, self.Ddihedrals,
                      v1, res)
-            m += self.ndihedrals
-            self._rd(m, self.nangle_sums, 4, self.angle_sums, self.Dangle_sums,
-                     v1, res)
-            m += self.nangle_sums
-            self._rd(m, self.nangle_diffs, 4, self.angle_diffs,
-                     self.Dangle_diffs, v1, res)
         return result_np.reshape((self.nq, self.nx))
 
 
@@ -1158,12 +1034,6 @@ cdef class D2q:
             m += self.nangles
             self._dd(m, self.ndihedrals, 4, self.dihedrals, self.Ddihedrals,
                      v1, v2, res)
-            m += self.ndihedrals
-            self._dd(m, self.nangle_sums, 4, self.angle_sums, self.Dangle_sums,
-                     v1, v2, res)
-            m += self.nangle_sums
-            self._dd(m, self.nangle_diffs, 4, self.angle_diffs,
-                     self.Dangle_diffs, v1, v2, res)
         return result_np
 
     cdef int _dd(D2q self,

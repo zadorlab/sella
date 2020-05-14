@@ -132,13 +132,22 @@ class MatrixSum(LinearOperator):
 
 
 class ApproximateHessian(LinearOperator):
-    def __init__(self, dim, B0=None, update_method='TS-BFGS', symm=2):
+    def __init__(
+        self,
+        dim: int,
+        ncart: int,
+        B0: np.ndarray = None,
+        update_method: str = 'TS-BFGS',
+        symm: int = 2,
+    ) -> None:
         """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
+        self.ncart = ncart
         self.shape = (self.dim, self.dim)
         self.dtype = np.float64
         self.update_method = update_method
         self.symm = symm
+        self.initialized = False
 
         self.set_B(B0)
 
@@ -156,7 +165,22 @@ class ApproximateHessian(LinearOperator):
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
-        self.set_B(update_H(self.B, dx, dg, method=self.update_method,
+        if self.B is None:
+            B = np.zeros(self.shape, dtype=self.dtype)
+        else:
+            B = self.B.copy()
+        if not self.initialized:
+            self.initialized = True
+            dx_cart = dx[:self.ncart]
+            dg_cart = dg[:self.ncart]
+            B[:self.ncart, :self.ncart] = update_H(
+                None, dx_cart, dg_cart, method=self.update_method, symm=self.symm,
+                lams=None, vecs=None
+            )
+            self.set_B(B)
+            return
+
+        self.set_B(update_H(B, dx, dg, method=self.update_method,
                             symm=self.symm, lams=self.evals, vecs=self.evecs))
 
     def project(self, U):
@@ -169,7 +193,7 @@ class ApproximateHessian(LinearOperator):
         else:
             Bproj = U.T @ self.B @ U
 
-        return ApproximateHessian(n, Bproj, self.update_method,
+        return ApproximateHessian(n, 0, Bproj, self.update_method,
                                   self.symm)
 
     def asarray(self):
@@ -196,9 +220,11 @@ class ApproximateHessian(LinearOperator):
     def __add__(self, other):
         if isinstance(other, ApproximateHessian):
             other = other.B
-        if self.B is None or other is None:
+        if not self.initialized or other is None:
+        #if self.B is None or other is None:
             tot = None
         else:
             tot = self.B + other
-        return ApproximateHessian(self.dim, tot, self.update_method,
-                                  self.symm)
+        return ApproximateHessian(
+            self.dim, self.ncart, tot, self.update_method, self.symm
+        )
