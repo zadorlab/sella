@@ -77,12 +77,12 @@ class PES:
             self.dummies.positions = dpos
 
     def set_constraints(self, c):
-        self.con_user, self.target_user = merge_user_constraints(self.atoms, c)
-        self.cons = get_constraints(self.atoms,
-                                    self.con_user,
-                                    self.target_user,
-                                    proj_trans=self.proj_trans,
-                                    proj_rot=self.proj_rot)
+        self.conbuilder = ConstraintBuilder(self.atoms, c)
+        self.cons = self.conbuilder.get_constraints(
+            self.atoms,
+            proj_trans=self.proj_trans,
+            proj_rot=self.proj_rot,
+        )
 
     # Position getter/setter
     def set_x(self, target):
@@ -299,7 +299,6 @@ class InternalPES(PES):
                  extra_bonds=None, atol=15, **kwargs):
         PES.__init__(self, atoms, *args, H0=None, **kwargs)
         self.atol = atol
-        self.conbuilder = ConstraintBuilder(self.con_user, self.target_user)
         intbuilder = InternalBuilder(self.atoms, self.conbuilder)
         intbuilder.find_bonds()
         intbuilder.find_angles(self.atol)

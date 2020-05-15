@@ -169,7 +169,7 @@ cdef class CartToInternal:
         self.ndihedrals = len(self.dihedrals)
 
         if bulklike is None:
-            self.bulklike = memoryview(np.zeros(self.nreal, dtype=bool))
+            self.bulklike = memoryview(np.zeros(self.nreal, dtype=np.uint8))
         else:
             self.bulklike = bulklike
 

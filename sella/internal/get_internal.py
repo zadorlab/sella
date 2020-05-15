@@ -59,7 +59,7 @@ class InternalBuilder:
             if np.any((np.asarray(ijk) != 0) * np.logical_not(self.atoms.pbc)):
                 continue
             tvecs.append(np.asarray(ijk) @ self.atoms.cell)
-        self.tvecs = np.array(tvecs)
+        self.tvecs = np.array(tvecs, dtype=np.float64)
 
         # For each translation vector, find its inverse
         self.tneg = -np.ones(self.ntvecs, dtype=np.int32)
@@ -210,7 +210,7 @@ class InternalBuilder:
                             self.nbonds[j] += 1
             scale *= 1.05
 
-        self.bulklike = (self.nbonds >= self._BBULK)
+        self.bulklike = np.array((self.nbonds >= self._BBULK), dtype=np.uint8)
 
         bonds = []
         cart = []

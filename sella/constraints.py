@@ -96,45 +96,12 @@ def _add_dihedral(atoms, arg, con, target):
         raise ValueError("Invalid dihedral constraint:", arg)
 
 
-def _add_angle_sum(atoms, arg, con, target):
-    if not isinstance(arg, Sequence):
-        raise ValueError("Invalid angle sum constraint:", arg)
-    n = len(arg)
-    if n == 2:
-        if not isinstance(arg[0], Sequence) or len(arg[0]) != 4:
-            raise ValueError("Invalid angle sum constraint:", arg)
-        _add_check(arg[0], con)
-        target.append(arg[1] * np.pi / 180.)
-    elif n == 4:
-        _add_check(arg, con)
-        a1 = atoms.get_angle(arg[0], arg[1], arg[3])
-        a2 = atoms.get_angle(arg[2], arg[1], arg[3])
-        target.append((a1 + a2) * np.pi / 180.)
-    else:
-        raise ValueError("Invalid angle sum constraint:", arg)
-
-
-def _add_angle_diff(atoms, arg, con, target):
-    if not isinstance(arg, Sequence):
-        raise ValueError("Invalid angle diff constraint:", arg)
-    n = len(arg)
-    if n == 2:
-        if not isinstance(arg[0], Sequence) or len(arg[0]) != 4:
-            raise ValueError("Invalid angle diff constraint:", arg)
-        _add_check(arg[0], con)
-        target.append(arg[1] * np.pi / 180.)
-    elif n == 4:
-        _add_check(arg, con)
-        a1 = atoms.get_angle(arg[0], arg[1], arg[3])
-        a2 = atoms.get_angle(arg[2], arg[1], arg[3])
-        target.append((a1 - a2) * np.pi / 180.)
-    else:
-        raise ValueError("Invalid angle diff constraint:", arg)
-
-
-_con_adders = dict(cart=_add_cart, bonds=_add_bond, angles=_add_angle,
-                   dihedrals=_add_dihedral, angle_sums=_add_angle_sum,
-                   angle_diffs=_add_angle_diff)
+_con_adders = dict(
+    cart=_add_cart,
+    bonds=_add_bond,
+    angles=_add_angle,
+    dihedrals=_add_dihedral,
+)
 
 
 def merge_user_constraints(atoms, con_user=None):
@@ -174,10 +141,6 @@ def merge_internal_constraints(con_user, target_user, bcons, acons, dcons,
     for arg in dcons:
         con_out['dihedrals'].append(_sort_indices(arg))
         target_out['dihedrals'].append(np.pi)
-
-    for arg in adiffs:
-        con_out['angle_diffs'].append(_sort_indices(arg))
-        target_out['angle_diffs'].append(0.)
 
     return con_out, target_out
 
@@ -279,30 +242,40 @@ class ConstraintBuilder:
 
     def __init__(
         self,
-        user_cons: Dict[str, np.ndarray] = None,
-        user_target: Dict[str, np.ndarray] = None
+        atoms: Atoms,
+        con_user: Dict[str, np.ndarray] = None,
     ) -> None:
-        self.user_cons = user_cons
-        if self.user_cons is None:
-            self.user_cons = dict()
-        self.user_target = user_target
-        if self.user_target is None:
-            self.user_target = dict()
+        if atoms.constraints:
+            con_ase = _ase_constraints_to_dict(atoms.constraints)
+        else:
+            con_ase = dict()
 
-        for key in self.shapes.keys():
-            if key not in self.user_cons:
-                self.user_cons[key] = []
-            if key not in self.user_target:
-                self.user_target[key] = []
+        if con_user is None:
+            con_user = dict()
 
+        self.user_cons = {kind: [] for kind in self.shapes.keys()}
+        self.user_target = {kind: [] for kind in self.shapes.keys()}
+
+        for kind in self.shapes.keys():
+            for con in [con_ase, con_user]:
+                for val in con.get(kind, []):
+                    _con_adders[kind](
+                        atoms, val, self.user_cons[kind], self.user_target[kind]
+                    )
         self.dummy_cons = {key: [] for key in self.shapes.keys()}
 
     def add_constraint(self, key: str, *args: List[int]) -> None:
         assert len(args) == self.shapes[key]
         self.dummy_cons[key].append(args)
 
-    def get_constraints(self, atoms: Atoms, dummies: Atoms,
-                        dinds: np.ndarray) -> Constraints:
+    def get_constraints(
+        self,
+        atoms: Atoms,
+        dummies: Atoms = None,
+        dinds: np.ndarray = None,
+        proj_trans: bool = True,
+        proj_rot: bool = True,
+    ) -> Constraints:
         con_out = self.user_cons.copy()
         target_out = self.user_target.copy()
 
@@ -329,5 +302,7 @@ class ConstraintBuilder:
                 con_out[kind] = None
         target_all = np.array(target_all, dtype=np.float64)
 
-        return Constraints(atoms, target_all, dummies=dummies, dinds=dinds,
-                           proj_trans=False, proj_rot=False, **con_out)
+        return Constraints(
+            atoms, target_all, dummies=dummies, dinds=dinds,
+            proj_trans=proj_trans, proj_rot=proj_rot, **con_out,
+        )
