@@ -165,12 +165,10 @@ class MaxInternalStep(BaseRestrictedStep):
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
-        w = np.array([self.wx] * self.pes.int.ncart
+        w = np.array([self.wx] * self.pes.int.ntrans
                      + [self.wb] * self.pes.int.nbonds
                      + [self.wa] * self.pes.int.nangles
-                     + [self.wd] * self.pes.int.ndihedrals
-                     + [self.wa] * self.pes.int.nangle_sums
-                     + [self.wa] * self.pes.int.nangle_diffs)
+                     + [self.wd] * self.pes.int.ndihedrals)
         assert len(w) == len(s)
 
         sw = np.abs(s * w)

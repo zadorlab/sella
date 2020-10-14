@@ -1,6 +1,9 @@
+from typing import Union
+
 import numpy as np
 from scipy.linalg import eigh
 from scipy.integrate import LSODA
+from ase import Atoms
 from ase.utils import basestring
 from ase.visualize import view
 from ase.calculators.singlepoint import SinglePointCalculator
@@ -9,26 +12,35 @@ from ase.io.trajectory import Trajectory
 from sella.utilities.math import modified_gram_schmidt
 from sella.hessian_update import symmetrize_Y
 from sella.linalg import NumericalHessian, ApproximateHessian
-from sella.constraints import get_constraints, merge_user_constraints
 from sella.eigensolvers import rayleigh_ritz
-from sella.internal.get_internal import get_internal
+from sella.internal import Internals, Constraints, DuplicateInternalError
 
 
 class PES:
-    def __init__(self,
-                 atoms,
-                 H0=None,
-                 constraints=None,
-                 eigensolver='jd0',
-                 trajectory=None,
-                 eta=1e-4,
-                 v0=None,
-                 proj_trans=True,
-                 proj_rot=True):
+    def __init__(
+        self,
+        atoms: Atoms,
+        H0: np.ndarray = None,
+        constraints: Constraints = None,
+        eigensolver: str = 'jd0',
+        trajectory: Union[str, Trajectory] = None,
+        eta: float = 1e-4,
+        v0: np.ndarray = None,
+        proj_trans: bool = True,
+        proj_rot: bool = True
+    ) -> None:
         self.atoms = atoms
-        self.proj_trans = proj_trans
-        self.proj_rot = proj_rot
-        self.set_constraints(constraints)
+        if proj_trans:
+            try:
+                constraints.fix_translation()
+            except DuplicateInternalError:
+                pass
+        if proj_rot:
+            try:
+                constraints.fix_rotation()
+            except DuplicateInternalError:
+                pass
+        self.cons = constraints
         self.eigensolver = eigensolver
 
         if trajectory is not None:
@@ -75,14 +87,6 @@ class PES:
         if dpos is not None:
             self.dummies.positions = dpos
 
-    def set_constraints(self, c):
-        self.con_user, self.target_user = merge_user_constraints(self.atoms, c)
-        self.cons = get_constraints(self.atoms,
-                                    self.con_user,
-                                    self.target_user,
-                                    proj_trans=self.proj_trans,
-                                    proj_rot=self.proj_rot)
-
     # Position getter/setter
     def set_x(self, target):
         diff = target - self.get_x()
@@ -101,7 +105,7 @@ class PES:
 
     # Hessian of the constraints
     def get_Hc(self):
-        return self.cons.get_D(self.apos, self.dpos).ldot(self.curr['L'])
+        return np.einsum('i,ijk->jk', self.curr['L'], self.cons.hessian())
 
     # Hessian of the Lagrangian
     def get_HL(self):
@@ -109,10 +113,10 @@ class PES:
 
     # Getters for constraints and their derivatives
     def get_res(self):
-        return self.cons.get_res(self.apos, self.dpos).copy()
+        return self.cons.residual()
 
     def get_drdx(self):
-        return self.cons.get_drdx(self.apos, self.dpos).copy()
+        return np.linalg.pinv(self.cons.jacobian()).T
 
     def _calc_basis(self):
         drdx = self.get_drdx()
@@ -158,7 +162,6 @@ class PES:
             else:
                 return False
         drdx, Ucons, Unred, Ufree = self._calc_basis()
-
 
         if feval:
             f, g = self.eval()
@@ -276,7 +279,7 @@ class PES:
 
         dx_initial, dx_final, g_par = self.set_x(x0 + dx)
 
-        #dx_actual = self.wrap_dx(self.get_x() - x0)
+        # dx_actual = self.wrap_dx(self.get_x() - x0)
         df_pred = self.get_df_pred(dx_initial, g0, B0)
         dg_actual = self.get_g() - g_par
         df_actual = self.get_f() - f0
@@ -294,18 +297,40 @@ class PES:
 
 
 class InternalPES(PES):
-    def __init__(self, atoms, *args, H0=None, angles=True, dihedrals=True,
-                 extra_bonds=None, **kwargs):
-        PES.__init__(self, atoms, *args, H0=None, **kwargs)
-        self.int, self.cons, self.dummies = get_internal(atoms, self.con_user,
-                                                         self.target_user)
+    def __init__(
+        self,
+        atoms: Atoms,
+        internals: Internals,
+        *args,
+        H0: np.ndarray = None,
+        **kwargs
+    ):
+        self.int_orig = internals
+        new_int = internals.copy()
+        new_int.find_all_bonds()
+        new_int.find_all_angles()
+        new_int.find_all_dihedrals()
+
+        PES.__init__(
+            self,
+            atoms,
+            *args,
+            constraints=new_int.cons,
+            H0=None,
+            proj_trans=False,
+            proj_rot=False,
+            **kwargs
+        )
+
+        self.int = new_int
+        self.dummies = self.int.dummies
         self.dim = len(self.get_x())
         if H0 is None:
             # Construct guess hessian and zero out components in
             # infeasible subspace
-            B = self.int.get_B(self.apos, self.dpos)
-            P = B @ self.int.get_Binv(self.apos, self.dpos)
-            H0 = P @ self.int.guess_hessian(self.atoms, self.dummies) @ P
+            B = self.int.jacobian()
+            P = B @ np.linalg.pinv(B)
+            H0 = P @ self.int.guess_hessian() @ P
         self.set_H(H0)
 
         # Flag used to indicate that new internal coordinates are required
@@ -318,7 +343,7 @@ class InternalPES(PES):
         dx = target - self.get_x()
 
         t0 = 0.
-        Binv = self.int.get_Binv(self.apos, self.dpos)
+        Binv = np.linalg.pinv(self.int.jacobian())
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         Binv @ dx,
                         Binv @ self.curr.get('g', np.zeros_like(dx))))
@@ -328,8 +353,7 @@ class InternalPES(PES):
             ode.step()
             y = ode.y
             t0 = ode.t
-            self.bad_int = self.int.check_for_bad_internal(self.apos,
-                                                           self.dpos)
+            self.bad_int = self.int.check_for_bad_internals()
             if self.bad_int is not None:
                 print('Bad internals found!')
                 break
@@ -341,83 +365,83 @@ class InternalPES(PES):
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
 
-
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)
         y = y.reshape((3, nxa + nxd))
         self.atoms.positions = y[0, :nxa].reshape((-1, 3))
         self.dummies.positions = y[0, nxa:].reshape((-1, 3))
-        B = self.int.get_B(self.apos, self.dpos)
+        B = self.int.jacobian()
         dx_final = t0 * B @ y[1]
         g_final = B @ y[2]
         dx_initial = t0 * dx
         return dx_initial, dx_final, g_final
 
     def get_x(self):
-        return self.int.get_q(self.apos, self.dpos)
+        return self.int.calc()
 
     # Hessian of the constraints
     def get_Hc(self):
-        D_cons = self.cons.get_D(self.apos, self.dpos)
-        Binv_int = self.int.get_Binv(self.apos, self.dpos)
-        B_cons = self.cons.get_B(self.apos, self.dpos)
-        D_int = self.int.get_D(self.apos, self.dpos)
+        D_cons = np.einsum('i,ijk->jk', self.curr['L'], self.cons.hessian())
+        B_int = self.int.jacobian()
+        Binv_int = np.linalg.pinv(B_int)
+        B_cons = self.cons.jacobian()
         L_int = self.curr['L'] @ B_cons @ Binv_int
-        Hc = Binv_int.T @ (D_cons.ldot(self.curr['L'])
-                           - D_int.ldot(L_int)) @ Binv_int
+        D_int = np.einsum('i,ijk->jk', L_int, self.int.hessian())
+        Hc = Binv_int.T @ (D_cons - D_int) @ Binv_int
         return Hc
 
     def get_drdx(self):
         # dr/dq = dr/dx dx/dq
-        return PES.get_drdx(self) @ self.int.get_Binv(self.apos, self.dpos)
+        return PES.get_drdx(self) @ np.linalg.pinv(self.int.jacobian())
 
     def _calc_basis(self):
         drdx = self.get_drdx()
         Ucons = modified_gram_schmidt(drdx.T)
         na = 3 * len(self.atoms)
-        B = self.int.get_B(self.apos, self.dpos)
+        B = self.int.jacobian()
         Udummy = modified_gram_schmidt(B[:, na:])
-        Binv = self.int.get_Binv(self.apos, self.dpos)
+        Binv = np.linalg.pinv(B)
         Unred = modified_gram_schmidt(B @ Binv, Udummy)
         Ufree = modified_gram_schmidt(Unred, Ucons)
         return drdx, Ucons, Unred, Ufree
 
     def eval(self):
         f, g_cart = PES.eval(self)
-        Binv = self.int.get_Binv(self.apos, self.dpos)
+        Binv = np.linalg.pinv(self.int.jacobian())
         return f, g_cart @ Binv[:len(g_cart)]
 
     def update_internals(self, dx):
         self._update(True)
 
-        if self.bad_int is None:
-            check_bonds = None
-            check_angles = None
-        else:
-            check_bonds = self.bad_int['bonds']
-            check_angles = self.bad_int['angles']
-
-        # Find new internals, constraints, and dummies
-        out = get_internal(self.atoms, self.con_user, self.target_user,
-                           dummies=self.dummies, conslast=self.cons,
-                           check_bonds=check_bonds, check_angles=check_angles)
-        new_int, new_cons, new_dummies = out
         nold = 3 * (len(self.atoms) + len(self.dummies))
 
-        # Calculate B matrix and its inverse for new and old internals
-        Blast = self.int.get_B(self.apos, self.dpos)
-        B = new_int.get_B(self.apos, new_dummies.positions)
-        Binv = new_int.get_Binv(self.apos, new_dummies.positions)
-        Dlast = self.int.get_D(self.apos, self.dpos)
-        D = new_int.get_D(self.apos, new_dummies.positions)
+        if self.bad_int is not None:
+            for bond in self.bad_int['bonds']:
+                self.int_orig.forbid_bond(bond)
+            for angle in self.bad_int['angles']:
+                self.int_orig.forbid_angle(angle)
 
-        # Projection matrices
-        P2 = B[:, nold:] @ Binv[nold:, :]
+        # Find new internals, constraints, and dummies
+        new_int = self.int_orig.copy()
+        new_int.find_all_bonds()
+        new_int.find_all_angles()
+        new_int.find_all_dihedrals()
+        new_cons = new_int.cons
+
+        # Calculate B matrix and its inverse for new and old internals
+        Blast = self.int.jacobian()
+        B = new_int.jacobian()
+        Binv = np.linalg.pinv(B)
+        Dlast = self.int.hessian()
+        D = new_int.hessian()
+
+        # # Projection matrices
+        # P2 = B[:, nold:] @ Binv[nold:, :]
 
         # Update the info in self.curr
-        x = new_int.get_q(self.apos, new_dummies.positions)
+        x = new_int.calc()
         g = -self.atoms.get_forces().ravel() @ Binv[:3*len(self.atoms)]
-        drdx = new_cons.get_drdx(self.apos, new_dummies.positions) @ Binv
+        drdx = new_cons.jacobian() @ Binv
         L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
         Ucons = modified_gram_schmidt(drdx.T)
         Unred = modified_gram_schmidt(B @ B.T)
@@ -426,14 +450,16 @@ class InternalPES(PES):
         # Update H using old data where possible. For new (dummy) atoms,
         # use the guess hessian info.
         H = self.get_H().asarray()
-        Hcart = Blast.T @ H @ Blast + Dlast.ldot(self.curr['g'])
-        Hnew = Binv.T[:, :nold]@Hcart@Binv[:nold] - Binv.T@D.ldot(g) @ Binv
+        Hcart = Blast.T @ H @ Blast
+        Hcart += np.einsum('i,ijk->jk', self.curr['g'], Dlast)
+        Hnew = Binv.T[:, :nold] @ (
+            Hcart - np.einsum('i,ijk->jk', g, D)
+        ) @ Binv
         self.dim = len(x)
         self.set_H(Hnew)
 
         self.int = new_int
         self.cons = new_cons
-        self.dummies = new_dummies
 
         self.curr.update(x=x, g=g, drdx=drdx, Ufree=Ufree,
                          Unred=Unred, Ucons=Ucons, L=L, B=B, Binv=Binv)
@@ -443,7 +469,7 @@ class InternalPES(PES):
             return None
         Unred = self.get_Unred()
         dx_r = dx @ Unred
-        #dx_r = self.wrap_dx(dx) @ Unred
+        # dx_r = self.wrap_dx(dx) @ Unred
         g_r = g @ Unred
         H_r = Unred.T @ H @ Unred
         return g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
@@ -453,11 +479,11 @@ class InternalPES(PES):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
         Ufree = self.get_Ufree()
-        B = self.int.get_B(self.apos, self.dpos)
+        B = self.int.jacobian()
         return -((Ufree @ Ufree.T) @ g @ B).reshape((-1, 3))
 
     def wrap_dx(self, dx):
-        return self.int.dq_wrap(dx)
+        return self.int.wrap(dx)
 
     # x setter aux functions
     def _q_ode(self, t, y):
@@ -471,10 +497,11 @@ class InternalPES(PES):
         self.atoms.positions = x[:nxa].reshape((-1, 3)).copy()
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
-        D = self.int.get_D(self.apos, self.dpos)
-        Binv = self.int.get_Binv(self.apos, self.dpos)
-        dydt[1] = -Binv @ D.ddot(dxdt, dxdt)
-        dydt[2] = -Binv @ D.ddot(dxdt, g)
+        D = self.int.hessian()
+        Binv = np.linalg.pinv(self.int.jacobian())
+        D_tmp = -np.einsum('ij,jkl,k->il', Binv, D, dxdt)
+        dydt[1] = D_tmp @ dxdt
+        dydt[2] = D_tmp @ g
 
         return dydt.ravel()
 
@@ -501,7 +528,7 @@ class InternalPES(PES):
         if not PES._update(self, feval=feval):
             return
 
-        B = self.int.get_B(self.apos, self.dpos)
-        Binv = self.int.get_Binv(self.apos, self.dpos)
+        B = self.int.jacobian()
+        Binv = np.linalg.pinv(B)
         self.curr.update(B=B, Binv=Binv)
         return True

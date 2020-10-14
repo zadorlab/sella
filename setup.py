@@ -18,9 +18,6 @@ else:
 cy_suff = '.pyx' if use_cython else '.c'
 
 cy_files = [['force_match'],
-            ['internal', 'int_eval'],
-            ['internal', 'int_find'],
-            ['internal', 'int_classes'],
             ['utilities', 'blas'],
             ['utilities', 'math']]
 
@@ -46,7 +43,7 @@ with open('requirements.txt', 'r') as f:
     install_requires = f.read().strip().split()
 
 setup(name='Sella',
-      version='1.0.3',
+      version='2.0.0',
       author='Eric Hermes',
       author_email='ehermes@sandia.gov',
       long_description=long_description,
@@ -60,11 +57,11 @@ setup(name='Sella',
                    'License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)',
                    'Natural Language :: English',
                    'Operating System :: OS Independent',
-                   'Programming Language :: Python :: 3.5',
+                   'Programming Language :: Python :: 3.6',
                    'Programming Language :: Cython',
                    'Topic :: Scientific/Engineering :: Chemistry',
                    'Topic :: Scientific/Engineering :: Mathematics',
                    'Topic :: Scientific/Engineering :: Physics'],
-      python_requires='>=3.5',
+      python_requires='>=3.6',
       install_requires=install_requires,
       )

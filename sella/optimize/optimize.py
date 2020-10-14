@@ -2,38 +2,68 @@
 
 import warnings
 from time import localtime, strftime
+from typing import Union
 
+import numpy as np
+from ase import Atoms
 from ase.optimize.optimize import Optimizer
 from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
 from .restricted_step import get_restricted_step
 from sella.peswrapper import PES, InternalPES
+from sella.internal import Internals, Constraints
 
-_default_kwargs = dict(minimum=dict(delta0=1e-1,
-                                    sigma_inc=1.15,
-                                    sigma_dec=0.90,
-                                    rho_inc=1.035,
-                                    rho_dec=100,
-                                    method='rfo',
-                                    eig=False),
-                       saddle=dict(delta0=1.3e-3,
-                                   sigma_inc=1.15,
-                                   sigma_dec=0.65,
-                                   rho_inc=1.035,
-                                   rho_dec=5.0,
-                                   method='prfo',
-                                   eig=True))
+_default_kwargs = dict(
+    minimum=dict(
+        delta0=1e-1,
+        sigma_inc=1.15,
+        sigma_dec=0.90,
+        rho_inc=1.035,
+        rho_dec=100,
+        method='rfo',
+        eig=False
+    ),
+    saddle=dict(
+        delta0=1.3e-3,
+        sigma_inc=1.15,
+        sigma_dec=0.65,
+        rho_inc=1.035,
+        rho_dec=5.0,
+        method='prfo',
+        eig=True
+    )
+)
 
 
 class Sella(Optimizer):
-    def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
-                 master=None, force_consistent=False, delta0=None,
-                 sigma_inc=None, sigma_dec=None, rho_dec=None, rho_inc=None,
-                 order=1, eig=None, eta=1e-4, method=None, gamma=0.4,
-                 threepoint=False, constraints=None, constraints_tol=1e-5,
-                 v0=None, internal=False, append_trajectory=False,
-                 rs=None, **kwargs):
+    def __init__(
+        self,
+        atoms: Atoms,
+        restart: bool = None,
+        logfile: str = '-',
+        trajectory: str = None,
+        master: bool = None,
+        force_consistent: bool = False,
+        delta0: float = None,
+        sigma_inc: float = None,
+        sigma_dec: float = None,
+        rho_dec: float = None,
+        rho_inc: float = None,
+        order: int = 1,
+        eig: bool = None,
+        eta: float = 1e-4,
+        method: str = None,
+        gamma: float = 0.4,
+        threepoint: bool = False,
+        constraints: Constraints = None,
+        constraints_tol: float = 1e-5,
+        v0: np.ndarray = None,
+        internal: Union[bool, Internals] = False,
+        append_trajectory: bool = False,
+        rs: str = None,
+        **kwargs
+    ):
         if order == 0:
             default = _default_kwargs['minimum']
         else:
@@ -47,11 +77,35 @@ class Sella(Optimizer):
 
         asetraj = None
         if internal:
-            MyPES = InternalPES
+            if isinstance(internal, Internals):
+                if constraints is not None:
+                    raise ValueError(
+                        "Internals object and Constraint object cannot both "
+                        "be provided to Sella. Instead, you must pass the "
+                        "Constraints object to the constructor of the "
+                        "Internals object."
+                    )
+            else:
+                internal = Internals(atoms, constraints)
+            self.pes = InternalPES(
+                atoms,
+                internals=internal,
+                trajectory=trajectory,
+                eta=eta,
+                v0=v0,
+                **kwargs
+            )
         else:
-            MyPES = PES
-        self.pes = MyPES(atoms, constraints=constraints,
-                         trajectory=trajectory, eta=eta, v0=v0, **kwargs)
+            if constraints is None:
+                constraints = Constraints(atoms)
+            self.pes = PES(
+                atoms,
+                constraints=constraints,
+                trajectory=trajectory,
+                eta=eta,
+                v0=v0,
+                **kwargs
+            )
 
         if rs is None:
             rs = 'mis' if internal else 'tr'
