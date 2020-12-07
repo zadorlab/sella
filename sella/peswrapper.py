@@ -30,6 +30,8 @@ class PES:
         proj_rot: bool = None
     ) -> None:
         self.atoms = atoms
+        if constraints is None:
+            constraints = Constraints(self.atoms)
         if proj_trans is None:
             if constraints.internals['translations']:
                 proj_trans = False
@@ -141,11 +143,9 @@ class PES:
                 idx, dim = trans.indices
                 removed_dof.append(3 * idx + dim)
                 removed_cons.append(i)
-        ndof = 3 * len(self.atoms)
-        rem_dof = [i for i in range(ndof) if i not in removed_dof]
+        rem_dof = [i for i in range(self.dim) if i not in removed_dof]
         Ufree = Unred[:, rem_dof]
-        ncons = self.cons.nint
-        rem_cons = [i for i in range(ncons) if i not in rem_dof]
+        rem_cons = [i for i in range(self.cons.nint) if i not in removed_cons]
         Ucons_red = Ucons[:, rem_cons]
         Ufree = modified_gram_schmidt(Ufree, Ucons_red)
         return drdx, Ucons, Unred, Ufree
@@ -305,7 +305,6 @@ class PES:
 
         dx_initial, dx_final, g_par = self.set_x(x0 + dx)
 
-        # dx_actual = self.wrap_dx(self.get_x() - x0)
         df_pred = self.get_df_pred(dx_initial, g0, B0)
         dg_actual = self.get_g() - g_par
         df_actual = self.get_f() - f0
