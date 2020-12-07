@@ -3,7 +3,9 @@ channels:
   - defaults
   - conda-forge
 dependencies:
-  - python >= 3.5
+  - python >= 3.6
   - scipy >=1.1.0
   - cython
   - ase
+  - jax >= 0.2.3
+  - jaxlib >= 0.1.56

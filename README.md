@@ -11,23 +11,27 @@ An example script
 from ase.build import fcc111, add_adsorbate
 from ase.calculators.emt import EMT
 
-from sella import Sella
+from sella import Sella, Constraints
 
 # Set up your system as an ASE atoms object
 slab = fcc111('Cu', (5, 5, 6), vacuum=7.5)
 add_adsorbate(slab, 'Cu', 2.0, 'bridge')
 
-# Define any constraints. Here we fix all atoms in the bottom half
-# of the slab.
-cart = [atom.index for atom in slab if atom.position[2] < slab.cell[2, 2] / 2.]
+# Optionally, create and populate a Constraints object.
+cons = Constraints(slab)
+for atom in slab:
+    if atom.position[2] < slab.cell[2, 2] / 2.:
+        cons.fix_translation(atom.index)
 
 # Set up your calculator
 slab.calc = EMT()
 
 # Set up a Sella Dynamics object
-dyn = Sella(slab,
-            constraints=dict(cart=cart),
-            trajectory='test_emt.traj')
+dyn = Sella(
+    slab,
+    constraints=cons,
+    trajectory='test_emt.traj',
+)
 
 dyn.run(1e-3, 1000)
 ```
