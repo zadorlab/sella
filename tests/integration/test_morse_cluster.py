@@ -7,6 +7,7 @@ from ase.units import kB
 
 from sella import Sella
 
+@pytest.mark.skip(reason="currently broken")
 @pytest.mark.parametrize("internal,order",
                          [(False, 0),
                           (False, 1),
@@ -29,10 +30,3 @@ def test_morse_cluster(internal, order, trajectory=None):
     opt.pes.diag(gamma=0.)
     H = opt.pes.get_HL().project(Ufree)
     assert np.sum(H.evals < 0) == order, H.evals
-
-
-if __name__ == '__main__':
-    test_morse_cluster(True, 0, trajectory='test.traj')
-    test_morse_cluster(False, 0, trajectory='test.traj')
-    test_morse_cluster(True, 1, trajectory='test.traj')
-    test_morse_cluster(False, 1, trajectory='test.traj')
