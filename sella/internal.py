@@ -359,7 +359,7 @@ class Rotation(Internal):
 
     _eval0 = staticmethod(jit(_rotation))
     _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
-    _eval2 = staticmethod(jit(jacrev(jacfwd(_rotation, argnums=0), argnums=0)))
+    _eval2 = staticmethod(jit(jacfwd(jacfwd(_rotation, argnums=0), argnums=0)))
 
 
 def _bond(
