@@ -81,6 +81,7 @@ class PES:
         self.dummies = None
 
         self.dim = 3 * len(atoms)
+        self.ncart = self.dim
         self.set_H(H0)
 
         self.savepoint = dict(apos=None, dpos=None)
@@ -114,7 +115,7 @@ class PES:
         return self.H
 
     def set_H(self, target):
-        self.H = ApproximateHessian(self.dim, target)
+        self.H = ApproximateHessian(self.dim, self.ncart, target)
 
     # Hessian of the constraints
     def get_Hc(self):
@@ -350,6 +351,7 @@ class InternalPES(PES):
         self.int = new_int
         self.dummies = self.int.dummies
         self.dim = len(self.get_x())
+        self.ncart = self.int.ncart
         if H0 is None:
             # Construct guess hessian and zero out components in
             # infeasible subspace
@@ -357,6 +359,7 @@ class InternalPES(PES):
             P = B @ np.linalg.pinv(B)
             H0 = P @ self.int.guess_hessian() @ P
         self.set_H(H0)
+        self.H.initialized = False
 
         # Flag used to indicate that new internal coordinates are required
         self.bad_int = None
