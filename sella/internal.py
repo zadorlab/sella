@@ -13,9 +13,12 @@ from ase import Atom, Atoms, units
 from ase.cell import Cell
 from ase.geometry import complete_cell, minkowski_reduce
 from ase.data import covalent_radii
+from ase.constraints import (
+    FixConstraint, FixAtoms, FixCom, FixBondLengths, FixCartesian, FixInternals
+)
 
 import jax.numpy as jnp
-from jax import jit, grad, jacfwd, jacrev
+from jax import jit, grad, jacfwd, jacrev, custom_jvp
 
 
 IVec = Tuple[int, int, int]
@@ -181,8 +184,10 @@ class Translation(Internal):
         self,
         indices: Tuple[int, ...],
     ) -> None:
-        assert len(indices) >= 2
-        self.indices = jnp.array(indices, dtype=jnp.int32)
+        assert len(indices) >= 2, indices
+        indices_sorted = sorted(indices[:-1])
+        indices_sorted.append(indices[-1])
+        self.indices = jnp.array(indices_sorted, dtype=jnp.int32)
         self.ncvecs = jnp.empty((0, 3), dtype=jnp.int32)
 
     def reverse(self) -> 'Internal':
@@ -191,12 +196,19 @@ class Translation(Internal):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return NotImplemented
-        if len(self.indices) != len(other.indices):
+        # JAX seems subtlely broken. Accessing the last element of a
+        # large jax.numpy.ndarray object is something like 5 orders of
+        # magnitude slower than accessing the last element of a
+        # numpy.ndarray objects, so we convert to numpy.ndarray here.
+        sidx = np.asarray(self.indices, dtype=np.int32)
+        oidx = np.asarray(other.indices, dtype=np.int32)
+        if sidx[-1] != oidx[-1]:
             return False
-        return (
-            set(self.indices[:-1]) == set(other.indices[:-1])
-            and self.indices[-1] == other.indices[-1]
-        )
+        if len(sidx) != len(oidx):
+            return False
+        if np.all(sidx == oidx):
+            return True
+        return False
 
     def __repr__(self) -> str:
         return "{}(indices={})".format(
@@ -209,31 +221,106 @@ class Translation(Internal):
     _eval2 = staticmethod(_hessian(_translation))
 
 
+# Nominally, jax.numpy.linalg.eigh supports auto-differentiation,
+# but if any of the eigenvalues are degenerate, the derivatives
+# of *all* eigenvectors will be NaN. Worryingly, this seems to be
+# the case when the molecule in question is sufficiently high-symmetry
+# (e.g. methane) and has not been rotated.
+#
+# We are assuming here that the eigenvector of interest corresponds
+# to a simple (non-degenerate) eigenvalue (though we permit the
+# possibility of there being other degenerate eigenvalues).
+#
+# As far as I can tell, we are limited to forward-auto-differentation,
+# at least for the first derivative, as backwards-mode requires
+# consideration of all eigenvalues/eigenvectors, which may be undefined.
+@custom_jvp
+def eigh_rightmost(X):
+    return jnp.linalg.eigh((X + X.T) / 2.)[1][:, -1]
+
+
+@eigh_rightmost.defjvp
+def eigh_rightmost_jvp(primals, tangents):
+    X, = primals
+    X = (X + X.T) / 2.
+    dX, = tangents
+    dX = (dX + dX.T) / 2.
+    dim = X.shape[0]
+    ws, vecs = jnp.linalg.eigh(X)
+    v = vecs[:, -1]
+    ldot = v.T @ dX @ v
+    # Note that the last term, `-ldot * v`, does not actually contribute
+    # to the first derivative since `v` is orthogonal to
+    # `pinv(ws[-1] * eye(dim) - X)`. However, this term must be included for
+    # the *second* derivative to be correct.
+    return v, jnp.linalg.pinv(ws[-1] * jnp.eye(dim) - X) @ (dX @ v - ldot * v)
+
+
+def _rotation_q(
+    pos: jnp.ndarray,
+    indices: jnp.ndarray,
+    refpos: jnp.ndarray
+) -> float:
+    dx = pos[indices[:-1]] - pos[indices[:-1]].mean(0)
+    R = dx.T @ refpos
+    Rtr = jnp.trace(R)
+    Ftop = jnp.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
+    F = jnp.block([
+        [Rtr, Ftop[None, :]],
+        [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
+    ])
+    q = eigh_rightmost(F)
+    return q * jnp.sign(q[0])
+
+
+# "inverse sinc" function, naive, undefined at x=1
+def _asinc_naive(x):
+    return jnp.arccos(x) / jnp.sqrt(1 - x**2)
+
+
+# Taylor series expansion of _asinc_naive around x=1
+def _asinc_taylor(x):
+    y = x - 1
+    return (
+        1
+        - y / 3
+        + 2 * y**2 / 15
+        - 2 * y**3 / 35
+        + 8 * y**4 / 315
+        - 8 * y**5 / 693
+        + 16 * y**6 / 3003
+        - 16 * y**7 / 6435
+        + 128 * y**8 / 109395
+        - 128 * y**9 / 230945
+    )
+
+
+def asinc(x):
+    return jnp.where(
+        x < 0.97,
+        _asinc_naive(jnp.where(x < 0.97, x, 0.97)),
+        _asinc_taylor(x)
+    )
+
+
 def _rotation(
     pos: jnp.ndarray,
     indices: jnp.ndarray,
-    axes: jnp.ndarray
+    refpos: jnp.ndarray
 ) -> float:
-    dx = pos[indices] - pos[indices].mean(0)
-    return axes[0] @ (
-        (dx * dx).sum() * jnp.eye(3)
-        - (dx[:, None, :] * dx[:, :, None]).sum(0)
-    ) @ axes[1]
+    q = _rotation_q(pos, indices, refpos)
+    return 2 * q[indices[-1] + 1] * asinc(q[0])
 
 
 class Rotation(Internal):
     def __init__(
         self,
         indices: Tuple[int, ...],
-        axis: int,
-        basis: jnp.ndarray = None,
+        refpos: np.ndarray,
     ) -> None:
         assert len(indices) >= 2
         self.indices = jnp.array(indices, dtype=jnp.int32)
-        if basis is None:
-            basis = jnp.eye(3, dtype=jnp.float64)
-        self.basis = jnp.asarray(basis, dtype=jnp.float64)
-        self.axis = axis
+        self.refpos = refpos.copy() - refpos.mean(0)
 
     def reverse(self) -> 'Internal':
         raise NotImplementedError
@@ -243,46 +330,36 @@ class Rotation(Internal):
             return NotImplemented
         if len(self.indices) != len(other.indices):
             return False
-        if set(self.indices) == set(other.indices) and self.axis == other.axis:
+        if (
+            set(self.indices[:-1]) == set(other.indices[:-1])
+            and self.indices[-1] == other.indices[-1]
+        ):
             return True
 
     def __repr__(self) -> str:
-        return "{}(indices={}, axis={}, basis={})".format(
+        return "{}(indices={}, refpos={})".format(
             self.__class__.__name__,
             tuple(self.indices),
-            self.axis,
-            self.basis,
+            self.refpos,
         )
 
     def calc(self, atoms: Atoms) -> float:
-        axes = jnp.array((
-            self.basis[:, (self.axis + 1) % 3],
-            self.basis[:, (self.axis + 2) % 3],
-        ), dtype=jnp.float64)
-        return float(self._eval0(atoms.positions, self.indices, axes))
+        return float(self._eval0(atoms.positions, self.indices, self.refpos))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        axes = jnp.array((
-            self.basis[:, (self.axis + 1) % 3],
-            self.basis[:, (self.axis + 2) % 3],
-        ), dtype=jnp.float64)
         return np.array(
-            self._eval1(atoms.positions, self.indices, axes).ravel()
+            self._eval1(atoms.positions, self.indices, self.refpos).ravel()
         )
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        axes = jnp.array((
-            self.basis[:, (self.axis + 1) % 3],
-            self.basis[:, (self.axis + 2) % 3],
-        ), dtype=jnp.float64)
-        dim = jnp.product(atoms.positions.shape)
+        dim = np.product(atoms.positions.shape)
         return np.array(self._eval2(
-            atoms.positions, self.indices, axes
+            atoms.positions, self.indices, self.refpos
         ).reshape((dim, dim)))
 
     _eval0 = staticmethod(jit(_rotation))
-    _eval1 = staticmethod(_gradient(_rotation))
-    _eval2 = staticmethod(_hessian(_rotation))
+    _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
+    _eval2 = staticmethod(jit(jacrev(jacfwd(_rotation, argnums=0), argnums=0)))
 
 
 def _bond(
@@ -576,10 +653,11 @@ class BaseInternals:
                 self.internals['translations'][i] = new_trans
 
         for i, rot in self.internals['rotations']:
-            if idx in rot.indices:
-                new_indices = (*rot.indices, didx)
-                rvecs = self.get_principal_rotation_axes(new_indices)
-                new_rot = Rotation(new_indices, rot.axis, basis=rvecs)
+            if idx in rot.indices[:-1]:
+                new_indices = (*rot.indices[:-1], didx, rot.indices[-1])
+                new_rot = Rotation(
+                    new_indices, self.all_atoms[new_indices[:-1].positions]
+                )
                 self.internals['rotations'][i] = new_rot
 
 
@@ -594,6 +672,8 @@ class Constraints(BaseInternals):
         BaseInternals.__init__(self, atoms, dummies, dinds)
         self._targets = {key: [] for key in self._names}
         self.ignore_rotation = ignore_rotation
+        for ase_cons in atoms.constraints:
+            self.merge_ase_constraint(ase_cons)
 
     def copy(self) -> 'Constraints':
         new = self.__class__(self.atoms, self.dummies, self.dinds.copy())
@@ -635,11 +715,10 @@ class Constraints(BaseInternals):
                 for axis in range(3):
                     self.fix_rotation(indices, axis)
                 return
-            rvecs = self.get_principal_rotation_axes(indices)
+            indices = jnp.array((*indices, axis), dtype=jnp.int32)
             new = Rotation(
                 indices,
-                axis,
-                basis=rvecs,
+                self.all_atoms[indices[:-1]].positions
             )
         try:
             _ = self.internals['rotations'].index(new)
@@ -666,7 +745,7 @@ class Constraints(BaseInternals):
         else:
             if index is None:
                 index = jnp.arange(len(self.all_atoms), dtype=jnp.int32)
-            elif isinstance(index, int):
+            if np.isscalar(index):
                 index = jnp.array((index,), dtype=jnp.int32)
             if dim is None:
                 if target is not None:
@@ -731,6 +810,57 @@ class Constraints(BaseInternals):
         _fix_internal, Dihedral, 'dihedrals', np.pi / 180.
     )
 
+    def merge_ase_constraint(self, ase_cons: FixConstraint) -> None:
+        if isinstance(ase_cons, FixAtoms):
+            for index in ase_cons.index:
+                try:
+                    self.fix_translation(index)
+                except DuplicateConstraintError:
+                    pass
+        elif isinstance(ase_cons, FixCom):
+            try:
+                self.fix_translation()
+            except DuplicateConstraintError:
+                pass
+        elif isinstance(ase_cons, FixBondLengths):
+            for i, indices in enumerate(ase_cons.pairs):
+                if ase_cons.bondlengths is None:
+                    target = None
+                else:
+                    target = ase_cons.bondlengths[i]
+                try:
+                    self.fix_bond(indices, mic=True, target=target)
+                except DuplicateConstraintError:
+                    pass
+            return
+        elif isinstance(ase_cons, FixCartesian):
+            for dim, relaxed in enumerate(ase_cons.mask):
+                if relaxed:
+                    continue
+                try:
+                    self.fix_translation(ase_cons.a, dim=dim)
+                except DuplicateConstraintError:
+                    pass
+        elif isinstance(ase_cons, FixInternals):
+            for ase_cons_list, adder in zip(
+                (ase_cons.bonds, ase_cons.angles, ase_cons.dihedrals),
+                (self.fix_bond, self.fix_angle, self.fix_dihedral),
+            ):
+                for target, indices in ase_cons_list:
+                    try:
+                        adder(indices, target=target)
+                    except DuplicateInternalError:
+                        pass
+            if ase_cons.bondcombos:
+                raise RuntimeError(
+                    "Sella currently does not support combination constraints."
+                )
+        else:
+            raise RuntimeError(
+                "Sella does not currently implement the ASE {} Constraint "
+                "class.".format(ase_cons.__class__.__name__)
+            )
+
 
 class Internals(BaseInternals):
     def __init__(
@@ -739,7 +869,8 @@ class Internals(BaseInternals):
         dummies: Atoms = None,
         atol: float = 15.,
         dinds: np.ndarray = None,
-        cons: Constraints = None
+        cons: Constraints = None,
+        allow_fragments: bool = False
     ) -> None:
         BaseInternals.__init__(self, atoms, dummies, dinds)
         self.atol = atol * np.pi / 180.
@@ -754,11 +885,16 @@ class Internals(BaseInternals):
         )):
             for coord in self.cons.internals[kind]:
                 adder(coord)
+        self.allow_fragments = allow_fragments
 
     def copy(self) -> 'Internals':
         new = self.__class__(
-            self.atoms, self.dummies, self.atol, self.dinds.copy(),
+            self.atoms,
+            self.dummies,
+            self.atol,
+            self.dinds.copy(),
             self.cons.copy(),
+            self.allow_fragments,
         )
         for name in self._names:
             new.internals[name] = self.internals[name].copy()
@@ -784,11 +920,10 @@ class Internals(BaseInternals):
                 for axis in range(3):
                     self.add_rotation(indices, axis)
                 return
-            rvecs = self.get_prinicpal_rotation_axes(indices)
+            indices = jnp.array((*indices, axis), dtype=jnp.int32)
             new = Rotation(
                 indices,
-                axis,
-                basis=rvecs,
+                self.all_atoms[indices[:-1]].positions
             )
         if (
             new in self.internals['rotations']
@@ -927,7 +1062,7 @@ class Internals(BaseInternals):
     def find_all_bonds(
         self,
         nbond_cart_thr: int = 6,
-        max_bonds: int = 20
+        max_bonds: int = 20,
     ) -> None:
         rcov = covalent_radii[self.atoms.numbers]
         nbonds = np.zeros(self.natoms, dtype=np.int32)
@@ -942,6 +1077,7 @@ class Internals(BaseInternals):
             nbonds[j] += 1
 
         scale = 1.25
+        first_run = True
         while True:
             # use flood fill algorithm to count the number of disconnected
             # fragments
@@ -955,6 +1091,8 @@ class Internals(BaseInternals):
             # if there is only one fragment, then the internal coordinates
             # are complete, and we can stop
             if nlabels == 1:
+                break
+            if self.allow_fragments and not first_run:
                 break
 
             # remove labels from atoms with no bonding partners
@@ -983,7 +1121,23 @@ class Internals(BaseInternals):
                         nbonds[i] += 1
                         c10y[j, nbonds[j]] = i
                         nbonds[j] += 1
+            first_run = False
             scale *= 1.05
+
+        if self.allow_fragments and nlabels != 1:
+            assert nlabels > 1
+            groups = [[] for _ in range(nlabels)]
+            for i, label in enumerate(labels):
+                if label == -1:
+                    # A lone atom not bonded to anything else
+                    self.add_translation(i)
+                else:
+                    groups[label].append(i)
+            for group in groups:
+                if not group:
+                    continue
+                self.add_translation(group)
+                self.add_rotation(group)
 
     def find_all_angles(
         self,

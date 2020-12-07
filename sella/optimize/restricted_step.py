@@ -168,7 +168,8 @@ class MaxInternalStep(BaseRestrictedStep):
         w = np.array([self.wx] * self.pes.int.ntrans
                      + [self.wb] * self.pes.int.nbonds
                      + [self.wa] * self.pes.int.nangles
-                     + [self.wd] * self.pes.int.ndihedrals)
+                     + [self.wd] * self.pes.int.ndihedrals
+                     + [self.wx] * self.pes.int.nrotations)
         assert len(w) == len(s)
 
         sw = np.abs(s * w)

@@ -26,15 +26,26 @@ class PES:
         trajectory: Union[str, Trajectory] = None,
         eta: float = 1e-4,
         v0: np.ndarray = None,
-        proj_trans: bool = True,
-        proj_rot: bool = True
+        proj_trans: bool = None,
+        proj_rot: bool = None
     ) -> None:
         self.atoms = atoms
+        if proj_trans is None:
+            if constraints.internals['translations']:
+                proj_trans = False
+            else:
+                proj_trans = True
         if proj_trans:
             try:
                 constraints.fix_translation()
             except DuplicateInternalError:
                 pass
+
+        if proj_rot is None:
+            if np.any(atoms.pbc):
+                proj_rot = False
+            else:
+                proj_rot = True
         if proj_rot:
             try:
                 constraints.fix_rotation()
@@ -122,7 +133,21 @@ class PES:
         drdx = self.get_drdx()
         Ucons = modified_gram_schmidt(drdx.T)
         Unred = np.eye(self.dim)
-        Ufree = modified_gram_schmidt(Unred, Ucons)
+        # speed up Ufree calc by pre-removing fixed atom constraints
+        removed_dof = []
+        removed_cons = []
+        for i, trans in enumerate(self.cons.internals['translations']):
+            if len(trans.indices) == 2:
+                idx, dim = trans.indices
+                removed_dof.append(3 * idx + dim)
+                removed_cons.append(i)
+        ndof = 3 * len(self.atoms)
+        rem_dof = [i for i in range(ndof) if i not in removed_dof]
+        Ufree = Unred[:, rem_dof]
+        ncons = self.cons.nint
+        rem_cons = [i for i in range(ncons) if i not in rem_dof]
+        Ucons_red = Ucons[:, rem_cons]
+        Ufree = modified_gram_schmidt(Ufree, Ucons_red)
         return drdx, Ucons, Unred, Ufree
 
     def write_traj(self):
@@ -207,26 +232,27 @@ class PES:
         return self.curr['Ucons']
 
     def diag(self, gamma=0.5, threepoint=False, maxiter=None):
-        Unred = self.get_Unred()
+        Ufree = self.get_Ufree()
+        nfree = Ufree.shape[1]
 
-        P = self.get_HL().project(Unred)
+        P = self.get_HL().project(Ufree)
 
         if P.B is None or self.first_diag:
             v0 = self.v0
             if v0 is None:
-                v0 = self.get_g() @ Unred
+                v0 = self.get_g() @ Ufree
         else:
             v0 = None
 
         if P.B is None:
-            P = np.eye(len(self.get_x()))
+            P = np.eye(nfree)
         else:
             P = P.asarray()
 
         Hproj = NumericalHessian(self._calc_eg, self.get_x(), self.get_g(),
-                                 self.eta, threepoint, Unred)
+                                 self.eta, threepoint, Ufree)
         Hc = self.get_Hc()
-        rayleigh_ritz(Hproj - Unred.T @ Hc @ Unred, gamma, P, v0=v0,
+        rayleigh_ritz(Hproj - Ufree.T @ Hc @ Ufree, gamma, P, v0=v0,
                       method=self.eigensolver,
                       maxiter=maxiter)
 
