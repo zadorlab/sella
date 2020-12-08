@@ -351,7 +351,7 @@ class InternalPES(PES):
         self.int = new_int
         self.dummies = self.int.dummies
         self.dim = len(self.get_x())
-        self.ncart = self.int.ncart
+        self.ncart = self.int.ndof
         if H0 is None:
             # Construct guess hessian and zero out components in
             # infeasible subspace
