@@ -86,7 +86,7 @@ class Sella(Optimizer):
                         "Internals object."
                     )
             else:
-                internal = Internals(atoms, constraints)
+                internal = Internals(atoms, cons=constraints)
             self.pes = InternalPES(
                 atoms,
                 internals=internal,

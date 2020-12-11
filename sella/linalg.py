@@ -139,6 +139,7 @@ class ApproximateHessian(LinearOperator):
         B0: np.ndarray = None,
         update_method: str = 'TS-BFGS',
         symm: int = 2,
+        initialized: bool = False,
     ) -> None:
         """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
@@ -147,7 +148,7 @@ class ApproximateHessian(LinearOperator):
         self.dtype = np.float64
         self.update_method = update_method
         self.symm = symm
-        self.initialized = False
+        self.initialized = initialized
 
         self.set_B(B0)
 
@@ -218,13 +219,16 @@ class ApproximateHessian(LinearOperator):
         return self.matmat(X)
 
     def __add__(self, other):
+        initialized = self.initialized
         if isinstance(other, ApproximateHessian):
             other = other.B
+            initialized = initialized and other.initialized
         if not self.initialized or other is None:
-        #if self.B is None or other is None:
             tot = None
+            initialized = False
         else:
             tot = self.B + other
         return ApproximateHessian(
-            self.dim, self.ncart, tot, self.update_method, self.symm
+            self.dim, self.ncart, tot, self.update_method, self.symm,
+            initialized=initialized,
         )

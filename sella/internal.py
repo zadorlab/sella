@@ -646,17 +646,17 @@ class BaseInternals:
     ) -> None:
         didx = self.dinds[idx]
         assert didx >= 0
-        for i, trans in self.internals['translations']:
+        for i, trans in enumerate(self.internals['translations']):
             if idx in trans.indices[:-1]:
                 new_indices = (*trans.indices[:-1], didx, trans.indices[-1])
                 new_trans = Translation(new_indices)
                 self.internals['translations'][i] = new_trans
 
-        for i, rot in self.internals['rotations']:
+        for i, rot in enumerate(self.internals['rotations']):
             if idx in rot.indices[:-1]:
                 new_indices = (*rot.indices[:-1], didx, rot.indices[-1])
                 new_rot = Rotation(
-                    new_indices, self.all_atoms[new_indices[:-1].positions]
+                    new_indices, self.all_atoms[new_indices[:-1]].positions
                 )
                 self.internals['rotations'][i] = new_rot
 
@@ -692,7 +692,7 @@ class Constraints(BaseInternals):
     def residual(self) -> np.ndarray:
         """Calculates the constraint residual vector."""
         res = self.wrap(self.calc() - self.targets)
-        if self.ignore_rotation:
+        if self.ignore_rotation and self.nrotations:
             res[-self.nrotations:] = 0.
         return res
 

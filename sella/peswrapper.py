@@ -82,7 +82,10 @@ class PES:
 
         self.dim = 3 * len(atoms)
         self.ncart = self.dim
-        self.set_H(H0)
+        if H0 is None:
+            self.set_H(None, initialized=False)
+        else:
+            self.set_H(H0, initialized=True)
 
         self.savepoint = dict(apos=None, dpos=None)
         self.first_diag = True
@@ -114,8 +117,10 @@ class PES:
     def get_H(self):
         return self.H
 
-    def set_H(self, target):
-        self.H = ApproximateHessian(self.dim, self.ncart, target)
+    def set_H(self, target, *args, **kwargs):
+        self.H = ApproximateHessian(
+            self.dim, self.ncart, target, *args, **kwargs
+        )
 
     # Hessian of the constraints
     def get_Hc(self):
@@ -130,7 +135,7 @@ class PES:
         return self.cons.residual()
 
     def get_drdx(self):
-        return np.linalg.pinv(self.cons.jacobian()).T
+        return self.cons.jacobian()
 
     def _calc_basis(self):
         drdx = self.get_drdx()
@@ -175,8 +180,11 @@ class PES:
         """Returns displacement vector for linear constraint correction."""
         Ucons = self.get_Ucons()
 
-        scons = -Ucons @ np.linalg.lstsq(self.get_drdx() @ Ucons,
-                                         self.get_res(), rcond=None)[0]
+        scons = -Ucons @ np.linalg.lstsq(
+            self.get_drdx() @ Ucons,
+            self.get_res(),
+            rcond=None,
+        )[0]
         return scons
 
     def _update(self, feval=True):
@@ -358,7 +366,8 @@ class InternalPES(PES):
             B = self.int.jacobian()
             P = B @ np.linalg.pinv(B)
             H0 = P @ self.int.guess_hessian() @ P
-        self.set_H(H0)
+            self.set_H(H0, initialized=False)
+        self.set_H(H0, initialized=True)
         self.H.initialized = False
 
         # Flag used to indicate that new internal coordinates are required
