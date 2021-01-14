@@ -95,7 +95,7 @@ def _MS_TS_BFGS(B, S, Y, lams, vecs):
     X1 = S.T @ Y @ Y.T
     absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))
     X2 = S.T @ absBS @ absBS.T
-    U = solve((X1 + X2) @ S, X1 + X2).T
+    U = lstsq((X1 + X2) @ S, X1 + X2)[0].T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
