@@ -1152,8 +1152,6 @@ class Internals(BaseInternals):
 
         for j, jbonds in enumerate(bonds):
             linear = []
-            if not jbonds:
-                raise RuntimeError("Atom {} has no bonds!".format(j))
             for b1, b2 in combinations(jbonds, 2):
                 new = b1 + b2
                 assert new.indices[1] == j
