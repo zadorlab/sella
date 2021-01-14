@@ -452,11 +452,12 @@ class InternalPES(PES):
 
         nold = 3 * (len(self.atoms) + len(self.dummies))
 
-        if self.bad_int is not None:
-            for bond in self.bad_int['bonds']:
-                self.int_orig.forbid_bond(bond)
-            for angle in self.bad_int['angles']:
-                self.int_orig.forbid_angle(angle)
+        # FIXME: Testing to see if disabling this works
+        #if self.bad_int is not None:
+        #    for bond in self.bad_int['bonds']:
+        #        self.int_orig.forbid_bond(bond)
+        #    for angle in self.bad_int['angles']:
+        #        self.int_orig.forbid_angle(angle)
 
         # Find new internals, constraints, and dummies
         new_int = self.int_orig.copy()
@@ -545,9 +546,10 @@ class InternalPES(PES):
     def kick(self, dx, diag=False, **diag_kwargs):
         ratio = PES.kick(self, dx, diag=diag, **diag_kwargs)
 
-        if self.bad_int is not None:
-            self.update_internals(dx)
-            self.bad_int = None
+        # FIXME: Testing to see if this works
+        #if self.bad_int is not None:
+        #    self.update_internals(dx)
+        #    self.bad_int = None
 
         return ratio
 
