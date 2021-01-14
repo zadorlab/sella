@@ -76,36 +76,10 @@ class Sella(Optimizer):
                                         atoms=atoms, master=master)
 
         asetraj = None
-        if internal:
-            if isinstance(internal, Internals):
-                if constraints is not None:
-                    raise ValueError(
-                        "Internals object and Constraint object cannot both "
-                        "be provided to Sella. Instead, you must pass the "
-                        "Constraints object to the constructor of the "
-                        "Internals object."
-                    )
-            else:
-                internal = Internals(atoms, cons=constraints)
-            self.pes = InternalPES(
-                atoms,
-                internals=internal,
-                trajectory=trajectory,
-                eta=eta,
-                v0=v0,
-                **kwargs
-            )
-        else:
-            if constraints is None:
-                constraints = Constraints(atoms)
-            self.pes = PES(
-                atoms,
-                constraints=constraints,
-                trajectory=trajectory,
-                eta=eta,
-                v0=v0,
-                **kwargs
-            )
+        self.peskwargs = kwargs.copy()
+        self.initialize_pes(
+            atoms, trajectory, order, eta, constraints, v0, internal, **kwargs
+        )
 
         if rs is None:
             rs = 'mis' if internal else 'tr'
@@ -151,7 +125,7 @@ class Sella(Optimizer):
         self.eta = eta
         self.delta_min = self.eta
         self.constraints_tol = constraints_tol
-        self.peskwargs = dict(gamma=gamma, threepoint=threepoint)
+        self.diagkwargs = dict(gamma=gamma, threepoint=threepoint)
         self.rho = 1.
 
         if self.ord != 0 and not self.eig:
@@ -162,11 +136,57 @@ class Sella(Optimizer):
         self.initialized = False
         self.xi = 1.
 
+    def initialize_pes(
+        self,
+        atoms: Atoms,
+        trajectory: str = None,
+        order: int = 1,
+        eta: float = 1e-4,
+        constraints: Constraints = None,
+        v0: np.ndarray = None,
+        internal: Union[bool, Internals] = False,
+        **kwargs
+    ):
+        if internal:
+            if isinstance(internal, Internals):
+                if constraints is not None:
+                    raise ValueError(
+                        "Internals object and Constraint object cannot both "
+                        "be provided to Sella. Instead, you must pass the "
+                        "Constraints object to the constructor of the "
+                        "Internals object."
+                    )
+            else:
+                internal = Internals(atoms, cons=constraints)
+            self.internal = internal.copy()
+            self.constraints = None
+            self.pes = InternalPES(
+                atoms,
+                internals=internal,
+                trajectory=trajectory,
+                eta=eta,
+                v0=v0,
+                **kwargs
+            )
+        else:
+            self.internal = None
+            if constraints is None:
+                constraints = Constraints(atoms)
+            self.constraints = constraints
+            self.pes = PES(
+                atoms,
+                constraints=constraints,
+                trajectory=trajectory,
+                eta=eta,
+                v0=v0,
+                **kwargs
+            )
+
     def _predict_step(self):
         if not self.initialized:
             self.pes.get_g()
             if self.eig:
-                self.pes.diag(**self.peskwargs)
+                self.pes.diag(**self.diagkwargs)
             self.initialized = True
 
         s, smag = self.rs(self.pes, self.ord, self.delta,
@@ -186,7 +206,23 @@ class Sella(Optimizer):
                                        .evals[:self.ord] > 0).any()
         else:
             ev = False
-        rho = self.pes.kick(s, ev, **self.peskwargs)
+        rho = self.pes.kick(s, ev, **self.diagkwargs)
+
+        # Check for bad internals, and if found, reset PES object.
+        # This skips the trust radius update.
+        if self.internal and self.pes.int.check_for_bad_internals():
+            self.initialize_pes(
+                atoms=self.pes.atoms,
+                trajectory=self.pes.traj,
+                order=self.ord,
+                eta=self.pes.eta,
+                constraints=self.constraints,
+                v0=None,  # TODO: use leftmost eigenvector from old H
+                internal=self.internal,
+            )
+            self.initialized = False
+            self.rho = 1
+            return
 
         # Update trust radius
         if rho is None:

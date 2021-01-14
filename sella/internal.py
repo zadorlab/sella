@@ -891,7 +891,7 @@ class Internals(BaseInternals):
         new = self.__class__(
             self.atoms,
             self.dummies,
-            self.atol,
+            self.atol * 180. / np.pi,
             self.dinds.copy(),
             self.cons.copy(),
             self.allow_fragments,
