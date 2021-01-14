@@ -676,7 +676,9 @@ class Constraints(BaseInternals):
             self.merge_ase_constraint(ase_cons)
 
     def copy(self) -> 'Constraints':
-        new = self.__class__(self.atoms, self.dummies, self.dinds.copy())
+        new = self.__class__(
+            self.atoms, self.dummies, self.dinds, self.ignore_rotation
+        )
         for name in self._names:
             new.internals[name] = self.internals[name].copy()
             new._targets[name] = self._targets[name].copy()
@@ -877,6 +879,14 @@ class Internals(BaseInternals):
         self.forbidden = {key: [] for key in self._names}
         if cons is None:
             cons = Constraints(self.atoms, self.dummies, self.dinds)
+        else:
+            if (
+                (dummies is not None and dummies is not cons.dummies)
+                or (dinds is not None and dinds is not cons.dinds)
+            ):
+                raise RuntimeError(
+                    "Constraints has inconsistent dummy atom definitions!"
+                )
         self.cons = cons
 
         for kind, adder in zip(self._names, (
@@ -892,7 +902,7 @@ class Internals(BaseInternals):
             self.atoms,
             self.dummies,
             self.atol * 180. / np.pi,
-            self.dinds.copy(),
+            self.dinds,
             self.cons.copy(),
             self.allow_fragments,
         )
