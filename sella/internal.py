@@ -887,6 +887,8 @@ class Internals(BaseInternals):
                 raise RuntimeError(
                     "Constraints has inconsistent dummy atom definitions!"
                 )
+            self.dummies = cons.dummies
+            self.dinds = cons.dinds
         self.cons = cons
 
         for kind, adder in zip(self._names, (
@@ -1205,15 +1207,29 @@ class Internals(BaseInternals):
                         dpos /= np.linalg.norm(dpos)
                     else:
                         dpos /= dpos_norm
+                    # Add the dummy atom
                     dpos += self.atoms.positions[j]
                     self.dummies += Atom('X', dpos)
+                    # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond)
                     self.add_bond(dbond)
+                    # Fix one dummy angle and update relavent internals
                     self.cons.fix_angle(b1 + dbond)
-                    self.add_angle(b1 + dbond)
                     self.add_dummy_to_internals(j)
                     self.cons.add_dummy_to_internals(j)
+                    # Add relevant angles
+                    for b1 in jbonds:
+                        new = b1 + dbond
+                        assert new.indices[1] == j
+                        angle = new.calc(self.all_atoms)
+                        if self.atol < angle < np.pi - self.atol:
+                            try:
+                                self.add_angle(new)
+                            except DuplicateInternalError:
+                                pass
+                        else:
+                            self.forbid_angle(new)
                 else:
                     for b1, b2 in linear:
                         for b3 in jbonds:
