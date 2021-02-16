@@ -62,6 +62,7 @@ class Sella(Optimizer):
         internal: Union[bool, Internals] = False,
         append_trajectory: bool = False,
         rs: str = None,
+        nsteps_per_diag: int = 3,
         **kwargs
     ):
         if order == 0:
@@ -135,6 +136,8 @@ class Sella(Optimizer):
 
         self.initialized = False
         self.xi = 1.
+        self.nsteps_per_diag = nsteps_per_diag
+        self.nsteps_since_diag = 0
 
     def initialize_pes(
         self,
@@ -197,7 +200,7 @@ class Sella(Optimizer):
         s, smag = self._predict_step()
 
         # Determine if we need to call the eigensolver, then step
-        if self.eig:
+        if self.eig and self.nsteps_since_diag >= self.nsteps_per_diag:
             if self.pes.H.evals is None:
                 ev = True
             else:
@@ -206,6 +209,10 @@ class Sella(Optimizer):
                                        .evals[:self.ord] > 0).any()
         else:
             ev = False
+        if ev:
+            self.nsteps_since_diag = 0
+        else:
+            self.nsteps_since_diag += 1
         rho = self.pes.kick(s, ev, **self.diagkwargs)
 
         # Check for bad internals, and if found, reset PES object.
