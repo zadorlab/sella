@@ -337,7 +337,7 @@ class InternalPES(PES):
         internals: Internals,
         *args,
         H0: np.ndarray = None,
-        iterative_stepper: bool = False,
+        iterative_stepper: int = 0,
         **kwargs
     ):
         self.int_orig = internals
@@ -378,10 +378,12 @@ class InternalPES(PES):
     dpos = property(lambda self: self.dummies.positions.copy())
 
     def _set_x_iterative(self, target):
-        pos0 = None
-        dpos0 = None
+        pos0 = self.atoms.positions.copy()
+        dpos0 = self.dummies.positions.copy()
+        pos1 = None
+        dpos1 = None
         x0 = self.get_x()
-        dx_initial = self.wrap_dx(target - x0)
+        dx_initial = target - x0
         g0 = np.linalg.lstsq(
             self.int.jacobian(),
             self.curr.get('g', np.zeros_like(dx_initial)),
@@ -389,19 +391,25 @@ class InternalPES(PES):
         )[0]
         for _ in range(10):
             dx = np.linalg.lstsq(
-                self.int.jacobian(), target - self.get_x(), rcond=None
+                self.int.jacobian(),
+                self.wrap_dx(target - self.get_x()),
+                rcond=None,
             )[0].reshape((-1, 3))
             if np.sqrt((dx**2).sum() / len(dx)) < 1e-6:
                 break
             self.atoms.positions += dx[:len(self.atoms)]
             self.dummies.positions += dx[len(self.atoms):]
-            if pos0 is None:
-                pos0 = self.atoms.positions.copy()
-                dpos0 = self.dummies.positions.copy()
+            if pos1 is None:
+                pos1 = self.atoms.positions.copy()
+                dpos1 = self.dummies.positions.copy()
         else:
             print('Iterative stepper failed!')
-            self.atoms.positions = pos0
-            self.dummies.positions = dpos0
+            if self.iterative_stepper == 2:
+                self.atoms.positions = pos0
+                self.dummies.positions = dpos0
+                return
+            self.atoms.positions = pos1
+            self.dummies.positions = dpos1
         dx_final = self.get_x() - x0
         g_final = self.int.jacobian() @ g0
         return dx_initial, dx_final, g_final
@@ -409,8 +417,10 @@ class InternalPES(PES):
     # Position getter/setter
     def set_x(self, target):
         if self.iterative_stepper:
-            return self._set_x_iterative(target)
-        dx = self.wrap_dx(target - self.get_x())
+            res = self._set_x_iterative(target)
+            if res is not None:
+                return res
+        dx = target - self.get_x()
 
         t0 = 0.
         Binv = np.linalg.pinv(self.int.jacobian())
