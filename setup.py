@@ -12,13 +12,13 @@ try:
     from Cython.Build import cythonize
 except ImportError:
     use_cython = False
+
 else:
     use_cython = True
 
 cy_suff = '.pyx' if use_cython else '.c'
 
 cy_files = [
-    ['force_match'],
     ['utilities', 'blas'],
     ['utilities', 'math'],
 ]
