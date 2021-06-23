@@ -1,0 +1,10 @@
+[build-system]
+requires = [
+    "setuptools >= 54.2.0",
+    "setuptools_scm >= 2.0.0, <3",
+    "cython >= 0.29.23",
+    "numpy",
+    "scipy"
+]
+
+build-backend = "setuptools.build_meta"

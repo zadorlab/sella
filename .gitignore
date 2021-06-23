@@ -10,3 +10,6 @@ __pycache__
 *.html
 *.traj
 .coverage
+build
+*venv
+.eggs/.*txt
