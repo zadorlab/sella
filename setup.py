@@ -10,6 +10,7 @@ debug = '--debug' in sys.argv or '-g' in sys.argv
 
 
 class build_ext(_build_ext):
+    # ref: https://stackoverflow.com/questions/19919905/how-to-bootstrap-numpy-installation-in-setup-py
     def finalize_options(self):
         _build_ext.finalize_options(self)
         # Prevent numpy from thinking it is still in its setup process:
@@ -73,6 +74,6 @@ setup(name='Sella',
                    'Topic :: Scientific/Engineering :: Physics'],
       python_requires='>=3.6',
       cmdclass={'build_ext':build_ext},
-      setup_requires=['numpy'],
+      setup_requires=['numpy>=1.14'],
       install_requires=install_requires,
       )
