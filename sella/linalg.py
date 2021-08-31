@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+from typing import List
+from itertools import product
 import numpy as np
 
 from sella.hessian_update import update_H
@@ -175,8 +177,8 @@ class ApproximateHessian(LinearOperator):
             dx_cart = dx[:self.ncart]
             dg_cart = dg[:self.ncart]
             B[:self.ncart, :self.ncart] = update_H(
-                None, dx_cart, dg_cart, method=self.update_method, symm=self.symm,
-                lams=None, vecs=None
+                None, dx_cart, dg_cart, method=self.update_method,
+                symm=self.symm, lams=None, vecs=None
             )
             self.set_B(B)
             return
@@ -232,3 +234,100 @@ class ApproximateHessian(LinearOperator):
             self.dim, self.ncart, tot, self.update_method, self.symm,
             initialized=initialized,
         )
+
+
+class SparseInternalJacobian(LinearOperator):
+    dtype = np.float64
+
+    def __init__(
+        self,
+        natoms: int,
+        indices: List[List[int]],
+        vals: List[List[np.ndarray]],
+    ) -> None:
+        self.natoms = natoms
+        self.indices = indices
+        self.vals = vals
+        self.nints = len(self.indices)
+        self.shape = (self.nints, 3 * self.natoms)
+
+    def asarray(self) -> np.ndarray:
+        B = np.zeros((self.nints, self.natoms, 3))
+        for Bi, idx, vals in zip(B, self.indices, self.vals):
+            for j, v in zip(idx, vals):
+                Bi[j] += v
+        return B.reshape(self.shape)
+
+    def _matvec(self, v: np.ndarray) -> np.ndarray:
+        vi = v.reshape((self.natoms, 3))
+        w = np.zeros(self.nints)
+        for i in range(self.nints):
+            for j, val in zip(self.indices[i], self.vals[i]):
+                w[i] += vi[j] @ val
+        return w
+
+    def _rmatvec(self, v: np.ndarray) -> np.ndarray:
+        w = np.zeros((self.natoms, 3))
+        for vi, indices, vals in zip(v, self.indices, self.vals):
+            for j, val in zip(indices, vals):
+                w[j] += vi * val
+        return w.ravel()
+
+
+class SparseInternalHessian(LinearOperator):
+    dtype = np.float64
+
+    def __init__(
+        self,
+        natoms: int,
+        indices: List[int],
+        vals: np.ndarray,
+    ) -> None:
+        self.natoms = natoms
+        self.shape = (3 * self.natoms, 3 * self.natoms)
+        self.indices = indices
+        self.vals = vals
+
+    def asarray(self) -> np.ndarray:
+        H = np.zeros((self.natoms, 3, self.natoms, 3))
+        for (a, i), (b, j) in product(enumerate(self.indices), repeat=2):
+            H[i, :, j, :] += self.vals[a, :, b, :]
+        return H.reshape(self.shape)
+
+    def _matvec(self, v: np.ndarray) -> np.ndarray:
+        vi = v.reshape((self.natoms, 3))
+        w = np.zeros_like(vi)
+        for (a, i), (b, j) in product(enumerate(self.indices), repeat=2):
+            w[i] += self.vals[a, :, b, :] @ vi[j, :]
+        return w.ravel()
+
+    def _rmatvec(self, v: np.ndarray) -> np.ndarray:
+        return self._matvec(v)
+
+
+class SparseInternalHessians:
+    def __init__(
+        self,
+        hessians: List[SparseInternalHessian],
+        ndof: int
+    ):
+        self.hessians = hessians
+        self.shape = (len(self.hessians), ndof, ndof)
+
+    def ldot(self, v: np.ndarray) -> np.ndarray:
+        M = np.zeros(self.shape[1:])
+        for vi, hessian in zip(v, self.hessians):
+            M += vi + hessian.asarray()
+        return M
+
+    def rdot(self, v: np.ndarray) -> np.ndarray:
+        M = np.zeros(self.shape[:2])
+        for row, hessian in zip(M, self.hessians):
+            row[:] = hessian @ v
+        return M
+
+    def ddot(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        w = np.zeros(self.shape[0])
+        for i, hessian in enumerate(self.hessians):
+            w[i] = u @ hessian @ v
+        return w

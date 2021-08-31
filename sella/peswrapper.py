@@ -124,7 +124,7 @@ class PES:
 
     # Hessian of the constraints
     def get_Hc(self):
-        return np.einsum('i,ijk->jk', self.curr['L'], self.cons.hessian())
+        return self.cons.hessian().ldot(self.curr['L'])
 
     # Hessian of the Lagrangian
     def get_HL(self):
@@ -451,12 +451,12 @@ class InternalPES(PES):
 
     # Hessian of the constraints
     def get_Hc(self):
-        D_cons = np.einsum('i,ijk->jk', self.curr['L'], self.cons.hessian())
+        D_cons = self.cons.hessian().ldot(self.curr['L'])
         B_int = self.int.jacobian()
         Binv_int = np.linalg.pinv(B_int)
         B_cons = self.cons.jacobian()
         L_int = self.curr['L'] @ B_cons @ Binv_int
-        D_int = np.einsum('i,ijk->jk', L_int, self.int.hessian())
+        D_int = self.int.hessian().ldot(L_int)
         Hc = Binv_int.T @ (D_cons - D_int) @ Binv_int
         return Hc
 
@@ -530,10 +530,8 @@ class InternalPES(PES):
         # use the guess hessian info.
         H = self.get_H().asarray()
         Hcart = Blast.T @ H @ Blast
-        Hcart += np.einsum('i,ijk->jk', self.curr['g'], Dlast)
-        Hnew = Binv.T[:, :nold] @ (
-            Hcart - np.einsum('i,ijk->jk', g, D)
-        ) @ Binv
+        Hcart += Dlast.ldot(self.curr['g'])
+        Hnew = Binv.T[:, :nold] @ (Hcart - D.ldot(g)) @ Binv
         self.dim = len(x)
         self.set_H(Hnew)
 
@@ -578,7 +576,7 @@ class InternalPES(PES):
 
         D = self.int.hessian()
         Binv = np.linalg.pinv(self.int.jacobian())
-        D_tmp = -np.einsum('ij,jkl,k->il', Binv, D, dxdt)
+        D_tmp = -Binv @ D.rdot(dxdt)
         dydt[1] = D_tmp @ dxdt
         dydt[2] = D_tmp @ g
 
