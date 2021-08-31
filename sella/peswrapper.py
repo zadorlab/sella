@@ -139,21 +139,11 @@ class PES:
 
     def _calc_basis(self):
         drdx = self.get_drdx()
-        Ucons = modified_gram_schmidt(drdx.T)
+        U, S, VT = np.linalg.svd(drdx)
+        ncons = np.sum(S > 1e-6)
+        Ucons = VT[:ncons].T
+        Ufree = VT[ncons:].T
         Unred = np.eye(self.dim)
-        # speed up Ufree calc by pre-removing fixed atom constraints
-        removed_dof = []
-        removed_cons = []
-        for i, trans in enumerate(self.cons.internals['translations']):
-            if len(trans.indices) == 2:
-                idx, dim = trans.indices
-                removed_dof.append(3 * idx + dim)
-                removed_cons.append(i)
-        rem_dof = [i for i in range(self.dim) if i not in removed_dof]
-        Ufree = Unred[:, rem_dof]
-        rem_cons = [i for i in range(self.cons.nint) if i not in removed_cons]
-        Ucons_red = Ucons[:, rem_cons]
-        Ufree = modified_gram_schmidt(Ufree, Ucons_red)
         return drdx, Ucons, Unred, Ufree
 
     def write_traj(self):
@@ -474,15 +464,23 @@ class InternalPES(PES):
         # dr/dq = dr/dx dx/dq
         return PES.get_drdx(self) @ np.linalg.pinv(self.int.jacobian())
 
-    def _calc_basis(self):
-        drdx = self.get_drdx()
-        Ucons = modified_gram_schmidt(drdx.T)
-        na = 3 * len(self.atoms)
-        B = self.int.jacobian()
-        Udummy = modified_gram_schmidt(B[:, na:])
-        Binv = np.linalg.pinv(B)
-        Unred = modified_gram_schmidt(B @ Binv, Udummy)
-        Ufree = modified_gram_schmidt(Unred, Ucons)
+    def _calc_basis(self, internal=None, cons=None):
+        if internal is None:
+            internal = self.int
+        if cons is None:
+            cons = self.cons
+        B = internal.jacobian()
+        Ui, Si, VTi = np.linalg.svd(B)
+        nnred = np.sum(Si > 1e-6)
+        Unred = Ui[:, :nnred]
+        Vnred = VTi[:nnred].T
+        Siinv = np.diag(1 / Si[:nnred])
+        drdxnred = cons.jacobian() @ Vnred @ Siinv
+        drdx = drdxnred @ Unred.T
+        Uc, Sc, VTc = np.linalg.svd(drdxnred)
+        ncons = np.sum(Sc > 1e-6)
+        Ucons = Unred @ VTc[:ncons].T
+        Ufree = Unred @ VTc[ncons:].T
         return drdx, Ucons, Unred, Ufree
 
     def eval(self):
@@ -522,11 +520,11 @@ class InternalPES(PES):
         # Update the info in self.curr
         x = new_int.calc()
         g = -self.atoms.get_forces().ravel() @ Binv[:3*len(self.atoms)]
-        drdx = new_cons.jacobian() @ Binv
+        drdx, Ucons, Unred, Ufree = self._calc_basis(
+            internal=new_int,
+            cons=new_cons,
+        )
         L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
-        Ucons = modified_gram_schmidt(drdx.T)
-        Unred = modified_gram_schmidt(B @ B.T)
-        Ufree = modified_gram_schmidt(Unred, Ucons)
 
         # Update H using old data where possible. For new (dummy) atoms,
         # use the guess hessian info.
