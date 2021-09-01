@@ -312,16 +312,18 @@ class SparseInternalHessians:
         ndof: int
     ):
         self.hessians = hessians
+        self.natoms = ndof // 3
         self.shape = (len(self.hessians), ndof, ndof)
 
     def asarray(self) -> np.ndarray:
         return np.array([hess.asarray() for hess in self.hessians])
 
     def ldot(self, v: np.ndarray) -> np.ndarray:
-        M = np.zeros(self.shape[1:])
-        for vi, hessian in zip(v, self.hessians):
-            M += vi * hessian.asarray()
-        return M
+        M = np.zeros((self.natoms, 3, self.natoms, 3))
+        for vi, hess in zip(v, self.hessians):
+            for (a, i), (b, j) in product(enumerate(hess.indices), repeat=2):
+                M[i, :, j, :] += vi * hess.vals[a, :, b, :]
+        return M.reshape(self.shape[1:])
 
     def rdot(self, v: np.ndarray) -> np.ndarray:
         M = np.zeros(self.shape[:2])
