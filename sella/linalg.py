@@ -320,7 +320,7 @@ class SparseInternalHessians:
     def ldot(self, v: np.ndarray) -> np.ndarray:
         M = np.zeros(self.shape[1:])
         for vi, hessian in zip(v, self.hessians):
-            M += vi + hessian.asarray()
+            M += vi * hessian.asarray()
         return M
 
     def rdot(self, v: np.ndarray) -> np.ndarray:
