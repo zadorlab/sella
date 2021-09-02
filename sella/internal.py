@@ -20,6 +20,10 @@ from ase.constraints import (
 import jax.numpy as jnp
 from jax import jit, grad, jacfwd, jacrev, custom_jvp
 
+from sella.linalg import (
+    SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians
+)
+
 
 IVec = Tuple[int, int, int]
 
@@ -60,20 +64,20 @@ class Internal:
     ) -> None:
         if self.nindices is not None:
             assert len(indices) == self.nindices
-        self.indices = jnp.array(indices, dtype=jnp.int32)
+        self.indices = np.array(indices, dtype=np.int32)
 
         if self.nindices is not None:
             if ncvecs is None:
-                ncvecs = jnp.zeros((self.nindices - 1, 3), dtype=np.int32)
+                ncvecs = np.zeros((self.nindices - 1, 3), dtype=np.int32)
             else:
-                ncvecs = jnp.asarray(ncvecs).reshape((self.nindices - 1, 3))
+                ncvecs = np.asarray(ncvecs).reshape((self.nindices - 1, 3))
         else:
             if ncvecs is not None:
                 raise ValueError(
                     "{} does not support ncvecs"
                     .format(self.__class__.__name__)
                 )
-            ncvecs = jnp.empty((0, 3), dtype=np.int32)
+            ncvecs = np.empty((0, 3), dtype=np.int32)
         self.ncvecs = ncvecs
 
     def reverse(self) -> 'Internal':
@@ -137,58 +141,53 @@ class Internal:
 
     @staticmethod
     def _eval0(
-        pos: jnp.ndarray, indices: jnp.ndarray, tvecs: jnp.ndarray
+        pos: jnp.ndarray, tvecs: jnp.ndarray
     ) -> float:
         raise NotImplementedError
 
     @staticmethod
     def _eval1(
-        pos: jnp.ndarray, indices: jnp.ndarray, tvecs: jnp.ndarray
+        pos: jnp.ndarray, tvecs: jnp.ndarray
     ) -> jnp.ndarray:
         raise NotImplementedError
 
     @staticmethod
     def _eval2(
-        pos: jnp.ndarray, indices: jnp.ndarray, tvecs: jnp.ndarray
+        pos: jnp.ndarray, tvecs: jnp.ndarray
     ) -> jnp.ndarray:
         raise NotImplementedError
 
     def calc(self, atoms: Atoms) -> float:
         tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
-        return float(self._eval0(atoms.positions, self.indices, tvecs))
+        return float(self._eval0(atoms[self.indices].positions, tvecs))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
         tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
-        return np.array(
-            self._eval1(atoms.positions, self.indices, tvecs).ravel()
-        )
+        return np.array(self._eval1(atoms[self.indices].positions, tvecs))
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
         tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
-        dim = np.product(atoms.positions.shape)
-        return np.array(self._eval2(
-            atoms.positions, self.indices, tvecs
-        ).reshape((dim, dim)))
+        return np.array(self._eval2(atoms[self.indices].positions, tvecs))
 
 
 def _translation(
     pos: jnp.ndarray,
-    indices: jnp.ndarray,
+    dim: int,
     tvecs: jnp.ndarray
 ) -> float:
-    return pos[indices[:-1], indices[-1]].mean()
+    return pos[:, indices[-1]].mean()
 
 
 class Translation(Internal):
     def __init__(
         self,
         indices: Tuple[int, ...],
+        dim: int,
     ) -> None:
         assert len(indices) >= 2, indices
-        indices_sorted = sorted(indices[:-1])
-        indices_sorted.append(indices[-1])
-        self.indices = jnp.array(indices_sorted, dtype=jnp.int32)
-        self.ncvecs = jnp.empty((0, 3), dtype=jnp.int32)
+        self.indices = np.array(sorted(indices), dtype=np.int32)
+        self.ncvecs = np.empty((0, 3), dtype=np.int32)
+        self.dim = dim
 
     def reverse(self) -> 'Internal':
         raise NotImplementedError
@@ -202,7 +201,7 @@ class Translation(Internal):
         # numpy.ndarray objects, so we convert to numpy.ndarray here.
         sidx = np.asarray(self.indices, dtype=np.int32)
         oidx = np.asarray(other.indices, dtype=np.int32)
-        if sidx[-1] != oidx[-1]:
+        if self.dim != other.dim:
             return False
         if len(sidx) != len(oidx):
             return False
@@ -211,10 +210,29 @@ class Translation(Internal):
         return False
 
     def __repr__(self) -> str:
-        return "{}(indices={})".format(
+        return "{}(indices={}, dim={})".format(
             self.__class__.__name__,
-            tuple(self.indices)
+            tuple(self.indices),
+            self.dim
         )
+
+    def calc(self, atoms: Atoms) -> float:
+        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        return float(self._eval0(
+            atoms.positions[self.indices], self.dim, tvecs
+        ))
+
+    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
+        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        return np.array(self._eval1(
+            atoms.positions[self.indices], self.dim, tvecs
+            ))
+
+    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        return np.array(self._eval2(
+            atoms.positions[self.indices], self.dim, tvecs
+        ))
 
     _eval0 = staticmethod(jit(_translation))
     _eval1 = staticmethod(_gradient(_translation))
@@ -258,10 +276,9 @@ def eigh_rightmost_jvp(primals, tangents):
 
 def _rotation_q(
     pos: jnp.ndarray,
-    indices: jnp.ndarray,
     refpos: jnp.ndarray
 ) -> float:
-    dx = pos[indices[:-1]] - pos[indices[:-1]].mean(0)
+    dx = pos - pos.mean(0)
     R = dx.T @ refpos
     Rtr = jnp.trace(R)
     Ftop = jnp.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
@@ -305,22 +322,24 @@ def asinc(x):
 
 def _rotation(
     pos: jnp.ndarray,
-    indices: jnp.ndarray,
+    axis: int,
     refpos: jnp.ndarray
 ) -> float:
-    q = _rotation_q(pos, indices, refpos)
-    return 2 * q[indices[-1] + 1] * asinc(q[0])
+    q = _rotation_q(pos, refpos)
+    return 2 * q[axis + 1] * asinc(q[0])
 
 
 class Rotation(Internal):
     def __init__(
         self,
         indices: Tuple[int, ...],
+        axis: int,
         refpos: np.ndarray,
     ) -> None:
         assert len(indices) >= 2
-        self.indices = jnp.array(indices, dtype=jnp.int32)
+        self.indices = np.array(indices, dtype=np.int32)
         self.refpos = refpos.copy() - refpos.mean(0)
+        self.axis = axis
 
     def reverse(self) -> 'Internal':
         raise NotImplementedError
@@ -328,34 +347,36 @@ class Rotation(Internal):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return NotImplemented
+        if self.dim != other.dim:
+            return False
         if len(self.indices) != len(other.indices):
             return False
-        if (
-            set(self.indices[:-1]) == set(other.indices[:-1])
-            and self.indices[-1] == other.indices[-1]
-        ):
-            return True
+        if set(self.indices) != set(other.dim):
+            return False
+        return True
 
     def __repr__(self) -> str:
-        return "{}(indices={}, refpos={})".format(
+        return "{}(indices={}, axis={}, refpos={})".format(
             self.__class__.__name__,
             tuple(self.indices),
+            self.axis,
             self.refpos,
         )
 
     def calc(self, atoms: Atoms) -> float:
-        return float(self._eval0(atoms.positions, self.indices, self.refpos))
+        return float(self._eval0(
+            atoms.positions[self.indices], self.axis, self.refpos
+        ))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        return np.array(
-            self._eval1(atoms.positions, self.indices, self.refpos).ravel()
-        )
+        return np.array(self._eval1(
+            atoms.positions[self.indices], self.axis, self.refpos
+        ))
 
-    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        dim = np.product(atoms.positions.shape)
+    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
         return np.array(self._eval2(
-            atoms.positions, self.indices, self.refpos
-        ).reshape((dim, dim)))
+            atoms.positions[self.indices], self.axis, self.refpos
+        ))
 
     _eval0 = staticmethod(jit(_rotation))
     _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
@@ -364,11 +385,10 @@ class Rotation(Internal):
 
 def _bond(
     pos: jnp.ndarray,
-    indices: jnp.ndarray,
     tvecs: jnp.ndarray
 ) -> float:
     return jnp.linalg.norm(
-        pos[indices[1]] - pos[indices[0]] + tvecs[0]
+        pos[1] - pos[0] + tvecs[0]
     )
 
 
@@ -386,11 +406,10 @@ class Bond(Internal):
 
 def _angle(
     pos: jnp.ndarray,
-    indices: jnp.ndarray,
     tvecs: jnp.ndarray
 ) -> float:
-    dx1 = -(pos[indices[1]] - pos[indices[0]] + tvecs[0])
-    dx2 = pos[indices[2]] - pos[indices[1]] + tvecs[1]
+    dx1 = -(pos[1] - pos[0] + tvecs[0])
+    dx2 = pos[2] - pos[1] + tvecs[1]
     return jnp.arccos(
         dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
     )
@@ -405,12 +424,11 @@ class Angle(Internal):
 
 def _dihedral(
     pos: jnp.ndarray,
-    indices: jnp.ndarray,
     tvecs: jnp.ndarray
 ) -> float:
-    dx1 = pos[indices[1]] - pos[indices[0]] + tvecs[0]
-    dx2 = pos[indices[2]] - pos[indices[1]] + tvecs[1]
-    dx3 = pos[indices[3]] - pos[indices[2]] + tvecs[2]
+    dx1 = pos[1] - pos[0] + tvecs[0]
+    dx2 = pos[2] - pos[1] + tvecs[1]
+    dx3 = pos[3] - pos[2] + tvecs[2]
     numer = dx2 @ jnp.cross(jnp.cross(dx1, dx2), jnp.cross(dx2, dx3))
     denom = jnp.linalg.norm(dx2) * jnp.cross(dx1, dx2) @ jnp.cross(dx2, dx3)
     return jnp.arctan2(numer, denom)
@@ -500,7 +518,7 @@ class BaseInternals:
 
     @property
     def ndof(self) -> int:
-        return 3 * (len(self.atoms) + len(self.dummies))
+        return 3 * (self.natoms + self.ndummies)
 
     @property
     def all_atoms(self) -> Atoms:
@@ -534,20 +552,30 @@ class BaseInternals:
         self._cache_check()
         if 'jacobian' not in self._cache:
             atoms = self.all_atoms
-            self._cache['jacobian'] = np.array(
-                [c.calc_gradient(atoms) for c in self]
-            ).reshape((self.nint, self.ndof))
-        return self._cache['jacobian'].copy()
+            self._cache['jacobian'] = [
+                np.array(c.calc_gradient(atoms)) for c in self
+            ]
+        indices = [np.array(c.indices) for c in self]
+        return SparseInternalJacobian(
+            self.natoms + self.ndummies, indices,
+            self._cache['jacobian'].copy()
+        ).asarray()
 
     def hessian(self) -> np.ndarray:
         """Calculates the Hessian matrix for each internal coordinate."""
         self._cache_check()
         if 'hessian' not in self._cache:
             atoms = self.all_atoms
-            self._cache['hessian'] = np.array(
-                [c.calc_hessian(atoms) for c in self]
-            ).reshape((self.nint, self.ndof, self.ndof))
-        return self._cache['hessian'].copy()
+            self._cache['hessian'] = [
+                np.array(c.calc_hessian(atoms)) for c in self
+            ]
+        indices = [np.array(c.indices) for c in self]
+        hessians = []
+        for idx, vals in zip(indices, self._cache['hessian']):
+            hessians.append(SparseInternalHessian(
+                self.natoms + self.ndummies, idx, vals.copy()
+            ))
+        return SparseInternalHessians(hessians, self.ndof)
 
     def wrap(self, vec: np.ndarray) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""
@@ -647,16 +675,17 @@ class BaseInternals:
         didx = self.dinds[idx]
         assert didx >= 0
         for i, trans in enumerate(self.internals['translations']):
-            if idx in trans.indices[:-1]:
-                new_indices = (*trans.indices[:-1], didx, trans.indices[-1])
-                new_trans = Translation(new_indices)
+            if idx in trans.indices:
+                new_indices = (*trans.indices[:-1], didx)
+                new_trans = Translation(new_indices, trans.dim)
                 self.internals['translations'][i] = new_trans
 
         for i, rot in enumerate(self.internals['rotations']):
             if idx in rot.indices[:-1]:
-                new_indices = (*rot.indices[:-1], didx, rot.indices[-1])
+                new_indices = (*rot.indices[:-1], didx)
                 new_rot = Rotation(
-                    new_indices, self.all_atoms[new_indices[:-1]].positions
+                    new_indices, rot.axis,
+                    self.all_atoms[new_indices].positions
                 )
                 self.internals['rotations'][i] = new_rot
 
@@ -711,16 +740,16 @@ class Constraints(BaseInternals):
             new = indices
         else:
             if indices is None:
-                indices = jnp.arange(len(self.all_atoms), dtype=jnp.int32)
-            indices = jnp.asarray(indices, dtype=jnp.int32)
+                indices = np.arange(len(self.all_atoms), dtype=np.int32)
+            indices = np.asarray(indices, dtype=np.int32)
             if axis is None:
                 for axis in range(3):
                     self.fix_rotation(indices, axis)
                 return
-            indices = jnp.array((*indices, axis), dtype=jnp.int32)
             new = Rotation(
                 indices,
-                self.all_atoms[indices[:-1]].positions
+                axis,
+                self.all_atoms[indices].positions
             )
         try:
             _ = self.internals['rotations'].index(new)
@@ -746,9 +775,9 @@ class Constraints(BaseInternals):
             new = index
         else:
             if index is None:
-                index = jnp.arange(len(self.all_atoms), dtype=jnp.int32)
+                index = np.arange(len(self.all_atoms), dtype=np.int32)
             if np.isscalar(index):
-                index = jnp.array((index,), dtype=jnp.int32)
+                index = np.array((index,), dtype=np.int32)
             if dim is None:
                 if target is not None:
                     raise ValueError(
@@ -757,7 +786,7 @@ class Constraints(BaseInternals):
                 for dim in range(3):
                     self.fix_translation(index, dim=dim)
                 return
-            new = Translation((*index, dim))
+            new = Translation(index, dim)
         if target is None:
             target = new.calc(self.all_atoms)
         try:
@@ -926,16 +955,16 @@ class Internals(BaseInternals):
             new = indices
         else:
             if indices is None:
-                indices = jnp.arange(len(self.all_atoms), dtype=jnp.int32)
-            indices = jnp.array(indices, dtype=jnp.int32)
+                indices = np.arange(len(self.all_atoms), dtype=np.int32)
+            indices = np.array(indices, dtype=np.int32)
             if axis is None:
                 for axis in range(3):
                     self.add_rotation(indices, axis)
                 return
-            indices = jnp.array((*indices, axis), dtype=jnp.int32)
             new = Rotation(
                 indices,
-                self.all_atoms[indices[:-1]].positions
+                axis,
+                self.all_atoms[indices].positions
             )
         if (
             new in self.internals['rotations']
@@ -957,14 +986,14 @@ class Internals(BaseInternals):
             new = index
         else:
             if index is None:
-                index = jnp.arange(len(self.all_atoms), dtype=jnp.int32)
+                index = np.arange(len(self.all_atoms), dtype=np.int32)
             elif isinstance(index, int):
-                index = jnp.array((index,), dtype=jnp.int32)
+                index = np.array((index,), dtype=np.int32)
             if dim is None:
                 for dim in range(3):
                     self.add_translation(index, dim=dim)
                 return
-            new = Translation((*index, dim))
+            new = Translation(index, dim)
         if (
             new in self.internals['translations']
             or new in self.forbidden['translations']
@@ -1014,14 +1043,14 @@ class Internals(BaseInternals):
             new = index
         else:
             if index is None:
-                index = jnp.arange(len(self.all_atoms), dtype=jnp.int32)
+                index = np.arange(len(self.all_atoms), dtype=np.int32)
             elif isinstance(index, int):
-                index = jnp.array((index,), dtype=jnp.int32)
+                index = np.array((index,), dtype=np.int32)
             if dim is None:
                 for dim in range(3):
                     self.forbid_translation(index, dim=dim)
                 return
-            new = Translation((*index, dim))
+            new = Translation(index, dim)
         try:
             self.internals['translations'].remove(new)
         except ValueError:
