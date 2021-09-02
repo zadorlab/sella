@@ -12,6 +12,7 @@ try:
     from Cython.Build import cythonize
 except ImportError:
     use_cython = False
+
 else:
     use_cython = True
 
@@ -31,7 +32,8 @@ ext_modules = []
 for cy_file in cy_files:
     ext_modules.append(Extension('.'.join(['sella', *cy_file]),
                                  [os.path.join('sella', *cy_file) + cy_suff],
-                                 define_macros=macros))
+                                 define_macros=macros,
+                                 include_dirs=[np.get_include()]))
 
 if use_cython:
     compdir = dict(linetrace=debug, boundscheck=debug, language_level=3,
