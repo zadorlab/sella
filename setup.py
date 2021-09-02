@@ -6,6 +6,8 @@ import numpy as np
 
 from setuptools import setup, Extension, find_packages
 
+VERSION = '2.0.3'
+
 debug = '--debug' in sys.argv or '-g' in sys.argv
 
 try:
@@ -47,7 +49,7 @@ with open('requirements.txt', 'r') as f:
     install_requires = f.read().strip().split()
 
 setup(name='Sella',
-      version='2.0.2',
+      version=VERSION,
       author='Eric Hermes',
       author_email='ehermes@sandia.gov',
       long_description=long_description,
