@@ -175,7 +175,7 @@ def _translation(
     dim: int,
     tvecs: jnp.ndarray
 ) -> float:
-    return pos[:, indices[-1]].mean()
+    return pos[:, dim].mean()
 
 
 class Translation(Internal):
@@ -184,7 +184,6 @@ class Translation(Internal):
         indices: Tuple[int, ...],
         dim: int,
     ) -> None:
-        assert len(indices) >= 2, indices
         self.indices = np.array(sorted(indices), dtype=np.int32)
         self.ncvecs = np.empty((0, 3), dtype=np.int32)
         self.dim = dim
