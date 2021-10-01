@@ -346,7 +346,7 @@ class Rotation(Internal):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return NotImplemented
-        if self.dim != other.dim:
+        if self.axis != other.axis:
             return False
         if len(self.indices) != len(other.indices):
             return False
