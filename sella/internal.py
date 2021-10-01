@@ -7,6 +7,7 @@ from itertools import (
     combinations_with_replacement as cwr
 )
 from functools import partialmethod
+import warnings
 
 import numpy as np
 from ase import Atom, Atoms, units
@@ -1203,10 +1204,10 @@ class Internals(BaseInternals):
                 else:
                     self.forbid_angle(new)
                     linear.append((b1, b2))
-            if linear and self.dinds[j] < 0:
+            #if linear and self.dinds[j] < 0:
+            if linear:
                 if len(jbonds) == 2:
                     # Add a dummy atom to an atom center with only 2 bonds
-                    self.dinds[j] = self.natoms + self.ndummies
                     # sort bonds from shortest to longest to ensure
                     # permutational invariance
                     b1, b2 = sorted(jbonds, key=lambda x: x.calc(self.atoms))
@@ -1214,36 +1215,47 @@ class Internals(BaseInternals):
                     # vectors. These two vectors are close to collinear, and
                     # may be exactly collinear, so there's a backup strategy
                     # if this results in the zero-vector.
-                    dx1 = -b1.calc_vec(self.atoms)
-                    dx1 /= np.linalg.norm(dx1)
-                    dx2 = b2.calc_vec(self.atoms)
-                    dx2 /= np.linalg.norm(dx2)
-                    dpos = dx1 + dx2
-                    dpos -= dx1 * (dpos @ dx1)
-                    dpos_norm = np.linalg.norm(dpos)
-                    if dpos_norm < 1e-4:
-                        # the aforementioned backup strategy
-                        # pick the cartesian basis vector that is maximally
-                        # orthogonal with the shorter of the two displacement
-                        # vectors.
-                        # note: this is not rotationally invariant, but
-                        # there's not much we can do about that
-                        dim = np.argmin(np.abs(dx1))
-                        dpos[:] = 0.
-                        dpos[dim] = 1.
+                    if self.dinds[j] < 0:
+                        self.dinds[j] = self.natoms + self.ndummies
+                        dx1 = -b1.calc_vec(self.atoms)
+                        dx1 /= np.linalg.norm(dx1)
+                        dx2 = b2.calc_vec(self.atoms)
+                        dx2 /= np.linalg.norm(dx2)
+                        dpos = dx1 + dx2
                         dpos -= dx1 * (dpos @ dx1)
-                        dpos /= np.linalg.norm(dpos)
-                    else:
-                        dpos /= dpos_norm
-                    # Add the dummy atom
-                    dpos += self.atoms.positions[j]
-                    self.dummies += Atom('X', dpos)
+                        dpos_norm = np.linalg.norm(dpos)
+                        if dpos_norm < 1e-4:
+                            # the aforementioned backup strategy
+                            # pick the cartesian basis vector that is maximally
+                            # orthogonal with the shorter of the two displacement
+                            # vectors.
+                            # note: this is not rotationally invariant, but
+                            # there's not much we can do about that
+                            dim = np.argmin(np.abs(dx1))
+                            dpos[:] = 0.
+                            dpos[dim] = 1.
+                            dpos -= dx1 * (dpos @ dx1)
+                            dpos /= np.linalg.norm(dpos)
+                        else:
+                            dpos /= dpos_norm
+                        # Add the dummy atom
+                        dpos += self.atoms.positions[j]
+                        self.dummies += Atom('X', dpos)
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond)
                     self.add_bond(dbond)
-                    # Fix one dummy angle and update relavent internals
-                    self.cons.fix_angle(b1 + dbond)
+                    # Fix one dummy angle
+                    dangle = b1 + dbond
+                    self.cons.fix_angle(dangle)
+                    # Fix the improper dihedral and update relevant internals
+                    if b2.indices[1] == j:
+                        b2 = b2.reverse()
+                    dbond2 = Bond((self.dinds[j], b2.indices[1]), b2.ncvecs)
+                    dangle2 = dbond + dbond2
+                    ddihedral = dangle + dangle2
+                    self.cons.fix_dihedral(ddihedral)
+                    self.add_dihedral(ddihedral)
                     self.add_dummy_to_internals(j)
                     self.cons.add_dummy_to_internals(j)
                     # Add relevant angles
@@ -1299,6 +1311,16 @@ class Internals(BaseInternals):
                 self.add_dihedral(new)
             except DuplicateInternalError:
                 continue
+
+    def validate_basis(self) -> None:
+        jac = self.jacobian()
+        U, S, VT = np.linalg.svd(jac)
+        ndeloc = np.sum(S > 1e-8)
+        ndof = 3 * (self.natoms + self.ndummies) - 6
+        if ndeloc != ndof:
+            warnings.warn(
+                f'{ndeloc} coords found! Expected {ndof}.'
+            )
 
     def check_for_bad_internals(self) -> Optional[Dict[str, List[Internal]]]:
         bad = {'bonds': [], 'angles': []}

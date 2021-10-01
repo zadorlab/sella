@@ -335,6 +335,7 @@ class InternalPES(PES):
         new_int.find_all_bonds()
         new_int.find_all_angles()
         new_int.find_all_dihedrals()
+        new_int.validate_basis()
 
         PES.__init__(
             self,
@@ -505,6 +506,7 @@ class InternalPES(PES):
         new_int.find_all_bonds()
         new_int.find_all_angles()
         new_int.find_all_dihedrals()
+        new_int.validate_basis()
         new_cons = new_int.cons
 
         # Calculate B matrix and its inverse for new and old internals
