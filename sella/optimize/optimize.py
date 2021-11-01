@@ -152,6 +152,7 @@ class Sella(Optimizer):
     ):
         if internal:
             if isinstance(internal, Internals):
+                auto_find_internals = False
                 if constraints is not None:
                     raise ValueError(
                         "Internals object and Constraint object cannot both "
@@ -160,6 +161,7 @@ class Sella(Optimizer):
                         "Internals object."
                     )
             else:
+                auto_find_internals = True
                 internal = Internals(atoms, cons=constraints)
             self.internal = internal.copy()
             self.constraints = None
@@ -169,6 +171,7 @@ class Sella(Optimizer):
                 trajectory=trajectory,
                 eta=eta,
                 v0=v0,
+                auto_find_internals=auto_find_internals,
                 **kwargs
             )
         else:

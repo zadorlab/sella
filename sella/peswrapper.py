@@ -328,13 +328,15 @@ class InternalPES(PES):
         *args,
         H0: np.ndarray = None,
         iterative_stepper: int = 0,
+        auto_find_internals: bool = True,
         **kwargs
     ):
         self.int_orig = internals
         new_int = internals.copy()
-        new_int.find_all_bonds()
-        new_int.find_all_angles()
-        new_int.find_all_dihedrals()
+        if auto_find_internals:
+            new_int.find_all_bonds()
+            new_int.find_all_angles()
+            new_int.find_all_dihedrals()
         new_int.validate_basis()
 
         PES.__init__(
