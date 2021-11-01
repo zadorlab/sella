@@ -351,7 +351,7 @@ class Rotation(Internal):
             return False
         if len(self.indices) != len(other.indices):
             return False
-        if set(self.indices) != set(other.dim):
+        if set(self.indices) != set(other.indices):
             return False
         return True
 
@@ -765,7 +765,8 @@ class Constraints(BaseInternals):
         self,
         index: Union[int, Tuple[int, ...], Translation] = None,
         dim: int = None,
-        target: float = None
+        target: float = None,
+        replace_ok: bool = True,
     ) -> None:
         if isinstance(index, Translation):
             if dim is not None:
@@ -795,6 +796,9 @@ class Constraints(BaseInternals):
             self.internals['translations'].append(new)
             self._targets['translations'].append(target)
         else:
+            if replace_ok:
+                self._targets['translations'][idx] = target
+                return
             raise DuplicateConstraintError(
                 "Coordinate {} is already fixed to target {}"
                 .format(new, self._targets['translations'][idx])
@@ -809,6 +813,7 @@ class Constraints(BaseInternals):
         ncvecs: Tuple[IVec, ...] = None,
         mic: bool = None,
         target: float = None,
+        replace_ok: bool = True,
     ) -> None:
         if isinstance(indices, kind):
             if ncvecs is not None or mic is not None:
@@ -830,6 +835,9 @@ class Constraints(BaseInternals):
             self.internals[name].append(new)
             self._targets[name].append(target)
         else:
+            if replace_ok:
+                self._targets[name][idx] = target
+                return
             raise DuplicateConstraintError(
                 "Coordinate {} is already fixed to target {}"
                 .format(new, self._targets[name][idx]) / conv
@@ -1195,7 +1203,7 @@ class Internals(BaseInternals):
             linear = []
             for b1, b2 in combinations(jbonds, 2):
                 new = b1 + b2
-                assert new.indices[1] == j
+                assert new.indices[1] == j, new.indices
                 if self.atol < new.calc(self.atoms) < np.pi - self.atol:
                     try:
                         self.add_angle(new)
@@ -1243,18 +1251,18 @@ class Internals(BaseInternals):
                         self.dummies += Atom('X', dpos)
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
-                    self.cons.fix_bond(dbond)
+                    self.cons.fix_bond(dbond, replace_ok=False)
                     self.add_bond(dbond)
                     # Fix one dummy angle
                     dangle = b1 + dbond
-                    self.cons.fix_angle(dangle)
+                    self.cons.fix_angle(dangle, replace_ok=False)
                     # Fix the improper dihedral and update relevant internals
                     if b2.indices[1] == j:
                         b2 = b2.reverse()
                     dbond2 = Bond((self.dinds[j], b2.indices[1]), b2.ncvecs)
                     dangle2 = dbond + dbond2
                     ddihedral = dangle + dangle2
-                    self.cons.fix_dihedral(ddihedral)
+                    self.cons.fix_dihedral(ddihedral, replace_ok=False)
                     self.add_dihedral(ddihedral)
                     self.add_dummy_to_internals(j)
                     self.cons.add_dummy_to_internals(j)
