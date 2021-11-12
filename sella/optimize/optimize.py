@@ -78,6 +78,7 @@ class Sella(Optimizer):
 
         asetraj = None
         self.peskwargs = kwargs.copy()
+        self.user_internal = internal
         self.initialize_pes(
             atoms, trajectory, order, eta, constraints, v0, internal, **kwargs
         )
@@ -228,7 +229,7 @@ class Sella(Optimizer):
                 eta=self.pes.eta,
                 constraints=self.constraints,
                 v0=None,  # TODO: use leftmost eigenvector from old H
-                internal=self.internal,
+                internal=self.user_internal,
             )
             self.initialized = False
             self.rho = 1
