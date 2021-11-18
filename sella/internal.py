@@ -1229,8 +1229,7 @@ class Internals(BaseInternals):
                         dx1 /= np.linalg.norm(dx1)
                         dx2 = b2.calc_vec(self.atoms)
                         dx2 /= np.linalg.norm(dx2)
-                        dpos = dx1 + dx2
-                        dpos -= dx1 * (dpos @ dx1)
+                        dpos = np.cross(dx1, dx2)
                         dpos_norm = np.linalg.norm(dpos)
                         if dpos_norm < 1e-4:
                             # the aforementioned backup strategy
@@ -1254,15 +1253,16 @@ class Internals(BaseInternals):
                     self.cons.fix_bond(dbond, replace_ok=False)
                     self.add_bond(dbond)
                     # Fix one dummy angle
-                    dangle = b1 + dbond
-                    self.cons.fix_angle(dangle, replace_ok=False)
+                    dangle1 = b1 + dbond
+                    self.cons.fix_angle(dangle1, replace_ok=False)
+                    dangle2 = b2 + dbond
+                    self.cons.fix_angle(dangle2, replace_ok=False)
                     # Fix the improper dihedral and update relevant internals
                     if b2.indices[1] == j:
                         b2 = b2.reverse()
                     dbond2 = Bond((self.dinds[j], b2.indices[1]), b2.ncvecs)
-                    dangle2 = dbond + dbond2
-                    ddihedral = dangle + dangle2
-                    self.cons.fix_dihedral(ddihedral, replace_ok=False)
+                    dangle3 = dbond + dbond2
+                    ddihedral = dangle1 + dangle3
                     self.add_dihedral(ddihedral)
                     self.add_dummy_to_internals(j)
                     self.cons.add_dummy_to_internals(j)
