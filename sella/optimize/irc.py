@@ -84,13 +84,15 @@ class IRC(Optimizer):
     def step(self):
         x0 = self.pes.get_x()
         for n in range(100):
-            s, smag = IRCTrustRegion(self.pes, 0, self.dx,
-                                     method=QuasiNewtonIRC,
-                                     sqrtm=self.sqrtm, d1=self.d1).get_s()
+            s, smag = IRCTrustRegion(
+                self.pes, 0, self.dx, method=QuasiNewtonIRC, sqrtm=self.sqrtm,
+                d1=self.d1
+            ).get_s()
+
             bound_clip = abs(smag - self.dx) < 1e-8
             self.d1 += s
 
-            self.pes.set_x(x0 + self.d1)
+            self.pes.kick(s)
             g1 = self.pes.get_g()
 
             d1m = self.d1 * self.sqrtm
@@ -99,10 +101,9 @@ class IRC(Optimizer):
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
             snorm = np.linalg.norm(s)
-            print(bound_clip, snorm, dot)
             if bound_clip and abs(1 - dot) < self.irctol:
                 break
-            elif not bound_clip and self.converged():
+            elif self.converged():
                 break
         else:
             raise RuntimeError("Inner IRC loop failed to converge")
