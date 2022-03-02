@@ -54,7 +54,7 @@ class IRC(Optimizer):
 
         if self.v0ts is None:
             # Initial diagonalization
-            self.pes.diag(**self.peskwargs)
+            self.pes.kick(0, True, **self.peskwargs)
             Hw = self.pes.get_H().asarray() / np.outer(self.sqrtm, self.sqrtm)
             _, vecs = eigh(Hw)
             self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
