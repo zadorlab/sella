@@ -91,7 +91,10 @@ class Sella(Optimizer):
 
         if delta0 is None:
             delta0 = default['delta0']
-        self.delta = delta0 * self.pes.get_Ufree().shape[1]
+        if self.rs == 'mis':
+            self.delta = delta0
+        else:
+            self.delta = delta0 * self.pes.get_Ufree().shape[1]
 
         if sigma_inc is None:
             self.sigma_inc = default['sigma_inc']
