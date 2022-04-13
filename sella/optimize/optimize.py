@@ -25,7 +25,7 @@ _default_kwargs = dict(
         eig=False
     ),
     saddle=dict(
-        delta0=1.3e-3,
+        delta0=0.1,
         sigma_inc=1.15,
         sigma_dec=0.65,
         rho_inc=1.035,
@@ -54,7 +54,7 @@ class Sella(Optimizer):
         eig: bool = None,
         eta: float = 1e-4,
         method: str = None,
-        gamma: float = 0.4,
+        gamma: float = 0.1,
         threepoint: bool = False,
         constraints: Constraints = None,
         constraints_tol: float = 1e-5,
@@ -91,7 +91,10 @@ class Sella(Optimizer):
 
         if delta0 is None:
             delta0 = default['delta0']
-        self.delta = delta0 * self.pes.get_Ufree().shape[1]
+        if rs in ['mis', 'ras']:
+            self.delta = delta0
+        else:
+            self.delta = delta0 * self.pes.get_Ufree().shape[1]
 
         if sigma_inc is None:
             self.sigma_inc = default['sigma_inc']
