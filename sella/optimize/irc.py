@@ -11,11 +11,25 @@ from .stepper import QuasiNewtonIRC
 
 
 class IRC(Optimizer):
-    def __init__(self, atoms, restart=None, logfile='-', trajectory=None,
-                 master=None, force_consistent=False, irctol=1e-3, dx=0.1,
-                 eta=1e-4, gamma=0.4, peskwargs=None, **kwargs):
+    def __init__(
+        self,
+        atoms,
+        restart=None,
+        logfile='-',
+        trajectory=None,
+        master=None,
+        force_consistent=False,
+        ninner_iter=10,
+        irctol=1e-2,
+        dx=0.1,
+        eta=1e-4,
+        gamma=0.1,
+        peskwargs=None,
+        **kwargs
+    ):
         Optimizer.__init__(self, atoms, restart, logfile, trajectory, master,
                            force_consistent)
+        self.ninner_iter = ninner_iter
         self.irctol = irctol
         self.dx = dx
         if peskwargs is None:
@@ -35,6 +49,7 @@ class IRC(Optimizer):
 
         def get_W(self):
             return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))
+
         PES.get_W = get_W
         self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False,
                        **kwargs)
@@ -83,7 +98,10 @@ class IRC(Optimizer):
 
     def step(self):
         x0 = self.pes.get_x()
-        for n in range(100):
+        if self.first:
+            self.pes.kick(self.d1)
+            self.first = False
+        for n in range(self.ninner_iter):
             s, smag = IRCTrustRegion(
                 self.pes, 0, self.dx, method=QuasiNewtonIRC, sqrtm=self.sqrtm,
                 d1=self.d1
@@ -101,6 +119,7 @@ class IRC(Optimizer):
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
             snorm = np.linalg.norm(s)
+            #print(bound_clip, snorm, dot, self.pes.H.evals[0])
             if bound_clip and abs(1 - dot) < self.irctol:
                 break
             elif self.converged():
