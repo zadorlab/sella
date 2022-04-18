@@ -383,6 +383,59 @@ class Rotation(Internal):
     _eval2 = staticmethod(jit(jacfwd(jacfwd(_rotation, argnums=0), argnums=0)))
 
 
+def _displacement(
+    pos: jnp.ndarray,
+    refpos: jnp.ndarray,
+    W: jnp.ndarray
+) -> float:
+    dx = (pos - refpos).ravel()
+    return jnp.sqrt(dx @ W @ dx)
+
+
+class Displacement(Internal):
+    def __init__(
+        self,
+        refpos: np.ndarray,
+        W: np.ndarray,
+    ) -> None:
+        self.refpos = refpos.copy()
+        self.W = W.copy()
+
+    def reverse(self) -> 'Internal':
+        raise NotImplementedError
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return np.all(self.refpos == other.refpos)
+
+    def __repr__(self) -> str:
+        return "{}(refpos={}, W={})".format(
+            self.__class__.__name__,
+            self.refpos,
+            self.W,
+        )
+
+    def calc(self, atoms: Atoms) -> float:
+        return float(self._eval0(
+            atoms.positions, self.refpos, self.W
+        ))
+
+    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
+        return np.array(self._eval1(
+            atoms.positions, self.refpos, self.W
+        ))
+
+    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
+        return np.array(self._eval2(
+            atoms.positions, self.refpos, self.W
+        ))
+
+    _eval0 = staticmethod(jit(_displacement))
+    _eval1 = staticmethod(jit(_gradient(_displacement)))
+    _eval2 = staticmethod(jit(_hessian(_displacement)))
+
+
 def _bond(
     pos: jnp.ndarray,
     tvecs: jnp.ndarray
@@ -448,7 +501,9 @@ Dihedral.diff = Angle
 
 
 class BaseInternals:
-    _names = ('translations', 'bonds', 'angles', 'dihedrals', 'rotations')
+    _names = (
+        'translations', 'bonds', 'angles', 'dihedrals', 'other', 'rotations'
+    )
 
     def __init__(
         self,
@@ -480,6 +535,7 @@ class BaseInternals:
         self.dinds = dinds
 
         self.internals = {key: [] for key in self._names}
+        self._active = {key: [] for key in self._names}
         self.cell = None
         self.rcell = None
         self.op = None
@@ -494,27 +550,38 @@ class BaseInternals:
 
     @property
     def ntrans(self) -> int:
-        return len(self.internals['translations'])
+        return sum(self._active['translations'])
 
     @property
     def nbonds(self) -> int:
-        return len(self.internals['bonds'])
+        return sum(self._active['bonds'])
 
     @property
     def nangles(self) -> int:
-        return len(self.internals['angles'])
+        return sum(self._active['angles'])
 
     @property
     def ndihedrals(self) -> int:
-        return len(self.internals['dihedrals'])
+        return sum(self._active['dihedrals'])
 
     @property
     def nrotations(self) -> int:
-        return len(self.internals['rotations'])
+        return sum(self._active['rotations'])
+
+    @property
+    def _active_indices(self) -> List[int]:
+        idx = 0
+        indices = []
+        for name in self._names:
+            for active in self._active[name]:
+                if active:
+                    indices.append(idx)
+                idx += 1
+        return indices
 
     @property
     def nint(self) -> int:
-        return sum(map(len, self.internals.values()))
+        return len(self._active_indices)
 
     @property
     def ndof(self) -> int:
@@ -592,8 +659,9 @@ class BaseInternals:
 
     def __iter__(self) -> Iterator[Internal]:
         for name in self._names:
-            for coord in self.internals[name]:
-                yield coord
+            for coord, active in zip(self.internals[name], self._active[name]):
+                if active:
+                    yield coord
 
     def _get_neighbors(self, dx: np.ndarray) -> Iterator[np.ndarray]:
         pbc = self.atoms.pbc
@@ -700,6 +768,7 @@ class Constraints(BaseInternals):
     ) -> None:
         BaseInternals.__init__(self, atoms, dummies, dinds)
         self._targets = {key: [] for key in self._names}
+        self._kind = {key: [] for key in self._names}
         self.ignore_rotation = ignore_rotation
         for ase_cons in atoms.constraints:
             self.merge_ase_constraint(ase_cons)
@@ -711,6 +780,8 @@ class Constraints(BaseInternals):
         for name in self._names:
             new.internals[name] = self.internals[name].copy()
             new._targets[name] = self._targets[name].copy()
+            new._active[name] = self._active[name].copy()
+            new._kind[name] = self._kind[name].copy()
         return new
 
     @property
@@ -718,7 +789,7 @@ class Constraints(BaseInternals):
         vec = []
         for key in self._names:
             vec += self._targets[key]
-        return np.array(vec, dtype=np.float64)
+        return np.array(vec, dtype=np.float64)[self._active_indices]
 
     def residual(self) -> np.ndarray:
         """Calculates the constraint residual vector."""
@@ -726,6 +797,35 @@ class Constraints(BaseInternals):
         if self.ignore_rotation and self.nrotations:
             res[-self.nrotations:] = 0.
         return res
+
+    def disable_satisfied_inequalities(self) -> None:
+        for name in self._names:
+            for i, (coord, kind, target) in enumerate(zip(
+                self.internals[name], self._kind[name], self._targets[name]
+            )):
+                if kind == 'lt' and coord.calc(self.all_atoms) <= target:
+                    active = False
+                elif kind == 'gt' and coord.calc(self.all_atoms) >= target:
+                    active = False
+                else:
+                    active = True
+                self._active[name][i] = active
+
+    def validate_inequalities(self) -> bool:
+        all_valid = True
+        for name in self._names:
+            for i, (coord, kind, target) in enumerate(zip(
+                self.internals[name], self._kind[name], self._targets[name]
+            )):
+                if self._active[name][i]:
+                    continue
+                if kind == 'lt' and coord.calc(self.all_atoms) > target:
+                    self._active[name][i] = True
+                    all_valid = False
+                elif kind == 'gt' and coord.calc(self.all_atoms) < target:
+                    self._active[name][i] = True
+                    all_valid = False
+        return all_valid
 
     def fix_rotation(
         self,
@@ -756,6 +856,8 @@ class Constraints(BaseInternals):
         except ValueError:
             self.internals['rotations'].append(new)
             self._targets['rotations'].append(0.)
+            self._active['rotations'].append(True)
+            self._kind['rotations'].append('eq')
         else:
             raise DuplicateConstraintError(
                 "This rotation has already been constrained!"
@@ -795,6 +897,8 @@ class Constraints(BaseInternals):
         except ValueError:
             self.internals['translations'].append(new)
             self._targets['translations'].append(target)
+            self._active['translations'].append(True)
+            self._kind['translations'].append('eq')
         else:
             if replace_ok:
                 self._targets['translations'][idx] = target
@@ -813,6 +917,7 @@ class Constraints(BaseInternals):
         ncvecs: Tuple[IVec, ...] = None,
         mic: bool = None,
         target: float = None,
+        comparator: str = 'eq',
         replace_ok: bool = True,
     ) -> None:
         if isinstance(indices, kind):
@@ -834,6 +939,8 @@ class Constraints(BaseInternals):
         except ValueError:
             self.internals[name].append(new)
             self._targets[name].append(target)
+            self._active[name].append(True)
+            self._kind[name].append(comparator)
         else:
             if replace_ok:
                 self._targets[name][idx] = target
@@ -948,6 +1055,7 @@ class Internals(BaseInternals):
         for name in self._names:
             new.internals[name] = self.internals[name].copy()
             new.forbidden[name] = self.forbidden[name].copy()
+            new._active[name] = self._active[name].copy()
         return new
 
     def add_rotation(
@@ -980,6 +1088,7 @@ class Internals(BaseInternals):
         ):
             raise DuplicateInternalError
         self.internals['rotations'].append(new)
+        self._active['rotations'].append(True)
 
     def add_translation(
         self,
@@ -1008,6 +1117,7 @@ class Internals(BaseInternals):
         ):
             raise DuplicateInternalError
         self.internals['translations'].append(new)
+        self._active['translations'].append(True)
 
     def _add_internal(
         self,
@@ -1033,6 +1143,7 @@ class Internals(BaseInternals):
         ):
             raise DuplicateInternalError
         self.internals[name].append(new)
+        self._active[name].append(True)
 
     add_bond = partialmethod(_add_internal, Bond, 'bonds')
     add_angle = partialmethod(_add_internal, Angle, 'angles')

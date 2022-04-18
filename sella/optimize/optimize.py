@@ -199,8 +199,16 @@ class Sella(Optimizer):
                 self.pes.diag(**self.diagkwargs)
             self.initialized = True
 
-        s, smag = self.rs(self.pes, self.ord, self.delta,
-                          method=self.method).get_s()
+        self.pes.cons.disable_satisfied_inequalities()
+        self.pes.save()
+        all_valid = False
+        while not all_valid:
+            s, smag = self.rs(
+                self.pes, self.ord, self.delta, method=self.method
+            ).get_s()
+            self.pes.set_x(self.pes.get_x() + s)
+            all_valid = self.pes.cons.validate_inequalities()
+            self.pes.restore()
         return s, smag
 
     def step(self):
