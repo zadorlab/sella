@@ -68,12 +68,11 @@ class PES:
         self.v0 = v0
 
         self.neval = 0
-        self.curr = dict(x=None,
-                         f=None,
-                         g=None,
-                         gfree=None,
-                         hfree=None,
-                         )
+        self.curr = dict(
+            x=None,
+            f=None,
+            g=None,
+        )
         self.last = self.curr.copy()
 
         # Internal coordinate specific things
@@ -189,21 +188,31 @@ class PES:
 
         if feval:
             f, g = self.eval()
-            L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
         else:
             f = None
             g = None
-            L = None
 
         if new_point:
-            self.last = self.curr
-            self.curr = dict(x=x, f=f, g=g, drdx=drdx, Ucons=Ucons,
-                             Unred=Unred, Ufree=Ufree, L=L)
-        else:
-            self.curr['f'] = f
-            self.curr['g'] = g
-            self.curr['L'] = L
+            self.last = self.curr.copy()
+
+        self.curr['x'] = x
+        self.curr['f'] = f
+        self.curr['g'] = g
+        self._update_basis()
         return True
+
+    def _update_basis(self):
+        drdx, Ucons, Unred, Ufree = self._calc_basis()
+        self.curr['drdx'] = drdx
+        self.curr['Ucons'] = Ucons
+        self.curr['Unred'] = Unred
+        self.curr['Ufree'] = Ufree
+
+        if self.curr['g'] is None:
+            L = None
+        else:
+            L = np.linalg.lstsq(drdx.T, self.curr['g'], rcond=None)[0]
+        self.curr['L'] = L
 
     def _update_H(self, dx, dg):
         if self.last['x'] is None or self.last['g'] is None:

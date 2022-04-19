@@ -569,15 +569,15 @@ class BaseInternals:
         return sum(self._active['rotations'])
 
     @property
-    def _active_indices(self) -> List[int]:
-        idx = 0
-        indices = []
+    def _active_mask(self) -> List[bool]:
+        active = []
         for name in self._names:
-            for active in self._active[name]:
-                if active:
-                    indices.append(idx)
-                idx += 1
-        return indices
+            active += self._active[name]
+        return active
+
+    @property
+    def _active_indices(self) -> List[int]:
+        return [idx for idx, active in enumerate(self._active_mask) if active]
 
     @property
     def nint(self) -> int:
@@ -612,7 +612,7 @@ class BaseInternals:
         if 'coords' not in self._cache:
             atoms = self.all_atoms
             self._cache['coords'] = np.array([c.calc(atoms) for c in self])
-        return self._cache['coords'].copy()
+        return np.array([x for x, a in zip(self._cache['coords'], self._active_mask) if a])
 
     def jacobian(self) -> np.ndarray:
         """Calculates the internal coordinate Jacobian matrix."""
@@ -622,10 +622,11 @@ class BaseInternals:
             self._cache['jacobian'] = [
                 np.array(c.calc_gradient(atoms)) for c in self
             ]
-        indices = [np.array(c.indices) for c in self]
+        indices = [np.array(c.indices) for c, a in zip(self, self._active_mask) if a]
         return SparseInternalJacobian(
-            self.natoms + self.ndummies, indices,
-            self._cache['jacobian'].copy()
+            self.natoms + self.ndummies,
+            indices,
+            [j for j, a in zip(self._cache['jacobian'], self._active_mask) if a]
         ).asarray()
 
     def hessian(self) -> np.ndarray:
@@ -638,7 +639,9 @@ class BaseInternals:
             ]
         indices = [np.array(c.indices) for c in self]
         hessians = []
-        for idx, vals in zip(indices, self._cache['hessian']):
+        for idx, vals, active in zip(indices, self._cache['hessian'], self._active_mask):
+            if not active:
+                continue
             hessians.append(SparseInternalHessian(
                 self.natoms + self.ndummies, idx, vals.copy()
             ))
@@ -659,9 +662,11 @@ class BaseInternals:
 
     def __iter__(self) -> Iterator[Internal]:
         for name in self._names:
-            for coord, active in zip(self.internals[name], self._active[name]):
-                if active:
-                    yield coord
+            for coord in self.internals[name]:
+                yield coord
+            #for coord, active in zip(self.internals[name], self._active[name]):
+            #    if active:
+            #        yield coord
 
     def _get_neighbors(self, dx: np.ndarray) -> Iterator[np.ndarray]:
         pbc = self.atoms.pbc
