@@ -239,7 +239,10 @@ class PES:
         self._update(False)
         return self.curr['Ucons']
 
-    def diag(self, gamma=0.5, threepoint=False, maxiter=None):
+    def diag(self, gamma=0.1, threepoint=False, maxiter=None):
+        if self.curr['f'] is None:
+            self._update(feval=True)
+
         Ufree = self.get_Ufree()
         nfree = Ufree.shape[1]
 

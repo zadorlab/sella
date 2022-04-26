@@ -389,15 +389,17 @@ def _displacement(
     W: jnp.ndarray
 ) -> float:
     dx = (pos - refpos).ravel()
-    return jnp.sqrt(dx @ W @ dx)
+    return dx @ W @ dx
 
 
 class Displacement(Internal):
     def __init__(
         self,
+        indices: np.ndarray,
         refpos: np.ndarray,
         W: np.ndarray,
     ) -> None:
+        self.indices = indices.copy()
         self.refpos = refpos.copy()
         self.W = W.copy()
 
@@ -410,25 +412,26 @@ class Displacement(Internal):
         return np.all(self.refpos == other.refpos)
 
     def __repr__(self) -> str:
-        return "{}(refpos={}, W={})".format(
+        return "{}(indices={}, refpos={}, W={})".format(
             self.__class__.__name__,
+            self.indices,
             self.refpos,
             self.W,
         )
 
     def calc(self, atoms: Atoms) -> float:
         return float(self._eval0(
-            atoms.positions, self.refpos, self.W
+            atoms.positions[self.indices], self.refpos, self.W
         ))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
         return np.array(self._eval1(
-            atoms.positions, self.refpos, self.W
+            atoms.positions[self.indices], self.refpos, self.W
         ))
 
     def calc_hessian(self, atoms: Atoms) -> np.ndarray:
         return np.array(self._eval2(
-            atoms.positions, self.refpos, self.W
+            atoms.positions[self.indices], self.refpos, self.W
         ))
 
     _eval0 = staticmethod(jit(_displacement))
@@ -949,6 +952,7 @@ class Constraints(BaseInternals):
         else:
             if replace_ok:
                 self._targets[name][idx] = target
+                self._kind[name][idx] = comparator
                 return
             raise DuplicateConstraintError(
                 "Coordinate {} is already fixed to target {}"
@@ -960,6 +964,32 @@ class Constraints(BaseInternals):
     fix_dihedral = partialmethod(
         _fix_internal, Dihedral, 'dihedrals', np.pi / 180.
     )
+
+    def fix_other(
+        self,
+        coord: Internal,
+        target: float = None,
+        comparator: str = 'eq',
+        replace_ok: bool = True,
+    ) -> None:
+        if target is None:
+            target = coord.calc(self.all_atoms)
+        try:
+            idx = self.internals['other'].index(coord)
+        except ValueError:
+            self.internals['other'].append(coord)
+            self._targets['other'].append(target)
+            self._active['other'].append(True)
+            self._kind['other'].append(comparator)
+        else:
+            if replace_ok:
+                self._targets['other'][idx] = target
+                self._kind['other'][idx] = comparator
+                return
+            raise DuplicateCoordinateError(
+                "Coordinate {} is already fixed to target {}"
+                .format(coord, self._targets['other'][idx])
+            )
 
     def merge_ase_constraint(self, ase_cons: FixConstraint) -> None:
         if isinstance(ase_cons, FixAtoms):
