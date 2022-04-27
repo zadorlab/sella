@@ -137,7 +137,7 @@ jobs:
     strategy:
       max-parallel: 4
       matrix:
-        python-version: [3.7, 3.8, 3.9, 3.10]
+        python-version: [3.7, 3.8, 3.9, '3.10']
 
     steps:
     - uses: actions/checkout@master
@@ -160,42 +160,8 @@ jobs:
         name: dist-macos-${{ matrix.python-version }}
         path: dist
 
-  build-windows:
-    runs-on: windows-latest
-    strategy:
-      max-parallel: 3
-      matrix:
-        python-version: [3.7, 3.8, 3.9, 3.10]
-
-    steps:
-    - uses: actions/checkout@master
-
-    - name: Download Build Tools for Visual Studio 2019
-      run: Invoke-WebRequest -Uri https://aka.ms/vs/16/release/vs_buildtools.exe -OutFile vs_buildtools.exe
-
-    - name: Run vs_buildtools.exe install
-      run: ./vs_buildtools.exe --quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.v141.x86.x64 --add Microsoft.VisualStudio.Component.VC.140 --includeRecommended
-
-    - name: Set up Python ${{ matrix.python-version }} x64
-      uses: actions/setup-python@v1
-      with:
-        python-version: ${{ matrix.python-version }}
-        architecture: x64
-
-    - name: Install Python package dependencies
-      run: pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: python setup.py bdist_wheel
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-windows-${{ matrix.python-version }}
-        path: dist
-
   upload:
-    needs: [build-linux-cp36, build-linux-cp37, build-linux-cp38, build-linux-cp39, build-linux-cp310, build-macos, build-windows]
+    needs: [build-linux-cp36, build-linux-cp37, build-linux-cp38, build-linux-cp39, build-linux-cp310, build-macos]
     runs-on: ubuntu-latest
 
     steps:
@@ -267,30 +233,6 @@ jobs:
       with:
         name: dist-macos-3.10
     - run: mv -v dist-macos-3.10/* dist/
-
-    - name: Stage windows 3.7
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-windows-3.7
-    - run: mv -v dist-windows-3.7/* dist/
-
-    - name: Stage windows 3.8
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-windows-3.8
-    - run: mv -v dist-windows-3.8/* dist/
-
-    - name: Stage windows 3.9
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-windows-3.9
-    - run: mv -v dist-windows-3.9/* dist/
-
-    - name: Stage windows 3.10
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-windows-3.10
-    - run: mv -v dist-windows-3.10/* dist/
 
     - name: Upload with twine
       env:
