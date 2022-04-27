@@ -242,4 +242,4 @@ jobs:
       run: |
         ls -l dist/*
         pip install twine
-        twine upload --repository testpypi dist/*
+        twine upload dist/*
