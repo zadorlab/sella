@@ -9,7 +9,7 @@ from ase.optimize.optimize import Optimizer
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
 
-class IRCInnerLoopConvergenceFailure(RuntimeException):
+class IRCInnerLoopConvergenceFailure(RuntimeError):
     pass
 
 
