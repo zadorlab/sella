@@ -9,6 +9,9 @@ from ase.optimize.optimize import Optimizer
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
 
+class IRCInnerLoopConvergenceFailure(RuntimeException):
+    pass
+
 
 class IRC(Optimizer):
     def __init__(
@@ -125,7 +128,7 @@ class IRC(Optimizer):
             elif self.converged():
                 break
         else:
-            raise RuntimeError("Inner IRC loop failed to converge")
+            raise IRCInnerLoopConvergenceFailure
 
         self.d1 *= 0.
 
