@@ -58,14 +58,14 @@ class IRC(Optimizer):
                        **kwargs)
 
         self.lastrun = None
-        self.x0 = self.pes.get_x()
+        self.x0 = self.pes.get_x().copy()
         self.v0ts = None
         self.H0 = None
         self.peslast = None
         self.xi = 1.
         self.first = True
 
-    def irun(self, fmax=0.05, steps=None, direction='forward'):
+    def irun(self, fmax=0.05, fmax_inner=0.01, steps=None, direction='forward'):
         if direction not in ['forward', 'reverse']:
             raise ValueError('direction must be one of "forward" or '
                              '"reverse"!')
@@ -73,18 +73,20 @@ class IRC(Optimizer):
         if self.v0ts is None:
             # Initial diagonalization
             self.pes.kick(0, True, **self.peskwargs)
-            Hw = self.pes.get_H().asarray() / np.outer(self.sqrtm, self.sqrtm)
+            self.H0 = self.pes.get_H().asarray().copy()
+            Hw = self.H0 / np.outer(self.sqrtm, self.sqrtm)
             _, vecs = eigh(Hw)
             self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
-            self.H0 = self.pes.get_H().asarray().copy()
+            #self.v0ts = vecs[:, 0] / self.sqrtm
+            #self.v0ts *= 0.5 * self.dx / np.linalg.norm(self.v0ts)
             self.pescurr = self.pes.curr.copy()
             self.peslast = self.pes.last.copy()
         else:
             # Or, restore from last diagonalization for new direction
-            self.pes.set_x(self.x0.copy())
-            self.pes.set_H(self.H0.copy())
+            self.pes.set_x(self.x0)
             self.pes.curr = self.pescurr.copy()
             self.pes.last = self.peslast.copy()
+            self.pes.set_H(self.H0.copy(), initialized=True)
 
         if direction == 'forward':
             self.d1 = self.v0ts.copy()
@@ -92,10 +94,11 @@ class IRC(Optimizer):
             self.d1 = -self.v0ts.copy()
 
         self.first = True
+        self.fmax_inner = min(fmax, fmax_inner)
         return Optimizer.irun(self, fmax, steps)
 
-    def run(self, fmax=0.05, steps=None, direction='forward'):
-        for converged in self.irun(fmax, steps, direction):
+    def run(self, fmax=0.05, fmax_inner=0.01, steps=None, direction='forward'):
+        for converged in self.irun(fmax, fmax_inner, steps, direction):
             pass
         return converged
 
@@ -119,11 +122,17 @@ class IRC(Optimizer):
             d1m = self.d1 * self.sqrtm
             d1m /= np.linalg.norm(d1m)
             g1m = g1 / self.sqrtm
+
+            # Temporary: calculate projected gradient
+            g1m_proj = g1m - d1m * (d1m @ g1m)
+            fmax = np.linalg.norm((g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1).max()
+
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
             snorm = np.linalg.norm(s)
-            #print(bound_clip, snorm, dot, self.pes.H.evals[0])
-            if bound_clip and abs(1 - dot) < self.irctol:
+            print(bound_clip, snorm, dot, fmax)
+            #if bound_clip and abs(1 - dot) < self.irctol:
+            if bound_clip and fmax < self.fmax_inner:
                 break
             elif self.converged():
                 break
