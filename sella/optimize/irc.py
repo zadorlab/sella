@@ -118,14 +118,15 @@ class IRC(Optimizer):
 
             self.pes.kick(s)
             g1 = self.pes.get_g()
+            Ufree = self.pes.get_Ufree()
 
-            d1m = self.d1 * self.sqrtm
+            d1m = Ufree.T @ (self.d1 * self.sqrtm)
             d1m /= np.linalg.norm(d1m)
-            g1m = g1 / self.sqrtm
+            g1m = Ufree.T @ (g1 / self.sqrtm)
 
             # Temporary: calculate projected gradient
             g1m_proj = g1m - d1m * (d1m @ g1m)
-            fmax = np.linalg.norm((g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1).max()
+            fmax = np.linalg.norm(((Ufree @ g1m_proj) * self.sqrtm).reshape((-1, 3)), axis=1).max()
 
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
