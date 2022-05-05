@@ -84,7 +84,7 @@ class Sella(Optimizer):
         )
 
         if rs is None:
-            rs = 'mis' if internal else 'tr'
+            rs = 'mis' if internal else 'ras'
         self.rs = get_restricted_step(rs)
         Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
                            force_consistent)
@@ -199,8 +199,20 @@ class Sella(Optimizer):
                 self.pes.diag(**self.diagkwargs)
             self.initialized = True
 
-        s, smag = self.rs(self.pes, self.ord, self.delta,
-                          method=self.method).get_s()
+        self.pes.cons.disable_satisfied_inequalities()
+        self.pes._update_basis()
+        self.pes.save()
+        all_valid = False
+        x0 = self.pes.get_x()
+        while not all_valid:
+            s, smag = self.rs(
+                self.pes, self.ord, self.delta, method=self.method
+            ).get_s()
+            self.pes.set_x(x0 + s)
+            all_valid = self.pes.cons.validate_inequalities()
+            self.pes._update_basis()
+            self.pes.restore()
+        self.pes._update_basis()
         return s, smag
 
     def step(self):
