@@ -77,8 +77,6 @@ class IRC(Optimizer):
             Hw = self.H0 / np.outer(self.sqrtm, self.sqrtm)
             _, vecs = eigh(Hw)
             self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
-            #self.v0ts = vecs[:, 0] / self.sqrtm
-            #self.v0ts *= 0.5 * self.dx / np.linalg.norm(self.v0ts)
             self.pescurr = self.pes.curr.copy()
             self.peslast = self.pes.last.copy()
         else:
@@ -123,15 +121,13 @@ class IRC(Optimizer):
             d1m /= np.linalg.norm(d1m)
             g1m = g1 / self.sqrtm
 
-            # Temporary: calculate projected gradient
             g1m_proj = g1m - d1m * (d1m @ g1m)
             fmax = np.linalg.norm((g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1).max()
 
             g1m /= np.linalg.norm(g1m)
             dot = np.abs(d1m @ g1m)
             snorm = np.linalg.norm(s)
-            print(bound_clip, snorm, dot, fmax)
-            #if bound_clip and abs(1 - dot) < self.irctol:
+            #print(bound_clip, snorm, dot, fmax)
             if bound_clip and fmax < self.fmax_inner:
                 break
             elif self.converged():
