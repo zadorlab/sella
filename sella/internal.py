@@ -1,5 +1,5 @@
 from typing import (
-    Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict
+    Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type
 )
 from itertools import (
     product,
@@ -53,8 +53,72 @@ def _hessian(
     return jit(jacfwd(jacrev(func, argnums=0), argnums=0))
 
 
-class Internal:
-    nindices = None
+class Coordinate:
+    nindices= None
+    kwargs = None
+
+    def __init__(
+        self,
+        indices: Tuple[int, ...],
+    ) -> None:
+        if self.nindices is not None:
+            assert len(indices) == self.nindices
+        self.indices = np.array(indices, dtype=np.int32)
+        self.kwargs = dict()
+
+    def reverse(self) -> 'Coordinate':
+        raise NotImplementedError
+
+    def __eq__(self, other: 'Coordinate') -> bool:
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        if len(self.indices) != len(other.indices):
+            return False
+        if np.all(self.indices == other.indices):
+            return True
+        return False
+
+    def __add__(self, other: 'Coordinate') -> 'Coordinate':
+        raise NotImplementedError
+
+    def split(self) -> Tuple['Coordinate', 'Coordinate']:
+        raise NotImplementedError
+
+    def __repr__(self) -> str:
+        out = [f'indices={self.indices}']
+        out += [f'{key}={val}' for key, val in self.kwargs.items()]
+        str_out = ', '.join(out)
+        return f'{self.__class__.__name__}({str_out})'
+
+    @staticmethod
+    def _eval0(pos: jnp.ndarray, **kwargs) -> float:
+        raise NotImplementedError
+
+    @staticmethod
+    def _eval1(pos: jnp.ndarray, **kwargs) -> jnp.ndarray:
+        raise NotImplementedError
+
+    @staticmethod
+    def _eval2(pos: jnp.ndarray, **kwargs) -> jnp.ndarray:
+        raise NotImplementedError
+
+    def calc(self, atoms: Atoms) -> float:
+        return float(self._eval0(
+            atoms[self.indices].positions, **self.kwargs
+        ))
+
+    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
+        return np.array(self._eval1(
+            atoms[self.indices].positions, **self.kwargs
+        ))
+
+    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+        return np.array(self._eval2(
+            atoms[self.indices].positions, **self.kwargs
+        ))
+
+
+class Internal(Coordinate):
     union = None
     diff = None
 
@@ -63,9 +127,7 @@ class Internal:
         indices: Tuple[int, ...],
         ncvecs: Tuple[IVec, ...] = None
     ) -> None:
-        if self.nindices is not None:
-            assert len(indices) == self.nindices
-        self.indices = np.array(indices, dtype=np.int32)
+        Coordinate.__init__(self, indices)
 
         if self.nindices is not None:
             if ncvecs is None:
@@ -79,24 +141,20 @@ class Internal:
                     .format(self.__class__.__name__)
                 )
             ncvecs = np.empty((0, 3), dtype=np.int32)
-        self.ncvecs = ncvecs
+        self.kwargs['ncvecs'] = ncvecs
 
     def reverse(self) -> 'Internal':
-        return self.__class__(self.indices[::-1], -self.ncvecs[::-1])
+        return self.__class__(self.indices[::-1], -self.kwargs['ncvecs'][::-1])
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, self.__class__):
-            return NotImplemented
-        if (
-            np.all(self.indices == other.indices)
-            and np.all(self.ncvecs == other.ncvecs)
-        ):
-            return True
+        if not Coordinate.__eq__(self, other):
+            return False
         srev = self.reverse()
-        if (
-            np.all(srev.indices == other.indices)
-            and np.all(srev.ncvecs == other.ncvecs)
-        ):
+        if not Coordinate.__eq__(srev, other):
+            return False
+        if np.all(self.kwargs['ncvecs'] == other.kwargs['ncvecs']):
+            return True
+        if np.all(srev.kwargs['ncvecs'] == other.kwargs['ncvecs']):
             return True
         return False
 
@@ -114,10 +172,10 @@ class Internal:
         for s, o in product([self, self.reverse()], [other, other.reverse()]):
             if (
                 np.all(s.indices[1:] == o.indices[:-1])
-                and np.all(s.ncvecs[1:] == o.ncvecs[:-1])
+                and np.all(s.kwargs['ncvecs'][1:] == o.kwargs['ncvecs'][:-1])
             ):
                 new_indices = [*s.indices, o.indices[-1]]
-                new_ncvecs = [*s.ncvecs, o.ncvecs[-1]]
+                new_ncvecs = [*s.kwargs['ncvecs'], o.kwargs['ncvecs'][-1]]
                 return self.union(new_indices, new_ncvecs)
         raise NoValidInternalError(
             '{} indices do not overlap!'.format(self.__class__.__name__)
@@ -129,15 +187,8 @@ class Internal:
                 "Don't know how to split a {}!".format(self.__class__.__name__)
             )
         return (
-            self.diff(self.indices[:-1], self.ncvecs[:-1]),
-            self.diff(self.indices[1:], self.ncvecs[1:])
-        )
-
-    def __repr__(self) -> str:
-        return "{}(indices={}, ncvecs={})".format(
-            self.__class__.__name__,
-            tuple(self.indices),
-            tuple([tuple(vec) for vec in self.ncvecs])
+            self.diff(self.indices[:-1], self.kwargs['ncvecs'][:-1]),
+            self.diff(self.indices[1:], self.kwargs['ncvecs'][1:])
         )
 
     @staticmethod
@@ -159,80 +210,48 @@ class Internal:
         raise NotImplementedError
 
     def calc(self, atoms: Atoms) -> float:
-        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        tvecs = jnp.asarray(
+            self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
+        )
         return float(self._eval0(atoms[self.indices].positions, tvecs))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        tvecs = jnp.asarray(
+            self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
+        )
         return np.array(self._eval1(atoms[self.indices].positions, tvecs))
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        tvecs = jnp.asarray(
+            self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
+        )
         return np.array(self._eval2(atoms[self.indices].positions, tvecs))
 
 
 def _translation(
     pos: jnp.ndarray,
     dim: int,
-    tvecs: jnp.ndarray
 ) -> float:
     return pos[:, dim].mean()
 
 
-class Translation(Internal):
+class Translation(Coordinate):
     def __init__(
         self,
         indices: Tuple[int, ...],
         dim: int,
     ) -> None:
-        self.indices = np.array(sorted(indices), dtype=np.int32)
-        self.ncvecs = np.empty((0, 3), dtype=np.int32)
-        self.dim = dim
-
-    def reverse(self) -> 'Internal':
-        raise NotImplementedError
+        Coordinate.__init__(self, indices)
+        self.kwargs['dim'] = dim
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return NotImplemented
-        # JAX seems subtlely broken. Accessing the last element of a
-        # large jax.numpy.ndarray object is something like 5 orders of
-        # magnitude slower than accessing the last element of a
-        # numpy.ndarray objects, so we convert to numpy.ndarray here.
-        sidx = np.asarray(self.indices, dtype=np.int32)
-        oidx = np.asarray(other.indices, dtype=np.int32)
-        if self.dim != other.dim:
+        if self.kwargs['dim'] != other.kwargs['dim']:
             return False
-        if len(sidx) != len(oidx):
+        if set(self.indices) != set(other.indices):
             return False
-        if np.all(sidx == oidx):
-            return True
-        return False
-
-    def __repr__(self) -> str:
-        return "{}(indices={}, dim={})".format(
-            self.__class__.__name__,
-            tuple(self.indices),
-            self.dim
-        )
-
-    def calc(self, atoms: Atoms) -> float:
-        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
-        return float(self._eval0(
-            atoms.positions[self.indices], self.dim, tvecs
-        ))
-
-    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
-        return np.array(self._eval1(
-            atoms.positions[self.indices], self.dim, tvecs
-            ))
-
-    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        tvecs = jnp.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
-        return np.array(self._eval2(
-            atoms.positions[self.indices], self.dim, tvecs
-        ))
+        return True
 
     _eval0 = staticmethod(jit(_translation))
     _eval1 = staticmethod(_gradient(_translation))
@@ -329,7 +348,7 @@ def _rotation(
     return 2 * q[axis + 1] * asinc(q[0])
 
 
-class Rotation(Internal):
+class Rotation(Coordinate):
     def __init__(
         self,
         indices: Tuple[int, ...],
@@ -337,46 +356,22 @@ class Rotation(Internal):
         refpos: np.ndarray,
     ) -> None:
         assert len(indices) >= 2
-        self.indices = np.array(indices, dtype=np.int32)
-        self.refpos = refpos.copy() - refpos.mean(0)
-        self.axis = axis
-
-    def reverse(self) -> 'Internal':
-        raise NotImplementedError
+        Coordinate.__init__(self, indices)
+        self.kwargs['axis'] = axis
+        self.kwargs['refpos'] = refpos.copy() - refpos.mean(0)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return NotImplemented
-        if self.axis != other.axis:
+        if self.kwargs['axis'] != other.kwargs['axis']:
             return False
         if len(self.indices) != len(other.indices):
             return False
         if set(self.indices) != set(other.indices):
             return False
+        if np.any(self.kwargs['refpos'] != other.kwargs['refpos']):
+            return False
         return True
-
-    def __repr__(self) -> str:
-        return "{}(indices={}, axis={}, refpos={})".format(
-            self.__class__.__name__,
-            tuple(self.indices),
-            self.axis,
-            self.refpos,
-        )
-
-    def calc(self, atoms: Atoms) -> float:
-        return float(self._eval0(
-            atoms.positions[self.indices], self.axis, self.refpos
-        ))
-
-    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        return np.array(self._eval1(
-            atoms.positions[self.indices], self.axis, self.refpos
-        ))
-
-    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
-        return np.array(self._eval2(
-            atoms.positions[self.indices], self.axis, self.refpos
-        ))
 
     _eval0 = staticmethod(jit(_rotation))
     _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
@@ -392,47 +387,21 @@ def _displacement(
     return dx @ W @ dx
 
 
-class Displacement(Internal):
+class Displacement(Coordinate):
     def __init__(
         self,
         indices: np.ndarray,
         refpos: np.ndarray,
         W: np.ndarray,
     ) -> None:
-        self.indices = indices.copy()
-        self.refpos = refpos.copy()
-        self.W = W.copy()
+        Coordinate.__init__(self, indices)
+        self.kwargs['refpos'] = refpos.copy()
+        self.kwargs['W'] = W.copy()
 
-    def reverse(self) -> 'Internal':
-        raise NotImplementedError
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, self.__class__):
-            return NotImplemented
+    def __eq__(self, other: Coordinate) -> bool:
+        if not Coordinate.__eq__(self, other):
+            return False
         return np.all(self.refpos == other.refpos)
-
-    def __repr__(self) -> str:
-        return "{}(indices={}, refpos={}, W={})".format(
-            self.__class__.__name__,
-            self.indices,
-            self.refpos,
-            self.W,
-        )
-
-    def calc(self, atoms: Atoms) -> float:
-        return float(self._eval0(
-            atoms.positions[self.indices], self.refpos, self.W
-        ))
-
-    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        return np.array(self._eval1(
-            atoms.positions[self.indices], self.refpos, self.W
-        ))
-
-    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
-        return np.array(self._eval2(
-            atoms.positions[self.indices], self.refpos, self.W
-        ))
 
     _eval0 = staticmethod(jit(_displacement))
     _eval1 = staticmethod(jit(_gradient(_displacement)))
@@ -455,7 +424,9 @@ class Bond(Internal):
     _eval2 = staticmethod(_hessian(_bond))
 
     def calc_vec(self, atoms: Atoms) -> np.ndarray:
-        tvecs = np.asarray(self.ncvecs @ atoms.cell, dtype=np.float64)
+        tvecs = np.asarray(
+            self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
+        )
         i, j = self.indices
         return atoms.positions[j] - atoms.positions[i] + tvecs[0]
 
@@ -501,6 +472,34 @@ Bond.union = Angle
 Angle.union = Dihedral
 Angle.diff = Bond
 Dihedral.diff = Angle
+
+
+def make_internal(
+    name: str,
+    fun: Callable[[jnp.ndarray, ...], float],
+    nindices: int,
+    use_jit: bool = True,
+    jac: Callable[[jnp.ndarray, ...], jnp.ndarray] = None,
+    hess: Callable[[jnp.ndarray, ...], jnp.ndarray] = None,
+    **kwargs,
+) -> Type[Coordinate]:
+    if jac is None:
+        jac = _gradient(fun)
+    if hess is None:
+        hess = _hessian(fun)
+
+    if use_jit:
+        fun = jit(fun)
+        jac = jit(jac)
+        hess = jit(hess)
+
+    return type(name, (Coordinate,), dict(
+        nindices=nindices,
+        kwargs=kwargs,
+        _eval0=staticmethod(fun),
+        _eval1=staticmethod(jac),
+        _eval2=staticmethod(hess)
+    ))
 
 
 class BaseInternals:
@@ -663,7 +662,7 @@ class BaseInternals:
         vec[start:end] = (vec[start:end] + np.pi) % (2 * np.pi) - np.pi
         return vec
 
-    def __iter__(self) -> Iterator[Internal]:
+    def __iter__(self) -> Iterator[Coordinate]:
         for name in self._names:
             for coord in self.internals[name]:
                 yield coord
@@ -918,10 +917,10 @@ class Constraints(BaseInternals):
 
     def _fix_internal(
         self,
-        kind: TypeVar('Internal', bound=Internal),
+        kind: TypeVar('Coordinate', bound=Coordinate),
         name: str,
         conv: float,
-        indices: Union[Tuple[int, ...], Internal],
+        indices: Union[Tuple[int, ...], Coordinate],
         ncvecs: Tuple[IVec, ...] = None,
         mic: bool = None,
         target: float = None,
@@ -967,7 +966,7 @@ class Constraints(BaseInternals):
 
     def fix_other(
         self,
-        coord: Internal,
+        coord: Coordinate,
         target: float = None,
         comparator: str = 'eq',
         replace_ok: bool = True,
@@ -1072,7 +1071,7 @@ class Internals(BaseInternals):
 
         for kind, adder in zip(self._names, (
             self.add_translation, self.add_bond, self.add_angle,
-            self.add_dihedral, self.add_rotation
+            self.add_dihedral, self.add_other, self.add_rotation
         )):
             for coord in self.cons.internals[kind]:
                 adder(coord)
@@ -1156,9 +1155,9 @@ class Internals(BaseInternals):
 
     def _add_internal(
         self,
-        kind: TypeVar('Internal', bound=Internal),
+        kind: TypeVar('Coordinate', bound=Coordinate),
         name: str,
-        indices: Union[Tuple[int, ...], Internal],
+        indices: Union[Tuple[int, ...], Coordinate],
         ncvecs: Tuple[IVec, ...] = None,
         mic: bool = None,
     ) -> None:
@@ -1183,6 +1182,17 @@ class Internals(BaseInternals):
     add_bond = partialmethod(_add_internal, Bond, 'bonds')
     add_angle = partialmethod(_add_internal, Angle, 'angles')
     add_dihedral = partialmethod(_add_internal, Dihedral, 'dihedrals')
+
+    def add_other(
+        self,
+        coord: Coordinate,
+    ) -> None:
+        try:
+            idx = self.internals['other'].index(coord)
+        except ValueError:
+            self.internals['other'].append(coord)
+        else:
+            raise DuplicateCoordinateError()
 
     def forbid_translation(
         self,
@@ -1214,9 +1224,9 @@ class Internals(BaseInternals):
 
     def _forbid_internal(
         self,
-        kind: TypeVar('Internal', bound=Internal),
+        kind: TypeVar('Coordinate', bound=Coordinate),
         name: str,
-        indices: Union[Tuple[int, ...], Internal],
+        indices: Union[Tuple[int, ...], Coordinate],
         ncvecs: Tuple[IVec, ...] = None,
         mic: bool = None,
     ) -> None:
@@ -1406,7 +1416,9 @@ class Internals(BaseInternals):
                     # Fix the improper dihedral and update relevant internals
                     if b2.indices[1] == j:
                         b2 = b2.reverse()
-                    dbond2 = Bond((self.dinds[j], b2.indices[1]), b2.ncvecs)
+                    dbond2 = Bond(
+                        (self.dinds[j], b2.indices[1]), b2.kwargs['ncvecs']
+                    )
                     dangle3 = dbond + dbond2
                     ddihedral = dangle1 + dangle3
                     self.add_dihedral(ddihedral)
@@ -1433,9 +1445,9 @@ class Internals(BaseInternals):
                                 b1.indices[1], j, b3.indices[1], b2.indices[1]
                             )
                             ncvecs = (
-                                -b1.ncvecs[0],
-                                b3.ncvecs[0],
-                                b2.ncvecs[0] - b3.ncvecs[0]
+                                -b1.kwargs['ncvecs'][0],
+                                b3.kwargs['ncvecs'][0],
+                                b2.kwargs['ncvecs'][0] - b3.kwargs['ncvecs'][0]
                             )
                             try:
                                 self.add_dihedral(indices, ncvecs)
@@ -1476,7 +1488,7 @@ class Internals(BaseInternals):
                 f'{ndeloc} coords found! Expected {ndof}.'
             )
 
-    def check_for_bad_internals(self) -> Optional[Dict[str, List[Internal]]]:
+    def check_for_bad_internals(self) -> Optional[Dict[str, List[Coordinate]]]:
         bad = {'bonds': [], 'angles': []}
         for a in self.internals['angles']:
             if not (self.atol < a.calc(self.all_atoms) < np.pi - self.atol):
