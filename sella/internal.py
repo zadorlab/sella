@@ -117,6 +117,48 @@ class Coordinate:
             atoms[self.indices].positions, **self.kwargs
         ))
 
+    def _check_derivative(
+        self, atoms: Atoms, delta: float, atol: float, order: int
+    ) -> bool:
+        if order == 1:
+            derivative = 'Gradient'
+            f0 = self.calc
+            f1 = self.calc_gradient
+        elif order == 2:
+            derivative = 'Hessian'
+            f0 = self.calc_gradient
+            f1 = self.calc_hessian
+        else:
+            raise ValueError(f'Order {order} gradients are not implemented')
+
+        atoms0 = atoms.copy()
+        g_ref = f1(atoms0)
+        g_numer = np.zeros_like(g_ref)
+        atoms = atoms0.copy()
+        for i, idx in enumerate(self.indices):
+            for j in range(3):
+                atoms.positions[idx, j] = atoms0.positions[idx, j] + delta
+                fplus = f0(atoms)
+                atoms.positions[idx, j] = atoms0.positions[idx, j] - delta
+                fminus = f0(atoms)
+                g_numer[i, j] = (fplus - fminus) / (2 * delta)
+                atoms.positions[idx, j] = atoms0.positions[idx, j]
+        if np.max(np.abs(g_numer - g_ref)) > atol:
+            warnings.warn(f'{derivative}s for {self} failed numerical test!')
+            return False
+        return True
+
+    def check_gradient(
+        self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
+    ) -> bool:
+        return self._check_derivative(atoms, delta, atol, order=1)
+
+    def check_hessian(
+        self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
+    ) -> bool:
+        return self._check_derivative(atoms, delta, atol, order=2)
+
+
 
 class Internal(Coordinate):
     union = None
@@ -763,6 +805,22 @@ class BaseInternals:
                     self.all_atoms[new_indices].positions
                 )
                 self.internals['rotations'][i] = new_rot
+
+    def check_all_gradients(
+        self, delta: float = 1e-4, atol: float = 1e-6
+    ) -> bool:
+        success = True
+        for coord in self:
+            success &= coord.check_gradient(self.all_atoms, delta, atol)
+        return success
+
+    def check_all_hessians(
+        self, delta: float = 1e-4, atol: float = 1e-6,
+    ) -> bool:
+        success = True
+        for coord in self:
+            success &= coord.check_hessian(self.all_atoms, delta, atol)
+        return success
 
 
 class Constraints(BaseInternals):
