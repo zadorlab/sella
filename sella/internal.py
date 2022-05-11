@@ -54,7 +54,7 @@ def _hessian(
 
 
 class Coordinate:
-    nindices= None
+    nindices = None
     kwargs = None
 
     def __init__(
@@ -157,7 +157,6 @@ class Coordinate:
         self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
         return self._check_derivative(atoms, delta, atol, order=2)
-
 
 
 class Internal(Coordinate):
@@ -656,7 +655,9 @@ class BaseInternals:
         if 'coords' not in self._cache:
             atoms = self.all_atoms
             self._cache['coords'] = np.array([c.calc(atoms) for c in self])
-        return np.array([x for x, a in zip(self._cache['coords'], self._active_mask) if a])
+        return np.array([
+            x for x, a in zip(self._cache['coords'], self._active_mask) if a
+        ])
 
     def jacobian(self) -> np.ndarray:
         """Calculates the internal coordinate Jacobian matrix."""
@@ -666,11 +667,18 @@ class BaseInternals:
             self._cache['jacobian'] = [
                 np.array(c.calc_gradient(atoms)) for c in self
             ]
-        indices = [np.array(c.indices) for c, a in zip(self, self._active_mask) if a]
+        indices = []
+        jacs = []
+        for coord, jac, active in zip(
+            self, self._cache['jacobian'], self._active_mask
+        ):
+            if active:
+                indices.append(np.array(coord.indices))
+                jacs.append(jac)
         return SparseInternalJacobian(
             self.natoms + self.ndummies,
             indices,
-            [j for j, a in zip(self._cache['jacobian'], self._active_mask) if a]
+            jacs,
         ).asarray()
 
     def hessian(self) -> np.ndarray:
@@ -683,7 +691,9 @@ class BaseInternals:
             ]
         indices = [np.array(c.indices) for c in self]
         hessians = []
-        for idx, vals, active in zip(indices, self._cache['hessian'], self._active_mask):
+        for idx, vals, active in zip(
+            indices, self._cache['hessian'], self._active_mask
+        ):
             if not active:
                 continue
             hessians.append(SparseInternalHessian(
@@ -708,9 +718,6 @@ class BaseInternals:
         for name in self._names:
             for coord in self.internals[name]:
                 yield coord
-            #for coord, active in zip(self.internals[name], self._active[name]):
-            #    if active:
-            #        yield coord
 
     def _get_neighbors(self, dx: np.ndarray) -> Iterator[np.ndarray]:
         pbc = self.atoms.pbc
@@ -1426,7 +1433,6 @@ class Internals(BaseInternals):
                 else:
                     self.forbid_angle(new)
                     linear.append((b1, b2))
-            #if linear and self.dinds[j] < 0:
             if linear:
                 if len(jbonds) == 2:
                     # Add a dummy atom to an atom center with only 2 bonds
@@ -1448,8 +1454,8 @@ class Internals(BaseInternals):
                         if dpos_norm < 1e-4:
                             # the aforementioned backup strategy
                             # pick the cartesian basis vector that is maximally
-                            # orthogonal with the shorter of the two displacement
-                            # vectors.
+                            # orthogonal with the shorter of the two
+                            # displacement vectors.
                             # note: this is not rotationally invariant, but
                             # there's not much we can do about that
                             dim = np.argmin(np.abs(dx1))
