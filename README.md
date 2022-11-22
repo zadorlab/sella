@@ -53,7 +53,7 @@ If you use our code in publications, please cite the revelant work(s). (1) is re
 
 1. Hermes, E., Sargsyan, K., Najm, H. N., Zádor, J.: Accelerated saddle point refinement through full exploitation of partial Hessian diagonalization. Journal of Chemical Theory and Computation, 2019 15 6536-6549. https://pubs.acs.org/doi/full/10.1021/acs.jctc.9b00869
 2. Hermes, E. D., Sagsyan, K., Najm, H. N., Zádor, J.: A geodesic approach to internal coordinate optimization. The Journal of Chemical Physics, 2021 155 094105. https://aip.scitation.org/doi/10.1063/5.0060146
-3. Hermes, E. D., Sagsyan, K., Najm, H. N., Zádor, J.: Sella, an open-source automation-friendly molecular saddle point optimizer. Journal of Chemical Theory and Computation, accepted, 2022. https://pubs.acs.org/doi/10.1021/acs.jctc.2c00395
+3. Hermes, E. D., Sagsyan, K., Najm, H. N., Zádor, J.: Sella, an open-source automation-friendly molecular saddle point optimizer. Journal of Chemical Theory and Computation, 2022 18 6974–6988. https://pubs.acs.org/doi/10.1021/acs.jctc.2c00395
 
 ## Acknowledgments
 
