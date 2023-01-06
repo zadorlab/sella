@@ -77,6 +77,8 @@ class IRC(Optimizer):
             Hw = self.H0 / np.outer(self.sqrtm, self.sqrtm)
             _, vecs = eigh(Hw)
             self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
+            if self.v0ts[np.nonzero(self.v0ts)[0][0]] < 0: 
+                self.v0ts *= -1 #force v0ts to be the direction where the first non-zero component is positive
             self.pescurr = self.pes.curr.copy()
             self.peslast = self.pes.last.copy()
         else:
