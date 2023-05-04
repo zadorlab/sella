@@ -8,6 +8,7 @@ from sella.peswrapper import PES
 from ase.optimize.optimize import Optimizer
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
+from ..internal import Translation
 
 class IRCInnerLoopConvergenceFailure(RuntimeError):
     pass
@@ -56,6 +57,11 @@ class IRC(Optimizer):
         PES.get_W = get_W
         self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False,
                        **kwargs)
+
+        # Verify the only type of constraints present is Translation
+        for con in self.pes.cons:
+            if not isinstance(con, Translation):
+                raise RuntimeError(f'Unsupported constraint type for IRC: {con.__class__.__name__}')
 
         self.lastrun = None
         self.x0 = self.pes.get_x().copy()
@@ -106,6 +112,8 @@ class IRC(Optimizer):
             self.pes.kick(self.d1)
             self.first = False
         for n in range(self.ninner_iter):
+            Ufree = self.pes.get_Ufree()
+            P = Ufree @ Ufree.T
             s, smag = IRCTrustRegion(
                 self.pes, 0, self.dx, method=QuasiNewtonIRC, sqrtm=self.sqrtm,
                 d1=self.d1
@@ -115,7 +123,7 @@ class IRC(Optimizer):
             self.d1 += s
 
             self.pes.kick(s)
-            g1 = self.pes.get_g()
+            g1 = self.pes.get_g() @ P
 
             d1m = self.d1 * self.sqrtm
             d1m /= np.linalg.norm(d1m)
@@ -139,3 +147,12 @@ class IRC(Optimizer):
 
     def converged(self, forces=None):
         return self.pes.converged(self.fmax)[0] and self.pes.H.evals[0] > 0
+
+    def log(self, forces=None):
+        if forces is not None:
+            g = -forces.ravel()
+        else:
+            g = self.pes.get_g()
+        Ufree = self.pes.get_Ufree()
+        gproj = g @ Ufree @ Ufree.T
+        return Optimizer.log(self, forces=-gproj.reshape((-1, 3)))
