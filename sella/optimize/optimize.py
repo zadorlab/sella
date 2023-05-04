@@ -2,7 +2,7 @@
 
 import warnings
 from time import localtime, strftime
-from typing import Union
+from typing import Union, Callable, Optional
 
 import numpy as np
 from ase import Atoms
@@ -63,6 +63,8 @@ class Sella(Optimizer):
         append_trajectory: bool = False,
         rs: str = None,
         nsteps_per_diag: int = 3,
+        diag_every_n: Optional[int] = None,
+        hessian_function: Optional[Callable[[Atoms], np.ndarray]] = None,
         **kwargs
     ):
         if order == 0:
@@ -80,7 +82,15 @@ class Sella(Optimizer):
         self.peskwargs = kwargs.copy()
         self.user_internal = internal
         self.initialize_pes(
-            atoms, trajectory, order, eta, constraints, v0, internal, **kwargs
+            atoms,
+            trajectory,
+            order,
+            eta,
+            constraints,
+            v0,
+            internal,
+            hessian_function,
+            **kwargs
         )
 
         if rs is None:
@@ -142,6 +152,7 @@ class Sella(Optimizer):
         self.xi = 1.
         self.nsteps_per_diag = nsteps_per_diag
         self.nsteps_since_diag = 0
+        self.diag_every_n = diag_every_n
 
     def initialize_pes(
         self,
@@ -152,6 +163,7 @@ class Sella(Optimizer):
         constraints: Constraints = None,
         v0: np.ndarray = None,
         internal: Union[bool, Internals] = False,
+        hessian_function: Optional[Callable[[Atoms], np.ndarray]] = None,
         **kwargs
     ):
         if internal:
@@ -176,6 +188,7 @@ class Sella(Optimizer):
                 eta=eta,
                 v0=v0,
                 auto_find_internals=auto_find_internals,
+                hessian_function=hessian_function,
                 **kwargs
             )
         else:
@@ -189,6 +202,7 @@ class Sella(Optimizer):
                 trajectory=trajectory,
                 eta=eta,
                 v0=v0,
+                hessian_function=hessian_function,
                 **kwargs
             )
 
@@ -219,7 +233,9 @@ class Sella(Optimizer):
         s, smag = self._predict_step()
 
         # Determine if we need to call the eigensolver, then step
-        if self.eig and self.nsteps_since_diag >= self.nsteps_per_diag:
+        if self.nsteps_since_diag >= self.diag_every_n:
+            ev = True
+        elif self.eig and self.nsteps_since_diag >= self.nsteps_per_diag:
             if self.pes.H.evals is None:
                 ev = True
             else:
@@ -228,10 +244,12 @@ class Sella(Optimizer):
                                        .evals[:self.ord] > 0).any()
         else:
             ev = False
+
         if ev:
             self.nsteps_since_diag = 0
         else:
             self.nsteps_since_diag += 1
+
         rho = self.pes.kick(s, ev, **self.diagkwargs)
 
         # Check for bad internals, and if found, reset PES object.

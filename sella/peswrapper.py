@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Callable
 
 import numpy as np
 from scipy.linalg import eigh
@@ -27,7 +27,8 @@ class PES:
         eta: float = 1e-4,
         v0: np.ndarray = None,
         proj_trans: bool = None,
-        proj_rot: bool = None
+        proj_rot: bool = None,
+        hessian_function: Callable[[Atoms], np.ndarray] = None,
     ) -> None:
         self.atoms = atoms
         if constraints is None:
@@ -88,6 +89,8 @@ class PES:
 
         self.savepoint = dict(apos=None, dpos=None)
         self.first_diag = True
+
+        self.hessian_function = hessian_function
 
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
@@ -327,9 +330,16 @@ class PES:
         self._update_H(dx_final, dg_actual)
 
         if diag:
-            self.diag(**diag_kwargs)
+            if self.hessian_function is not None:
+                self.calculate_hessian()
+            else:
+                self.diag(**diag_kwargs)
 
         return ratio
+
+    def calculate_hessian(self):
+        assert self.hessian_function is not None
+        self.H.set_B(self.hessian_function(self.atoms))
 
 
 class InternalPES(PES):
@@ -626,3 +636,45 @@ class InternalPES(PES):
         Binv = np.linalg.pinv(B)
         self.curr.update(B=B, Binv=Binv)
         return True
+
+    def _convert_cartesian_hessian_to_internal(
+        self,
+        Hcart: np.ndarray,
+    ) -> np.ndarray:
+        # Get Jacobian and calculate redundant and non-redundant spaces
+        B = self.int.jacobian()
+        Ui, Si, VTi = np.linalg.svd(B)
+        nnred = np.sum(Si > 1e-6)
+        Unred = Ui[:, :nnred]
+        Ured = Ui[:, nnred:]
+
+        # Calculate inverse Jacobian in non-redundant space
+        Bnred_inv = VTi[:nnred].T @ np.diag(1 / Si[:nnred]) @ Unred.T
+
+        # Convert Cartesian Hessian to non-redundant internal Hessian
+        Hcart_corr = Hcart - self.int.hessian().ldot(self.get_g())
+        Hnred = Bnred_inv.T @ Hcart_corr @ Bnred_inv
+
+        # Find eigenvalues of non-redundant internal Hessian
+        lnred, _ = np.linalg.eigh(Hnred)
+
+        # The redundant part of the Hessian will be initialized to the
+        # geometric mean of the non-redundant eigenvalues
+        lnred_mean = np.exp(np.log(np.abs(lnred)).mean())
+
+        # finish reconstructing redundant internal Hessian
+        P = Ui.T @ Unred
+        return P @ Hnred @ P.T + lnred_mean * Ured @ Ured.T
+
+    def _convert_internal_hessian_to_cartesian(
+        self,
+        Hint: np.ndarray,
+    ) -> np.ndarray:
+        B = self.int.jacobian()
+        return B.T @ Hint @ B + self.int.hessian().ldot(self.get_g())
+
+    def calculate_hessian(self):
+        assert self.hessian_function is not None
+        self.H.set_B(self._convert_cartesian_hessian_to_internal(
+            self.hessian_function(self.atoms)
+        ))
