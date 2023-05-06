@@ -210,7 +210,10 @@ class Sella(Optimizer):
         if not self.initialized:
             self.pes.get_g()
             if self.eig:
-                self.pes.diag(**self.diagkwargs)
+                if self.pes.hessian_function is not None:
+                    self.pes.calculate_hessian()
+                else:
+                    self.pes.diag(**self.diagkwargs)
             self.initialized = True
 
         self.pes.cons.disable_satisfied_inequalities()
