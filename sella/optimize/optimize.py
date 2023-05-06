@@ -214,6 +214,7 @@ class Sella(Optimizer):
                     self.pes.calculate_hessian()
                 else:
                     self.pes.diag(**self.diagkwargs)
+                self.nsteps_since_diag = -1
             self.initialized = True
 
         self.pes.cons.disable_satisfied_inequalities()
@@ -266,6 +267,7 @@ class Sella(Optimizer):
                 constraints=self.constraints,
                 v0=None,  # TODO: use leftmost eigenvector from old H
                 internal=self.user_internal,
+                hessian_function=self.pes.hessian_function,
             )
             self.initialized = False
             self.rho = 1

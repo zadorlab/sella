@@ -649,7 +649,7 @@ class InternalPES(PES):
         Ured = Ui[:, nnred:]
 
         # Calculate inverse Jacobian in non-redundant space
-        Bnred_inv = VTi[:nnred].T @ np.diag(1 / Si[:nnred]) @ Unred.T
+        Bnred_inv = VTi[:nnred].T @ np.diag(1 / Si[:nnred])
 
         # Convert Cartesian Hessian to non-redundant internal Hessian
         Hcart_corr = Hcart - self.int.hessian().ldot(self.get_g())
@@ -663,8 +663,7 @@ class InternalPES(PES):
         lnred_mean = np.exp(np.log(np.abs(lnred)).mean())
 
         # finish reconstructing redundant internal Hessian
-        P = Ui.T @ Unred
-        return P @ Hnred @ P.T + lnred_mean * Ured @ Ured.T
+        return Unred @ Hnred @ Unred.T + lnred_mean * Ured @ Ured.T
 
     def _convert_internal_hessian_to_cartesian(
         self,
