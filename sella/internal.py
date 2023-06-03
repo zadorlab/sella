@@ -1534,7 +1534,7 @@ class Internals(BaseInternals):
             # the first and last atom.
             if (
                 new.indices[0] == new.indices[3]
-                and np.all(np.sum(new.ncvecs, axis=0) == np.array((0, 0, 0)))
+                and np.all(np.sum(new.kwargs['ncvecs'], axis=0) == np.array((0, 0, 0)))
             ):
                 continue
             try:
