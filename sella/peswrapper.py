@@ -641,8 +641,9 @@ class InternalPES(PES):
         self,
         Hcart: np.ndarray,
     ) -> np.ndarray:
+        ncart = 3 * len(self.atoms)
         # Get Jacobian and calculate redundant and non-redundant spaces
-        B = self.int.jacobian()
+        B = self.int.jacobian()[:, :ncart]
         Ui, Si, VTi = np.linalg.svd(B)
         nnred = np.sum(Si > 1e-6)
         Unred = Ui[:, :nnred]
@@ -652,7 +653,8 @@ class InternalPES(PES):
         Bnred_inv = VTi[:nnred].T @ np.diag(1 / Si[:nnred])
 
         # Convert Cartesian Hessian to non-redundant internal Hessian
-        Hcart_corr = Hcart - self.int.hessian().ldot(self.get_g())
+        Hcart_coupled = self.int.hessian().ldot(self.get_g())[:ncart, :ncart]
+        Hcart_corr = Hcart - Hcart_coupled
         Hnred = Bnred_inv.T @ Hcart_corr @ Bnred_inv
 
         # Find eigenvalues of non-redundant internal Hessian
