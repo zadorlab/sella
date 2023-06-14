@@ -159,9 +159,12 @@ class ApproximateHessian(LinearOperator):
             self.B = None
             self.evals = None
             self.evecs = None
+            self.initialized = False
             return
         elif np.isscalar(target):
             target = target * np.eye(self.dim)
+        else:
+            self.initialized = True
         assert target.shape == self.shape
         self.B = target
         self.evals, self.evecs = eigh(self.B)
