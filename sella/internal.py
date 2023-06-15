@@ -1253,7 +1253,7 @@ class Internals(BaseInternals):
         coord: Coordinate,
     ) -> None:
         try:
-            idx = self.internals['other'].index(coord)
+            self.internals['other'].index(coord)
         except ValueError:
             self.internals['other'].append(coord)
         else:
