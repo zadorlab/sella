@@ -608,6 +608,10 @@ class BaseInternals:
         return sum(self._active['dihedrals'])
 
     @property
+    def nother(self) -> int:
+        return sum(self._active['other'])
+
+    @property
     def nrotations(self) -> int:
         return sum(self._active['rotations'])
 

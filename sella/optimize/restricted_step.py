@@ -153,7 +153,9 @@ class RestrictedAtomicStep(BaseRestrictedStep):
 class MaxInternalStep(BaseRestrictedStep):
     synonyms = ['mis', 'max internal step']
 
-    def __init__(self, pes, *args, wx=1., wb=1., wa=1., wd=1., **kwargs):
+    def __init__(
+        self, pes, *args, wx=1., wb=1., wa=1., wd=1., wo=1., **kwargs
+    ):
         if pes.int is None:
             raise ValueError("Internal coordinates are required for the "
                              "{} trust region method"
@@ -162,14 +164,18 @@ class MaxInternalStep(BaseRestrictedStep):
         self.wb = wb
         self.wa = wa
         self.wd = wd
+        self.wo = wo
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
-        w = np.array([self.wx] * self.pes.int.ntrans
-                     + [self.wb] * self.pes.int.nbonds
-                     + [self.wa] * self.pes.int.nangles
-                     + [self.wd] * self.pes.int.ndihedrals
-                     + [self.wx] * self.pes.int.nrotations)
+        w = np.array(
+            [self.wx] * self.pes.int.ntrans
+            + [self.wb] * self.pes.int.nbonds
+            + [self.wa] * self.pes.int.nangles
+            + [self.wd] * self.pes.int.ndihedrals
+            + [self.wo] * self.pes.int.nother
+            + [self.wx] * self.pes.int.nrotations
+        )
         assert len(w) == len(s)
 
         sw = np.abs(s * w)
