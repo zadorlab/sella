@@ -205,6 +205,7 @@ class Sella(Optimizer):
                 hessian_function=hessian_function,
                 **kwargs
             )
+        self.trajectory = self.pes.traj
 
     def _predict_step(self):
         if not self.initialized:
