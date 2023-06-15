@@ -42,7 +42,7 @@ class Sella(Optimizer):
         atoms: Atoms,
         restart: bool = None,
         logfile: str = '-',
-        trajectory: str = None,
+        trajectory: Union[str, Trajectory] = None,
         master: bool = None,
         force_consistent: bool = False,
         delta0: float = None,
@@ -205,6 +205,7 @@ class Sella(Optimizer):
                 hessian_function=hessian_function,
                 **kwargs
             )
+        self.trajectory = self.pes.traj
 
     def _predict_step(self):
         if not self.initialized:
