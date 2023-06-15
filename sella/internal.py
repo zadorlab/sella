@@ -517,11 +517,11 @@ Dihedral.diff = Angle
 
 def make_internal(
     name: str,
-    fun: Callable[[jnp.ndarray, ...], float],
+    fun: Callable[..., float],
     nindices: int,
     use_jit: bool = True,
-    jac: Callable[[jnp.ndarray, ...], jnp.ndarray] = None,
-    hess: Callable[[jnp.ndarray, ...], jnp.ndarray] = None,
+    jac: Callable[..., jnp.ndarray] = None,
+    hess: Callable[..., jnp.ndarray] = None,
     **kwargs,
 ) -> Type[Coordinate]:
     if jac is None:
@@ -1050,7 +1050,7 @@ class Constraints(BaseInternals):
                 self._targets['other'][idx] = target
                 self._kind['other'][idx] = comparator
                 return
-            raise DuplicateCoordinateError(
+            raise DuplicateConstraintError(
                 "Coordinate {} is already fixed to target {}"
                 .format(coord, self._targets['other'][idx])
             )
@@ -1257,7 +1257,9 @@ class Internals(BaseInternals):
         except ValueError:
             self.internals['other'].append(coord)
         else:
-            raise DuplicateCoordinateError()
+            raise DuplicateInternalError()
+        self.internals['other'].append(coord)
+        self._active['other'].append(True)
 
     def forbid_translation(
         self,
@@ -1534,7 +1536,9 @@ class Internals(BaseInternals):
             # the first and last atom.
             if (
                 new.indices[0] == new.indices[3]
-                and np.all(np.sum(new.kwargs['ncvecs'], axis=0) == np.array((0, 0, 0)))
+                and np.all(
+                    np.sum(new.kwargs['ncvecs'], axis=0) == np.array((0, 0, 0))
+                )
             ):
                 continue
             try:
