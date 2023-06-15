@@ -42,7 +42,7 @@ class Sella(Optimizer):
         atoms: Atoms,
         restart: bool = None,
         logfile: str = '-',
-        trajectory: str = None,
+        trajectory: Union[str, Trajectory] = None,
         master: bool = None,
         force_consistent: bool = False,
         delta0: float = None,
