@@ -78,7 +78,6 @@ class Sella(Optimizer):
                 trajectory = Trajectory(trajectory, mode=mode,
                                         atoms=atoms, master=master)
 
-        asetraj = None
         self.peskwargs = kwargs.copy()
         self.user_internal = internal
         self.initialize_pes(
@@ -96,7 +95,7 @@ class Sella(Optimizer):
         if rs is None:
             rs = 'mis' if internal else 'ras'
         self.rs = get_restricted_step(rs)
-        Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
+        Optimizer.__init__(self, atoms, restart, logfile, trajectory, master,
                            force_consistent)
 
         if delta0 is None:
