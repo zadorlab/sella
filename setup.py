@@ -6,7 +6,7 @@ import numpy as np
 
 from setuptools import setup, Extension, find_packages
 
-VERSION = '2.3.1'
+VERSION = '2.3.2'
 
 debug = '--debug' in sys.argv or '-g' in sys.argv
 
