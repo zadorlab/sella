@@ -1,13 +1,17 @@
 import warnings
+from typing import Optional, Union, Dict, Any
 
 import numpy as np
 from scipy.linalg import eigh
 
-from sella.peswrapper import PES
-
+from ase import Atoms
+from ase.io.trajectory import Trajectory, TrajectoryWriter
 from ase.optimize.optimize import Optimizer
+
+from sella.peswrapper import PES
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
+
 
 class IRCInnerLoopConvergenceFailure(RuntimeError):
     pass
@@ -16,22 +20,29 @@ class IRCInnerLoopConvergenceFailure(RuntimeError):
 class IRC(Optimizer):
     def __init__(
         self,
-        atoms,
-        restart=None,
-        logfile='-',
-        trajectory=None,
-        master=None,
-        force_consistent=False,
-        ninner_iter=10,
-        irctol=1e-2,
-        dx=0.1,
-        eta=1e-4,
-        gamma=0.1,
-        peskwargs=None,
+        atoms: Atoms,
+        logfile: str = '-',
+        trajectory: Optional[Union[str, TrajectoryWriter]] = None,
+        master: Optional[bool] = None,
+        force_consistent: bool = False,
+        ninner_iter: int = 10,
+        irctol: float = 1e-2,
+        dx: float = 0.1,
+        eta: float = 1e-4,
+        gamma: float = 0.1,
+        peskwargs: Optional[Dict[str, Any]] = None,
+        keep_going: bool = False,
         **kwargs
     ):
-        Optimizer.__init__(self, atoms, restart, logfile, trajectory, master,
-                           force_consistent)
+        Optimizer.__init__(
+            self,
+            atoms,
+            None,
+            logfile,
+            trajectory,
+            master,
+            force_consistent,
+        )
         self.ninner_iter = ninner_iter
         self.irctol = irctol
         self.dx = dx
@@ -50,22 +61,25 @@ class IRC(Optimizer):
 
         self.sqrtm = np.repeat(np.sqrt(self.atoms.get_masses()), 3)
 
-        def get_W(self):
-            return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))
-
-        PES.get_W = get_W
         self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False,
                        **kwargs)
 
         self.lastrun = None
         self.x0 = self.pes.get_x().copy()
-        self.v0ts = None
-        self.H0 = None
+        self.v0ts: Optional[np.ndarray] = None
+        self.H0: Optional[np.ndarray] = None
         self.peslast = None
         self.xi = 1.
         self.first = True
+        self.keep_going = keep_going
 
-    def irun(self, fmax=0.05, fmax_inner=0.01, steps=None, direction='forward'):
+    def irun(
+        self,
+        fmax: float = 0.05,
+        fmax_inner: float = 0.01,
+        steps: Optional[int] = None,
+        direction: str = 'forward',
+    ):
         if direction not in ['forward', 'reverse']:
             raise ValueError('direction must be one of "forward" or '
                              '"reverse"!')
@@ -77,8 +91,12 @@ class IRC(Optimizer):
             Hw = self.H0 / np.outer(self.sqrtm, self.sqrtm)
             _, vecs = eigh(Hw)
             self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
-            if self.v0ts[np.nonzero(self.v0ts)[0][0]] < 0: 
-                self.v0ts *= -1 #force v0ts to be the direction where the first non-zero component is positive
+
+            # force v0ts to be the direction where the first non-zero
+            # component is positive
+            if self.v0ts[np.nonzero(self.v0ts)[0][0]] < 0:
+                self.v0ts *= -1
+
             self.pescurr = self.pes.curr.copy()
             self.peslast = self.pes.last.copy()
         else:
@@ -97,20 +115,24 @@ class IRC(Optimizer):
         self.fmax_inner = min(fmax, fmax_inner)
         return Optimizer.irun(self, fmax, steps)
 
-    def run(self, fmax=0.05, fmax_inner=0.01, steps=None, direction='forward'):
-        for converged in self.irun(fmax, fmax_inner, steps, direction):
+    def run(self, *args, **kwargs):
+        for converged in self.irun(*args, **kwargs):
             pass
         return converged
 
     def step(self):
-        x0 = self.pes.get_x()
         if self.first:
             self.pes.kick(self.d1)
             self.first = False
         for n in range(self.ninner_iter):
             s, smag = IRCTrustRegion(
-                self.pes, 0, self.dx, method=QuasiNewtonIRC, sqrtm=self.sqrtm,
-                d1=self.d1
+                self.pes,
+                0,
+                self.dx,
+                method=QuasiNewtonIRC,
+                sqrtm=self.sqrtm,
+                d1=self.d1,
+                W=self.get_W(),
             ).get_s()
 
             bound_clip = abs(smag - self.dx) < 1e-8
@@ -124,20 +146,28 @@ class IRC(Optimizer):
             g1m = g1 / self.sqrtm
 
             g1m_proj = g1m - d1m * (d1m @ g1m)
-            fmax = np.linalg.norm((g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1).max()
+            fmax = np.linalg.norm(
+                (g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1
+            ).max()
 
             g1m /= np.linalg.norm(g1m)
-            dot = np.abs(d1m @ g1m)
-            snorm = np.linalg.norm(s)
-            #print(bound_clip, snorm, dot, fmax)
             if bound_clip and fmax < self.fmax_inner:
                 break
             elif self.converged():
                 break
         else:
-            raise IRCInnerLoopConvergenceFailure
+            if self.keep_going:
+                warnings.warn(
+                    'IRC inner loop failed to converge! The trajectory is no '
+                    'longer a trustworthy IRC.'
+                )
+            else:
+                raise IRCInnerLoopConvergenceFailure
 
         self.d1 *= 0.
 
     def converged(self, forces=None):
         return self.pes.converged(self.fmax)[0] and self.pes.H.evals[0] > 0
+
+    def get_W(self):
+        return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))

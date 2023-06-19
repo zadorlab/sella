@@ -300,9 +300,6 @@ class PES:
         conv = (fmax1 < fmax) and (cmax1 < cmax)
         return conv, fmax1, cmax1
 
-    def get_W(self):
-        return np.eye(self.dim)
-
     def wrap_dx(self, dx):
         return dx
 

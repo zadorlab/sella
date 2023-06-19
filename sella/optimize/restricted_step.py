@@ -1,19 +1,34 @@
+from typing import Optional, Union, List
+
 import numpy as np
 import inspect
 
+from sella.peswrapper import PES, InternalPES
 from .stepper import get_stepper, BaseStepper, NaiveStepper
 
 
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)
 class BaseRestrictedStep:
-    synonyms = None
+    synonyms: List[str] = []
 
-    def __init__(self, pes, order, delta, method='qn',
-                 tol=1e-15, maxiter=1000, d1=None):
+    def __init__(
+        self,
+        pes: Union[PES, InternalPES],
+        order: int,
+        delta: float,
+        method: str = 'qn',
+        tol: float = 1e-15,
+        maxiter: int = 1000,
+        d1: Optional[np.ndarray] = None,
+        W: Optional[np.ndarray] = None,
+    ):
         self.pes = pes
         self.delta = delta
         self.d1 = d1
         g0 = self.pes.get_g()
+
+        if W is None:
+            W = np.eye(len(g0))
 
         self.scons = self.pes.get_scons()
         # TODO: Should this be HL instead of H?
@@ -30,13 +45,16 @@ class BaseRestrictedStep:
             self.stepper = NaiveStepper(dx)
             self.scons[:] *= 0
         else:
-            self.P = self.pes.get_Ufree().T @ self.pes.get_W()
+            self.P = self.pes.get_Ufree().T @ W
             d1 = self.d1
             if d1 is not None:
                 d1 = np.linalg.lstsq(self.P.T, d1, rcond=None)[0]
-            self.stepper = stepper(self.P @ g,
-                                   self.pes.get_HL().project(self.P.T),
-                                   order, d1=d1)
+            self.stepper = stepper(
+                self.P @ g,
+                self.pes.get_HL().project(self.P.T),
+                order,
+                d1=d1,
+            )
 
         self.tol = tol
         self.maxiter = maxiter
@@ -98,8 +116,13 @@ class BaseRestrictedStep:
 
 
 class TrustRegion(BaseRestrictedStep):
-    synonyms = ['tr', 'trust region', 'trust-region', 'trust radius',
-                'trust-radius']
+    synonyms = [
+        'tr',
+        'trust region',
+        'trust-region',
+        'trust radius',
+        'trust-radius',
+    ]
 
     def cons(self, s, dsda=None):
         val = np.linalg.norm(s)
@@ -131,9 +154,10 @@ class RestrictedAtomicStep(BaseRestrictedStep):
 
     def __init__(self, pes, *args, **kwargs):
         if pes.int is not None:
-            raise ValueError("Internal coordinates are not compatible with "
-                             "the {} trust region method."
-                             .format(self.__class__.__name__))
+            raise ValueError(
+                "Internal coordinates are not compatible with "
+                f"the {self.__class__.__name__} trust region method."
+            )
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
@@ -157,9 +181,10 @@ class MaxInternalStep(BaseRestrictedStep):
         self, pes, *args, wx=1., wb=1., wa=1., wd=1., wo=1., **kwargs
     ):
         if pes.int is None:
-            raise ValueError("Internal coordinates are required for the "
-                             "{} trust region method"
-                             .format(self.__class__.__name__))
+            raise ValueError(
+                "Internal coordinates are required for the "
+                "{self.__class__.__name__} trust region method"
+            )
         self.wx = wx
         self.wb = wb
         self.wa = wa
