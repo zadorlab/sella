@@ -22,7 +22,7 @@ jobs:
 
       - name: Build package
         run: |
-          python3 -m pip install --upgrade pip setuptools cython wheel numpy scipy ase jax jaxlib
+          python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
           python3 -m build --sdist --wheel
 
       - name: Archive build artifacts
@@ -49,8 +49,8 @@ jobs:
 
     - name: Build package
       run: |
-        python3 -m pip install --upgrade pip setuptools cython wheel numpy scipy ase jax jaxlib
-        python3 -m build --wheel
+        python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
+        python3 -m build --sdist --wheel
 
     - name: Archive dist artifacts
       uses: actions/upload-artifact@v1
