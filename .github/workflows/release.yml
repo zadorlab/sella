@@ -54,25 +54,25 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         name: wheels-ubuntu-latest
-    - runs: mv -v wheels-ubuntu-latest/* dist/
+    - run: mv -v wheels-ubuntu-latest/* dist/
 
     - name: Stage Windows
       uses: actions/download-artifact@v4
       with:
         name: wheels-windows-latest
-    - runs: mv -v wheels-windows-latest/* dist/
+    - run: mv -v wheels-windows-latest/* dist/
 
     - name: Stage MacOS 13
       uses: actions/download-artifact@v4
       with:
         name: wheels-macos-13
-    - runs: mv -v wheels-macos-13/* dist/
+    - run: mv -v wheels-macos-13/* dist/
 
     - name: Stage MacOS 14
       uses: actions/download-artifact@v4
       with:
         name: wheels-macos-14
-    - runs: mv -v wheels-macos-14/* dist/
+    - run: mv -v wheels-macos-14/* dist/
 
     - name: Upload with twine
       env:
