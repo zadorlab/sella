@@ -7,154 +7,50 @@ on:
   workflow_dispatch:
 
 jobs:
-
-  build-linux-cp38:
+  build-linux:
     runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
-
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
     steps:
-    - uses: actions/checkout@master
+      - uses: actions/checkout@v4
 
-    - name: Install Python package dependencies
-      run: /opt/python/cp38-cp38/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
 
-    - name: Build binary wheel
-      run: /opt/python/cp38-cp38/bin/python setup.py bdist_wheel
+      - name: Build package
+        run: |
+          python3 -m pip install --upgrade pip setuptools cython wheel numpy scipy ase jax jaxlib
+          python3 -m build --sdist --wheel
 
-    - name: Apply auditwheel for manylinux wheel
-      run: auditwheel repair -w dist dist/*
-
-    - name: Remove linux wheel
-      run: rm dist/*-linux_x86_64.whl
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-3.8
-        path: dist
-
-  build-linux-cp39:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
-
-    steps:
-    - uses: actions/checkout@master
-
-    - name: Install Python package dependencies
-      run: /opt/python/cp39-cp39/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: /opt/python/cp39-cp39/bin/python setup.py bdist_wheel
-
-    - name: Apply auditwheel for manylinux wheel
-      run: auditwheel repair -w dist dist/*
-
-    - name: Remove linux wheel
-      run: rm dist/*-linux_x86_64.whl
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-3.9
-        path: dist
-
-  build-linux-cp310:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
-
-    steps:
-    - uses: actions/checkout@master
-
-    - name: Install Python package dependencies
-      run: /opt/python/cp310-cp310/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: /opt/python/cp310-cp310/bin/python setup.py bdist_wheel
-
-    - name: Apply auditwheel for manylinux wheel
-      run: auditwheel repair -w dist dist/*
-
-    - name: Remove linux wheel
-      run: rm dist/*-linux_x86_64.whl
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-3.10
-        path: dist
-
-  build-linux-cp311:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
-
-    steps:
-    - uses: actions/checkout@master
-
-    - name: Install Python package dependencies
-      run: /opt/python/cp311-cp311/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: /opt/python/cp311-cp311/bin/python setup.py bdist_wheel
-
-    - name: Apply auditwheel for manylinux wheel
-      run: auditwheel repair -w dist dist/*
-
-    - name: Remove linux wheel
-      run: rm dist/*-linux_x86_64.whl
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-3.11
-        path: dist
-
-  build-linux-cp312:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
-
-    steps:
-    - uses: actions/checkout@master
-
-    - name: Install Python package dependencies
-      run: /opt/python/cp312-cp312/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: /opt/python/cp312-cp312/bin/python setup.py bdist_wheel
-
-    - name: Apply auditwheel for manylinux wheel
-      run: auditwheel repair -w dist dist/*
-
-    - name: Remove linux wheel
-      run: rm dist/*-linux_x86_64.whl
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-3.12
-        path: dist
-
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.python-version }}
+          path: dist
 
   build-macos:
     runs-on: macos-latest
     strategy:
       max-parallel: 4
       matrix:
-        python-version: [3.8, 3.9, '3.10', '3.11', '3.12']
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
 
     steps:
     - uses: actions/checkout@master
 
-    - name: Set up Python ${{ matrix.python-version }} x64
-      uses: actions/setup-python@v1
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
         architecture: x64
 
-    - name: Install Python package dependencies
-      run: pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: python setup.py bdist_wheel
+    - name: Build package
+      run: |
+        python3 -m pip install --upgrade pip setuptools cython wheel numpy scipy ase jax jaxlib
+        python3 -m build --wheel
 
     - name: Archive dist artifacts
       uses: actions/upload-artifact@v1
@@ -186,55 +82,55 @@ jobs:
       uses: actions/download-artifact@v1
       with:
         name: dist-linux-3.8
-    - run: mv -v dist-linux-3.8/* dist/
+    - run: mv -v dist-linux-3.8/*.whl dist/
 
     - name: Stage linux 3.9
       uses: actions/download-artifact@v1
       with:
         name: dist-linux-3.9
-    - run: mv -v dist-linux-3.9/* dist/
+    - run: mv -v dist-linux-3.9/*.whl dist/
 
     - name: Stage linux 3.10
       uses: actions/download-artifact@v1
       with:
         name: dist-linux-3.10
-    - run: mv -v dist-linux-3.10/* dist/
+    - run: mv -v dist-linux-3.10/*.whl dist/
 
     - name: Stage linux 3.11
       uses: actions/download-artifact@v1
       with:
         name: dist-linux-3.11
-    - run: mv -v dist-linux-3.11/* dist/
+    - run: mv -v dist-linux-3.11/*.whl dist/
 
     - name: Stage linux 3.12
       uses: actions/download-artifact@v1
       with:
         name: dist-linux-3.12
-    - run: mv -v dist-linux-3.12/* dist/
+    - run: mv -v dist-linux-3.12/*.whl dist/
 
     - name: Stage macos 3.8
       uses: actions/download-artifact@v1
       with:
         name: dist-macos-3.8
-    - run: mv -v dist-macos-3.8/* dist/
+    - run: mv -v dist-macos-3.8/*.whl dist/
 
     - name: Stage macos 3.9
       uses: actions/download-artifact@v1
       with:
         name: dist-macos-3.9
-    - run: mv -v dist-macos-3.9/* dist/
+    - run: mv -v dist-macos-3.9/*.whl dist/
 
     - name: Stage macos 3.10
       uses: actions/download-artifact@v1
       with:
         name: dist-macos-3.10
-    - run: mv -v dist-macos-3.10/* dist/
+    - run: mv -v dist-macos-3.10/*.whl dist/
 
     - name: Stage macos 3.11
       uses: actions/download-artifact@v1
       with:
         name: dist-macos-3.11
-    - run: mv -v dist-macos-3.11/* dist/
+    - run: mv -v dist-macos-3.11/*.whl dist/
 
     - name: Stage macos 3.12
       uses: actions/download-artifact@v1
