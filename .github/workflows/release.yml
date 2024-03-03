@@ -59,7 +59,7 @@ jobs:
         path: dist
 
   upload:
-    needs: [build-linux-cp38, build-linux-cp39, build-linux-cp310, build-linux-cp311, build-linux-cp312, build-macos]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
 
     steps:
