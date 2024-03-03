@@ -8,31 +8,6 @@ on:
 
 jobs:
 
-  build-linux-cp37:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
-
-    steps:
-    - uses: actions/checkout@master
-
-    - name: Install Python package dependencies
-      run: /opt/python/cp37-cp37m/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
-
-    - name: Build binary wheel
-      run: /opt/python/cp37-cp37m/bin/python setup.py bdist_wheel
-
-    - name: Apply auditwheel
-      run: auditwheel repair -w dist dist/*
-
-    - name: Remove linux wheel
-      run: rm dist/*-linux_x86_64.whl
-
-    - name: Archive dist artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-3.7
-        path: dist
-
   build-linux-cp38:
     runs-on: ubuntu-latest
     container: quay.io/pypa/manylinux2014_x86_64
@@ -133,12 +108,38 @@ jobs:
         name: dist-linux-3.11
         path: dist
 
+  build-linux-cp312:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux2014_x86_64
+
+    steps:
+    - uses: actions/checkout@master
+
+    - name: Install Python package dependencies
+      run: /opt/python/cp312-cp312/bin/python -m pip install cython wheel numpy scipy ase jax jaxlib
+
+    - name: Build binary wheel
+      run: /opt/python/cp312-cp312/bin/python setup.py bdist_wheel
+
+    - name: Apply auditwheel for manylinux wheel
+      run: auditwheel repair -w dist dist/*
+
+    - name: Remove linux wheel
+      run: rm dist/*-linux_x86_64.whl
+
+    - name: Archive dist artifacts
+      uses: actions/upload-artifact@v1
+      with:
+        name: dist-linux-3.12
+        path: dist
+
+
   build-macos:
     runs-on: macos-latest
     strategy:
       max-parallel: 4
       matrix:
-        python-version: [3.7, 3.8, 3.9, '3.10', '3.11']
+        python-version: [3.8, 3.9, '3.10', '3.11', '3.12']
 
     steps:
     - uses: actions/checkout@master
@@ -162,7 +163,7 @@ jobs:
         path: dist
 
   upload:
-    needs: [build-linux-cp37, build-linux-cp38, build-linux-cp39, build-linux-cp310, build-linux-cp311, build-macos]
+    needs: [build-linux-cp38, build-linux-cp39, build-linux-cp310, build-linux-cp311, build-linux-cp312, build-macos]
     runs-on: ubuntu-latest
 
     steps:
@@ -171,7 +172,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v1
       with:
-        python-version: '3.11'
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |
@@ -180,12 +181,6 @@ jobs:
 
     - name: Create source dist
       run: python setup.py sdist
-
-    - name: Stage linux 3.7
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-linux-3.7
-    - run: mv -v dist-linux-3.7/* dist/
 
     - name: Stage linux 3.8
       uses: actions/download-artifact@v1
@@ -211,11 +206,11 @@ jobs:
         name: dist-linux-3.11
     - run: mv -v dist-linux-3.11/* dist/
 
-    - name: Stage macos 3.7
+    - name: Stage linux 3.12
       uses: actions/download-artifact@v1
       with:
-        name: dist-macos-3.7
-    - run: mv -v dist-macos-3.7/* dist/
+        name: dist-linux-3.12
+    - run: mv -v dist-linux-3.12/* dist/
 
     - name: Stage macos 3.8
       uses: actions/download-artifact@v1
@@ -240,6 +235,12 @@ jobs:
       with:
         name: dist-macos-3.11
     - run: mv -v dist-macos-3.11/* dist/
+
+    - name: Stage macos 3.12
+      uses: actions/download-artifact@v1
+      with:
+        name: dist-macos-3.12
+    - run: mv -v dist-macos-3.12/* dist/
 
     - name: Upload with twine
       env:
