@@ -7,58 +7,31 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
+  build:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Build package
-      run: |
-        python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
-        python3 -m build --wheel
-
-    - name: Archive build artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-linux-${{ matrix.python-version }}
-        path: dist
-
-  build-macos:
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-        architecture: x64
+      - uses: actions/setup-python@v4
 
-    - name: Build package
-      run: |
-        python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
-        python3 -m build --wheel
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel==2.16.5
 
-    - name: Archive build artifacts
-      uses: actions/upload-artifact@v1
-      with:
-        name: dist-macos-${{ matrix.python-version }}
-        path: dist
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
 
   upload:
-    needs: [build-linux, build-macos]
+    needs: [build]
     runs-on: ubuntu-latest
 
     steps:
@@ -77,65 +50,29 @@ jobs:
     - name: Create source dist
       run: python3 -m build --sdist
 
-    - name: Stage linux 3.8
-      uses: actions/download-artifact@v1
+    - name: Stage Linux
+      uses: actions/download-artifact@v4
       with:
-        name: dist-linux-3.8
-    - run: mv -v dist-linux-3.8/* dist/
+        name: wheels-ubuntu-latest
+    - runs: mv -v wheels-ubuntu-latest/* dist/
 
-    - name: Stage linux 3.9
-      uses: actions/download-artifact@v1
+    - name: Stage Windows
+      uses: actions/download-artifact@v4
       with:
-        name: dist-linux-3.9
-    - run: mv -v dist-linux-3.9/* dist/
+        name: wheels-windows-latest
+    - runs: mv -v wheels-windows-latest/* dist/
 
-    - name: Stage linux 3.10
-      uses: actions/download-artifact@v1
+    - name: Stage MacOS 13
+      uses: actions/download-artifact@v4
       with:
-        name: dist-linux-3.10
-    - run: mv -v dist-linux-3.10/* dist/
+        name: wheels-macos-13
+    - runs: mv -v wheels-macos-13/* dist/
 
-    - name: Stage linux 3.11
-      uses: actions/download-artifact@v1
+    - name: Stage MacOS 14
+      uses: actions/download-artifact@v4
       with:
-        name: dist-linux-3.11
-    - run: mv -v dist-linux-3.11/* dist/
-
-    - name: Stage linux 3.12
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-linux-3.12
-    - run: mv -v dist-linux-3.12/* dist/
-
-    - name: Stage macos 3.8
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-macos-3.8
-    - run: mv -v dist-macos-3.8/* dist/
-
-    - name: Stage macos 3.9
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-macos-3.9
-    - run: mv -v dist-macos-3.9/* dist/
-
-    - name: Stage macos 3.10
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-macos-3.10
-    - run: mv -v dist-macos-3.10/* dist/
-
-    - name: Stage macos 3.11
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-macos-3.11
-    - run: mv -v dist-macos-3.11/* dist/
-
-    - name: Stage macos 3.12
-      uses: actions/download-artifact@v1
-      with:
-        name: dist-macos-3.12
-    - run: mv -v dist-macos-3.12/* dist/
+        name: wheels-macos-14
+    - runs: mv -v wheels-macos-14/* dist/
 
     - name: Upload with twine
       env:
