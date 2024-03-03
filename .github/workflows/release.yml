@@ -13,23 +13,23 @@ jobs:
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python-version }}
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
 
-      - name: Build package
-        run: |
-          python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
-          python3 -m build --wheel
+    - name: Build package
+      run: |
+        python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
+        python3 -m build --wheel
 
-      - name: Archive build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-linux-${{ matrix.python-version }}
-          path: dist
+    - name: Archive build artifacts
+      uses: actions/upload-artifact@v1
+      with:
+        name: dist-linux-${{ matrix.python-version }}
+        path: dist
 
   build-macos:
     runs-on: macos-latest
@@ -38,7 +38,7 @@ jobs:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
 
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v4
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -51,7 +51,7 @@ jobs:
         python3 -m pip install --upgrade pip build setuptools cython wheel numpy scipy ase jax jaxlib
         python3 -m build --wheel
 
-    - name: Archive dist artifacts
+    - name: Archive build artifacts
       uses: actions/upload-artifact@v1
       with:
         name: dist-macos-${{ matrix.python-version }}
