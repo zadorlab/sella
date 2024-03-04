@@ -47,7 +47,7 @@ jobs:
       - name: Build SDist
         run: python3 -m build --sdist
 
-      - uses: action/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cibw-sdist
           path: dist/*.tar.gz
