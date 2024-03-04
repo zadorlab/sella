@@ -27,52 +27,44 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: cibw-${{ matrix.os }}-${{ strategy.job-index }}
           path: ./wheelhouse/*.whl
 
+  make_sdist:
+    name: Make SDist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip build setuptools cython numpy scipy ase jax jaxlib
+          python3 -m pip install -r requirements.txt
+
+      - name: Build SDist
+        run: python3 -m build --sdist
+
+     - uses: action/upload-artifact@v4
+       with:
+         name: cibw-sdist
+         path: dist/*.tar.gz
+
   upload:
-    needs: [build]
+    needs: [build, make_sdist]
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: cibw-*
+        path: dist
+        merge-multiple: true
 
     - name: Set up Python
-      uses: actions/setup-python@v1
-      with:
-        python-version: '3.12'
-
-    - name: Install dependencies
-      run: |
-        python3 -m pip install --upgrade pip build setuptools cython numpy scipy ase jax jaxlib
-        pip install -r requirements.txt
-
-    - name: Create source dist
-      run: python3 -m build --sdist
-
-    - name: Stage Linux
-      uses: actions/download-artifact@v4
-      with:
-        name: wheels-ubuntu-latest
-    - run: mv -v wheels-ubuntu-latest/* dist/
-
-    - name: Stage Windows
-      uses: actions/download-artifact@v4
-      with:
-        name: wheels-windows-latest
-    - run: mv -v wheels-windows-latest/* dist/
-
-    - name: Stage MacOS 13
-      uses: actions/download-artifact@v4
-      with:
-        name: wheels-macos-13
-    - run: mv -v wheels-macos-13/* dist/
-
-    - name: Stage MacOS 14
-      uses: actions/download-artifact@v4
-      with:
-        name: wheels-macos-14
-    - run: mv -v wheels-macos-14/* dist/
+      uses: actions/setup-python@v4
 
     - name: Upload with twine
       env:
@@ -80,5 +72,5 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
       run: |
         ls -l dist/*
-        pip install twine
+        python3 -m pip install twine
         twine upload dist/*
