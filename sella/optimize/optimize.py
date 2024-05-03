@@ -96,8 +96,10 @@ class Sella(Optimizer):
         if rs is None:
             rs = 'mis' if internal else 'ras'
         self.rs = get_restricted_step(rs)
-        Optimizer.__init__(self, atoms, restart, logfile, asetraj, master,
-                           force_consistent)
+        Optimizer.__init__(self, atoms, restart=restart,
+                           logfile=logfile, trajectory=asetraj,
+                           master=master,
+                           force_consistent=force_consistent)
 
         if delta0 is None:
             delta0 = default['delta0']
