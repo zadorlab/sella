@@ -1375,9 +1375,6 @@ class Internals(BaseInternals):
             labels[nbonds == 0] = -1
 
             for i, j in cwr(range(self.natoms), 2):
-                # do not consider bonds beyond max_bonds
-                #if i > max_bonds or j > max_bonds:
-                #    break
                 # do not add a bond between atoms belonging to the same
                 # bonding network fragment
                 if labels[i] == labels[j] and labels[i] != -1:
