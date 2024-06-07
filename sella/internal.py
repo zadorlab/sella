@@ -1375,6 +1375,9 @@ class Internals(BaseInternals):
             labels[nbonds == 0] = -1
 
             for i, j in cwr(range(self.natoms), 2):
+                # do not consider bonds beyond max_bonds
+                #if i > max_bonds or j > max_bonds:
+                #    break
                 # do not add a bond between atoms belonging to the same
                 # bonding network fragment
                 if labels[i] == labels[j] and labels[i] != -1:
@@ -1393,12 +1396,16 @@ class Internals(BaseInternals):
                             self.add_bond((i, j), ts)
                         except DuplicateInternalError:
                             continue
-                        c10y[i, nbonds[i]] = j
-                        nbonds[i] += 1
-                        c10y[j, nbonds[j]] = i
-                        nbonds[j] += 1
+                        if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
+                            c10y[i, nbonds[i]] = j
+                            nbonds[i] += 1
+                            c10y[j, nbonds[j]] = i
+                            nbonds[j] += 1
+                        else:
+                            pass
             first_run = False
             scale *= 1.05
+            print(scale)
 
         if self.allow_fragments and nlabels != 1:
             assert nlabels > 1
