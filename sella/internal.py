@@ -1402,7 +1402,6 @@ class Internals(BaseInternals):
                             pass
             first_run = False
             scale *= 1.05
-            print(scale)
 
         if self.allow_fragments and nlabels != 1:
             assert nlabels > 1
