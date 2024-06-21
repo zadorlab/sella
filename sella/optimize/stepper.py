@@ -56,7 +56,7 @@ class NaiveStepper(BaseStepper):
 class QuasiNewton(BaseStepper):
     alpha0 = 0.
     alphamin = 0.
-    alphamax = np.infty
+    alphamax = np.inf
     slope = -1
     synonyms = [
         'qn',
