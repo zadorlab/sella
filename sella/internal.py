@@ -750,7 +750,7 @@ class BaseInternals:
         ])
 
         for dx, ncvec in zip(dxs, ncvecs):
-            vlen = np.infty
+            vlen = np.inf
             for neighbor in self._get_neighbors(dx):
                 trial = np.linalg.norm(dx + neighbor @ self.atoms.cell)
                 if trial < vlen:

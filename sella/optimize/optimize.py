@@ -154,7 +154,7 @@ class Sella(Optimizer):
         self.xi = 1.
         self.nsteps_per_diag = nsteps_per_diag
         self.nsteps_since_diag = 0
-        self.diag_every_n = np.infty if diag_every_n is None else diag_every_n
+        self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
 
     def initialize_pes(
         self,
