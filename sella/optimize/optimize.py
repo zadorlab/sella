@@ -44,7 +44,6 @@ class Sella(Optimizer):
         logfile: str = '-',
         trajectory: Union[str, Trajectory] = None,
         master: bool = None,
-        force_consistent: bool = False,
         delta0: float = None,
         sigma_inc: float = None,
         sigma_dec: float = None,
@@ -98,8 +97,7 @@ class Sella(Optimizer):
         self.rs = get_restricted_step(rs)
         Optimizer.__init__(self, atoms, restart=restart,
                            logfile=logfile, trajectory=asetraj,
-                           master=master,
-                           force_consistent=force_consistent)
+                           master=master)
 
         if delta0 is None:
             delta0 = default['delta0']
@@ -154,7 +152,7 @@ class Sella(Optimizer):
         self.xi = 1.
         self.nsteps_per_diag = nsteps_per_diag
         self.nsteps_since_diag = 0
-        self.diag_every_n = np.infty if diag_every_n is None else diag_every_n
+        self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
 
     def initialize_pes(
         self,

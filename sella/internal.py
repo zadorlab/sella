@@ -750,7 +750,7 @@ class BaseInternals:
         ])
 
         for dx, ncvec in zip(dxs, ncvecs):
-            vlen = np.infty
+            vlen = np.inf
             for neighbor in self._get_neighbors(dx):
                 trial = np.linalg.norm(dx + neighbor @ self.atoms.cell)
                 if trial < vlen:
@@ -1393,10 +1393,13 @@ class Internals(BaseInternals):
                             self.add_bond((i, j), ts)
                         except DuplicateInternalError:
                             continue
-                        c10y[i, nbonds[i]] = j
-                        nbonds[i] += 1
-                        c10y[j, nbonds[j]] = i
-                        nbonds[j] += 1
+                        if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
+                            c10y[i, nbonds[i]] = j
+                            nbonds[i] += 1
+                            c10y[j, nbonds[j]] = i
+                            nbonds[j] += 1
+                        else:
+                            pass
             first_run = False
             scale *= 1.05
 
