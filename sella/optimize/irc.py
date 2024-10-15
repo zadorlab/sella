@@ -24,7 +24,6 @@ class IRC(Optimizer):
         logfile: str = '-',
         trajectory: Optional[Union[str, TrajectoryWriter]] = None,
         master: Optional[bool] = None,
-        force_consistent: bool = False,
         ninner_iter: int = 10,
         irctol: float = 1e-2,
         dx: float = 0.1,
@@ -41,7 +40,6 @@ class IRC(Optimizer):
             logfile=logfile,
             trajectory=trajectory,
             master=master,
-            force_consistent=force_consistent,
         )
         self.ninner_iter = ninner_iter
         self.irctol = irctol
