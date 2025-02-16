@@ -296,13 +296,17 @@ class Sella(Optimizer):
         T = strftime("%H:%M:%S", localtime())
         name = self.__class__.__name__
         buf = " " * len(name)
+        traj_id = 0
+        if self.pes.traj is not None:
+            # We need the index so that's len()-1
+            traj_id = len(self.pes.traj) - 1
         if self.nsteps == 0:
             self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                               "{:>12s} {:>12s}\n"
+                               "{:>12s} {:>12s} {:>7}\n"
                                .format("Step", "Time", "Energy", "fmax",
-                                       "cmax", "rtrust", "rho"))
+                                       "cmax", "rtrust", "rho", "    trjid"))
         self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                           "{:>12.4f} {:>12.4f}\n"
+                           "{:>12.4f} {:>12.4f} {:>7d}\n"
                            .format(name, self.nsteps, T, e, fmax, cmax,
-                                   self.delta, self.rho))
+                                   self.delta, self.rho, traj_id))
         self.logfile.flush()
