@@ -2,6 +2,8 @@
 
 # Sella
 
+<img width="375" height="353" alt="image" src="https://github.com/user-attachments/assets/8cc92eb6-f1d7-4a94-ab5f-1f448592d653" />
+
 Sella is a utility for finding first order saddle points
 
 An example script
