@@ -129,10 +129,7 @@ class TrustRegion(BaseRestrictedStep):
         if dsda is None:
             return val
 
-        if val < 1e-14:
-            dval = np.zeros_like(dsda[0]) if dsda.ndim > 1 else 0.0
-        else:
-            dval = dsda @ s / val
+        dval = dsda @ s / max(val, 1e-15)
         return val, dval
 
 
@@ -173,10 +170,7 @@ class RestrictedAtomicStep(BaseRestrictedStep):
             return val
 
         dsda_mat = dsda.reshape((-1, 3))
-        if val < 1e-14:
-            dval = 0.0
-        else:
-            dval = dsda_mat[index] @ s_mat[index] / val
+        dval = dsda_mat[index] @ s_mat[index] / max(val, 1e-15)
         return val, dval
 
 
