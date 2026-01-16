@@ -51,7 +51,7 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
         thetas, _ = eigh(S.T @ Ytilde)
         # Guard against zero eigenvalues which would give log(0) = -Inf
         thetas_abs = np.abs(thetas)
-        thetas_abs = np.maximum(thetas_abs, 1e-14)
+        thetas_abs = np.maximum(thetas_abs, 1e-12)
         lam0 = np.exp(np.average(np.log(thetas_abs)))
         d, _ = S.shape
         B = lam0 * np.eye(d)

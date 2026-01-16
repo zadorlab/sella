@@ -123,8 +123,8 @@ class RationalFunctionOptimization(BaseStepper):
 
         # Regularize denominator to avoid division by near-zero eigenvector component
         denom = V[-1, self.order]
-        if abs(denom) < 1e-10:
-            denom = np.sign(denom) * 1e-10 if denom != 0 else 1e-10
+        if abs(denom) < 1e-12:
+            denom = np.sign(denom) * 1e-12 if denom != 0 else 1e-12
         s = V[:-1, self.order] * alpha / denom
 
         dAda = self.A.copy()

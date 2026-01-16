@@ -72,7 +72,7 @@ class NumericalHessian(LinearOperator):
                     break
 
         vnorm = np.linalg.norm(v)
-        if vnorm < 1e-14:
+        if vnorm < 1e-12:
             # Zero input vector produces zero output
             if self.Uproj is not None:
                 return np.zeros(self.Uproj.shape[1])
