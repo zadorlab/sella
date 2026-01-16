@@ -120,10 +120,11 @@ class RationalFunctionOptimization(BaseStepper):
         A = self.A * alpha
         A[:-1, :-1] *= alpha
         L, V = eigh(A)
-        # Regularize denominator to avoid NaN/Inf when eigenvector component is near zero
+
+        # Regularize denominator to avoid division by near-zero eigenvector component
         denom = V[-1, self.order]
-        if abs(denom) < 1e-14:
-            denom = np.sign(denom) * 1e-14 if denom != 0 else 1e-14
+        if abs(denom) < 1e-10:
+            denom = np.sign(denom) * 1e-10 if denom != 0 else 1e-10
         s = V[:-1, self.order] * alpha / denom
 
         dAda = self.A.copy()
@@ -131,9 +132,12 @@ class RationalFunctionOptimization(BaseStepper):
 
         V1 = np.delete(V, self.order, 1)
         L1 = np.delete(L, self.order)
-        # Regularize eigenvalue differences to avoid division by zero
+
+        # Regularize eigenvalue differences: clamp small values while preserving sign
         L_diff = L1 - L[self.order]
-        L_diff = np.where(np.abs(L_diff) < 1e-14, 1e-14, L_diff)
+        L_diff = np.where(L_diff >= 0,
+                         np.maximum(L_diff, 1e-12),
+                         np.minimum(L_diff, -1e-12))
         dVda = V1 @ ((V1.T @ dAda @ V[:, self.order]) / L_diff)
 
         dsda = (V[:-1, self.order] / denom
