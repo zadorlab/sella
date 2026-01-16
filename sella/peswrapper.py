@@ -249,12 +249,19 @@ class PES:
         Ufree = self.get_Ufree()
         nfree = Ufree.shape[1]
 
+        # If there are no free DOF, there's nothing to diagonalize
+        if nfree == 0:
+            return
+
         P = self.get_HL().project(Ufree)
 
         if P.B is None or self.first_diag:
             v0 = self.v0
             if v0 is None:
                 v0 = self.get_g() @ Ufree
+            # If v0 is near-zero, let rayleigh_ritz choose its own initial guess
+            if v0 is not None and np.linalg.norm(v0) < 1e-10:
+                v0 = None
         else:
             v0 = None
 
