@@ -67,7 +67,8 @@ def velocity_rescaling(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=
         K_target = d * T / 2.
         K = np.sum(v**2) / 2.
 
-        v *= np.sqrt(K_target / K)
+        if K > 1e-14:
+            v *= np.sqrt(K_target / K)
         print(np.average(v**2) / kB, T / kB)
 
     return x
