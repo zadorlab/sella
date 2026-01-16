@@ -106,6 +106,21 @@ class PES:
         if dpos is not None:
             self.dummies.positions = dpos
 
+    def close(self):
+        """Close any open file handles (e.g., trajectory file)."""
+        if self.traj is not None:
+            self.traj.close()
+            self.traj = None
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures trajectory is closed."""
+        self.close()
+        return False
+
     # Position getter/setter
     def set_x(self, target):
         diff = target - self.get_x()
