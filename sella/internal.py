@@ -1338,6 +1338,7 @@ class Internals(BaseInternals):
         self,
         nbond_cart_thr: int = 6,
         max_bonds: int = 20,
+        scale: float = 1.25,
     ) -> None:
         rcov = covalent_radii[self.atoms.numbers]
         nbonds = np.zeros(self.natoms, dtype=np.int32)
@@ -1351,7 +1352,6 @@ class Internals(BaseInternals):
             c10y[j, nbonds[j]] = i
             nbonds[j] += 1
 
-        scale = 1.25
         first_run = True
         while True:
             # use flood fill algorithm to count the number of disconnected
@@ -1367,11 +1367,15 @@ class Internals(BaseInternals):
             # are complete, and we can stop
             if nlabels == 1:
                 break
+
+            # Remove labels from atoms with no bonding partners.
+            # This must happen BEFORE the allow_fragments break, otherwise
+            # single atoms will retain fragment labels and cause rotation ICs
+            # to be incorrectly added to single-atom groups.
+            labels[nbonds == 0] = -1
+
             if self.allow_fragments and not first_run:
                 break
-
-            # remove labels from atoms with no bonding partners
-            labels[nbonds == 0] = -1
 
             for i, j in cwr(range(self.natoms), 2):
                 # do not add a bond between atoms belonging to the same
@@ -1533,6 +1537,7 @@ class Internals(BaseInternals):
                             )
 
     def find_all_dihedrals(self) -> None:
+        # First, find proper dihedrals from angle combinations
         for a1, a2 in combinations(self.internals['angles'], 2):
             try:
                 new = a1 + a2
@@ -1552,11 +1557,82 @@ class Internals(BaseInternals):
             except DuplicateInternalError:
                 continue
 
+        # Second, add improper dihedrals for atoms with 3 or 4 neighbors that don't
+        # have any proper dihedral passing through them. This is needed because:
+        # 1. At planar geometries, bond/angle derivatives vanish for out-of-plane motion
+        # 2. Even starting non-planar, the geometry may planarize during optimization
+        # 3. Improper dihedrals capture the out-of-plane (umbrella) mode
+
+
+        # Note this does add some redundancy to the internals but it also makes it
+        # so that the Jacobian is well-conditioned in the case of planar systems,
+        # such as nitrate.
+        #
+        # We only add impropers when no proper dihedral exists through the atom,
+        # which avoids excessive unnecessary additional internals.
+
+        # First, find which atoms have proper dihedrals through them
+        dihedral_centers = set()
+        for d, a in zip(self.internals['dihedrals'], self._active['dihedrals']):
+            if a:
+                # Positions 1 and 2 are the "central" atoms of a dihedral
+                dihedral_centers.add(int(d.indices[1]))
+                dihedral_centers.add(int(d.indices[2]))
+
+        # Build neighbor list
+        neighbors = [[] for _ in range(self.natoms)]
+        for bond in self.internals['bonds']:
+            i, j = bond.indices
+            if i < self.natoms:
+                neighbors[i].append((int(j), bond.kwargs['ncvecs'][0]))
+            if j < self.natoms:
+                neighbors[j].append((int(i), -bond.kwargs['ncvecs'][0]))
+
+        for center in range(self.natoms):
+            # Consider atoms with 3 or 4 neighbors that lack proper dihedrals.
+            # - 3 neighbors: at planar geometries (e.g., NO3, sp2 carbons), the
+            #   3 angles sum to 360°, creating linear dependency.
+            # - 4 neighbors: at square planar geometries (e.g., Pt(II)), the
+            #   4 cis angles sum to 360°, similar issue. For tetrahedral, the
+            #   improper is redundant but harmless (pseudo-inverse handles it).
+            # - 5+ neighbors: rare, and typically have proper dihedrals anyway.
+            if len(neighbors[center]) not in (3, 4):
+                continue
+
+            # Skip if this atom already has proper dihedrals through it
+            if center in dihedral_centers:
+                continue
+
+            # Add improper dihedral: neighbors[0]-center-neighbors[1]-neighbors[2]
+            n0, ncvec0 = neighbors[center][0]
+            n1, ncvec1 = neighbors[center][1]
+            n2, ncvec2 = neighbors[center][2]
+            # Improper dihedral indices: (n0, center, n1, n2)
+            # The ncvecs connect consecutive atoms in the dihedral
+            imp_ncvecs = (
+                -ncvec0,  # from n0 to center
+                ncvec1,   # from center to n1
+                ncvec2 - ncvec1,  # from n1 to n2
+            )
+            try:
+                self.add_dihedral((n0, center, n1, n2), imp_ncvecs)
+            except DuplicateInternalError:
+                pass
+
     def validate_basis(self) -> None:
         jac = self.jacobian()
         U, S, VT = np.linalg.svd(jac)
         ndeloc = np.sum(S > 1e-8)
-        ndof = 3 * (self.natoms + self.ndummies) - 6
+
+        # If TRICs (translations/rotations) are present, they span the full
+        # 3N DOF. Otherwise, 6 DOF are removed for global translation/rotation.
+        has_trics = (len(self.internals['translations']) > 0 or
+                     len(self.internals['rotations']) > 0)
+        if has_trics:
+            ndof = 3 * (self.natoms + self.ndummies)
+        else:
+            ndof = 3 * (self.natoms + self.ndummies) - 6
+
         if ndeloc != ndof:
             warnings.warn(
                 f'{ndeloc} coords found! Expected {ndof}.'
