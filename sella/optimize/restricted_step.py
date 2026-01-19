@@ -129,7 +129,7 @@ class TrustRegion(BaseRestrictedStep):
         if dsda is None:
             return val
 
-        dval = dsda @ s / val
+        dval = dsda @ s / max(val, 1e-12)
         return val, dval
 
 
@@ -170,7 +170,7 @@ class RestrictedAtomicStep(BaseRestrictedStep):
             return val
 
         dsda_mat = dsda.reshape((-1, 3))
-        dval = dsda_mat[index] @ s_mat[index] / val
+        dval = dsda_mat[index] @ s_mat[index] / max(val, 1e-12)
         return val, dval
 
 
@@ -182,8 +182,8 @@ class MaxInternalStep(BaseRestrictedStep):
     ):
         if pes.int is None:
             raise ValueError(
-                "Internal coordinates are required for the "
-                "{self.__class__.__name__} trust region method"
+                f"Internal coordinates are required for the "
+                f"{self.__class__.__name__} trust region method"
             )
         self.wx = wx
         self.wb = wb

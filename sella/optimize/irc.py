@@ -165,7 +165,10 @@ class IRC(Optimizer):
         self.d1 *= 0.
 
     def converged(self, forces=None):
-        return self.pes.converged(self.fmax)[0] and self.pes.H.evals[0] > 0
+        evals = self.pes.H.evals
+        if evals is None:
+            return False
+        return self.pes.converged(self.fmax)[0] and evals[0] > 0
 
     def get_W(self):
         return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))

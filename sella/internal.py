@@ -442,7 +442,7 @@ class Displacement(Coordinate):
     def __eq__(self, other: Coordinate) -> bool:
         if not Coordinate.__eq__(self, other):
             return False
-        return np.all(self.refpos == other.refpos)
+        return np.all(self.kwargs['refpos'] == other.kwargs['refpos'])
 
     _eval0 = staticmethod(jit(_displacement))
     _eval1 = staticmethod(jit(_gradient(_displacement)))
@@ -478,9 +478,9 @@ def _angle(
 ) -> float:
     dx1 = -(pos[1] - pos[0] + tvecs[0])
     dx2 = pos[2] - pos[1] + tvecs[1]
-    return jnp.arccos(
-        dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
-    )
+    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+    # Clamp to [-1, 1] to prevent NaN from floating-point errors
+    return jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0))
 
 
 class Angle(Internal):
@@ -1024,7 +1024,7 @@ class Constraints(BaseInternals):
                 return
             raise DuplicateConstraintError(
                 "Coordinate {} is already fixed to target {}"
-                .format(new, self._targets[name][idx]) / conv
+                .format(new, self._targets[name][idx] / conv)
             )
 
     fix_bond = partialmethod(_fix_internal, Bond, 'bonds', 1.)
@@ -1260,10 +1260,9 @@ class Internals(BaseInternals):
             self.internals['other'].index(coord)
         except ValueError:
             self.internals['other'].append(coord)
+            self._active['other'].append(True)
         else:
             raise DuplicateInternalError()
-        self.internals['other'].append(coord)
-        self._active['other'].append(True)
 
     def forbid_translation(
         self,

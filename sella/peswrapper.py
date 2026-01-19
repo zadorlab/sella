@@ -106,6 +106,21 @@ class PES:
         if dpos is not None:
             self.dummies.positions = dpos
 
+    def close(self):
+        """Close any open file handles (e.g., trajectory file)."""
+        if self.traj is not None:
+            self.traj.close()
+            self.traj = None
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures trajectory is closed."""
+        self.close()
+        return False
+
     # Position getter/setter
     def set_x(self, target):
         diff = target - self.get_x()
@@ -249,12 +264,19 @@ class PES:
         Ufree = self.get_Ufree()
         nfree = Ufree.shape[1]
 
+        # If there are no free DOF, there's nothing to diagonalize
+        if nfree == 0:
+            return
+
         P = self.get_HL().project(Ufree)
 
         if P.B is None or self.first_diag:
             v0 = self.v0
             if v0 is None:
                 v0 = self.get_g() @ Ufree
+            # If v0 is near-zero, let rayleigh_ritz choose its own initial guess
+            if v0 is not None and np.linalg.norm(v0) < 1e-12:
+                v0 = None
         else:
             v0 = None
 
