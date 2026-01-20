@@ -71,6 +71,12 @@ class QuasiNewton(BaseStepper):
     ]
 
     def _stepper_init(self) -> None:
+        # Get eigenvalues and eigenvectors from the Hessian
+        # If not already computed, compute them now
+        if self.H.evals is None:
+            H_array = self.H.asarray()
+            self.H.evals, self.H.evecs = eigh(H_array)
+
         self.L = np.abs(self.H.evals)
         self.L[:self.order] *= -1
 
@@ -120,20 +126,29 @@ class RationalFunctionOptimization(BaseStepper):
         A = self.A * alpha
         A[:-1, :-1] *= alpha
         L, V = eigh(A)
-        s = V[:-1, self.order] * alpha / V[-1, self.order]
+
+        # Regularize denominator to avoid division by near-zero eigenvector component
+        denom = V[-1, self.order]
+        if abs(denom) < 1e-12:
+            denom = np.sign(denom) * 1e-12 if denom != 0 else 1e-12
+        s = V[:-1, self.order] * alpha / denom
 
         dAda = self.A.copy()
         dAda[:-1, :-1] *= 2 * alpha
 
         V1 = np.delete(V, self.order, 1)
         L1 = np.delete(L, self.order)
-        dVda = V1 @ ((V1.T @ dAda @ V[:, self.order])
-                     / (L1 - L[self.order]))
 
-        dsda = (V[:-1, self.order] / V[-1, self.order]
-                + (alpha / V[-1, self.order]) * dVda[:-1]
-                - (V[:-1, self.order] * alpha
-                   / V[-1, self.order]**2) * dVda[-1])
+        # Regularize eigenvalue differences: clamp small values while preserving sign
+        L_diff = L1 - L[self.order]
+        L_diff = np.where(L_diff >= 0,
+                         np.maximum(L_diff, 1e-12),
+                         np.minimum(L_diff, -1e-12))
+        dVda = V1 @ ((V1.T @ dAda @ V[:, self.order]) / L_diff)
+
+        dsda = (V[:-1, self.order] / denom
+                + (alpha / denom) * dVda[:-1]
+                - (V[:-1, self.order] * alpha / denom**2) * dVda[-1])
         return s, dsda
 
 

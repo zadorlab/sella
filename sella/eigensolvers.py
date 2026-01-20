@@ -127,7 +127,11 @@ def expand(V, Y, P, B, lams, vecs, shift, method='jd0', seeking=0):
         vi = V @ vecs[:, seeking]
         Pprojr = solve(Pshift, R[:, seeking])
         Pprojv = solve(Pshift, vi)
-        alpha = vi.T @ Pprojr / (vi.T @ Pprojv)
+        denom = vi.T @ Pprojv
+        if abs(denom) < 1e-12:
+            # Fallback when denominator is near zero
+            return Pprojr
+        alpha = vi.T @ Pprojr / denom
         return Pprojv * alpha - Pprojr
     elif method == 'jd0':
         vi = V @ vecs[:, seeking]

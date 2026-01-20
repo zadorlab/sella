@@ -28,7 +28,7 @@ def bdp(func, x0, ngen, T0, Tf, dt, tau, *args, schedule=T_linear, v0=None, **kw
     for i in range(ngen):
         old_f = f
         old_g = g.copy()
-        
+
         x += dt * v - 0.5 * dt**2 * g
         f, g = func(x, *args, **kwargs)
 
@@ -38,8 +38,10 @@ def bdp(func, x0, ngen, T0, Tf, dt, tau, *args, schedule=T_linear, v0=None, **kw
         K_target = d * T / 2.
         K = np.sum(v**2) / 2.
         R = np.random.normal(size=d)
-        alpha2 = edttau + K * (1 - edttau) * np.sum(R**2) / (d * K) + 2 * edttau2 * np.sqrt(K_target * (1 - edttau) / (d * K)) * R[0]
-        v *= np.sqrt(alpha2)
+        if K > 1e-12:
+            alpha2 = edttau + K * (1 - edttau) * np.sum(R**2) / (d * K) + 2 * edttau2 * np.sqrt(K_target * (1 - edttau) / (d * K)) * R[0]
+            v *= np.sqrt(alpha2)
+        # If K is too small, skip rescaling - Verlet integration will add velocity from forces
         print(np.average(v**2) / kB, T / kB)
     return x
 
@@ -57,7 +59,7 @@ def velocity_rescaling(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=
     for i in range(ngen):
         old_f = f
         old_g = g.copy()
-        
+
         x += dt * v - 0.5 * dt**2 * g
         f, g = func(x, *args, **kwargs)
 
@@ -67,7 +69,9 @@ def velocity_rescaling(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=
         K_target = d * T / 2.
         K = np.sum(v**2) / 2.
 
-        v *= np.sqrt(K_target / K)
+        if K > 1e-12:
+            v *= np.sqrt(K_target / K)
+        # If K is too small, skip rescaling - Verlet integration will add velocity from forces
         print(np.average(v**2) / kB, T / kB)
 
     return x
@@ -86,7 +90,7 @@ def csvr(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=None, **kwargs
     for i in range(ngen):
         old_f = f
         old_g = g.copy()
-        
+
         x += dt * v - 0.5 * dt**2 * g
         f, g = func(x, *args, **kwargs)
 
@@ -96,7 +100,9 @@ def csvr(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=None, **kwargs
         K_target = np.random.gamma(d/2, T)
         K = np.sum(v**2) / 2.
 
-        v *= np.sqrt(K_target / K)
+        if K > 1e-12:
+            v *= np.sqrt(K_target / K)
+        # If K is too small, skip rescaling - Verlet integration will add velocity from forces
         print(np.average(v**2) / kB, T / kB)
 
     return x
