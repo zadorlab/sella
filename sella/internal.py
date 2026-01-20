@@ -32,7 +32,7 @@ from sella.linalg import (
 # Creating ASE Atoms objects has significant overhead (Atoms.__init__ validates
 # positions, sets up constraints, etc.). This lightweight wrapper provides just
 # the positions and cell attributes needed for coordinate calculations, reducing
-# Atoms.__init__ calls from ~1258 to ~266 per optimization run (~79% reduction).
+# Atoms.__init__ calls (~79% reduction).
 # =============================================================================
 
 class LightAtoms:
