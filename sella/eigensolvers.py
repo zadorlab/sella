@@ -38,7 +38,7 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
     if maxiter is None:
         maxiter = 2 * n + 1
 
-    if gamma <= 0:
+    if gamma <= 0 or n == 1:
         return exact(A, gamma, P)
 
     if v0 is not None:

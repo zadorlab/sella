@@ -467,7 +467,9 @@ def _rotation_q(
         [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
     ])
     q = eigh_rightmost(F)
-    return q * jnp.sign(q[0])
+    # Use where instead of sign: sign(0)=0 in JAX which zeros the entire
+    # quaternion for linear molecules, making all rotation Jacobians zero.
+    return q * jnp.where(q[0] >= 0, 1.0, -1.0)
 
 
 # "inverse sinc" function, naive, undefined at x=1
@@ -562,6 +564,18 @@ class Rotation(Coordinate):
     _eval0 = staticmethod(jit(_rotation))
     _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
     _eval2 = staticmethod(jit(jacfwd(jacfwd(_rotation, argnums=0), argnums=0)))
+
+    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+        result = np.array(self._eval2(
+            atoms.positions[self.indices], **self.kwargs
+        ))
+        # For linear molecules, the quaternion eigenvalue problem in
+        # _rotation_q has degenerate eigenvalues, producing NaN second
+        # derivatives. The corresponding rotation is physically
+        # meaningless (zero Jacobian), so replacing NaN with 0 is exact.
+        if np.any(np.isnan(result)):
+            np.nan_to_num(result, copy=False)
+        return result
 
 
 def _displacement(
