@@ -738,10 +738,8 @@ class BaseInternals:
         self.dummies = dummies
         self.dinds = dinds
 
-        # Cache atom counts since they don't change during optimization
+        # Cache atom count (atoms are never added/removed during optimization)
         self._natoms = len(atoms)
-        self._ndummies = len(dummies)
-        self._ndof = 3 * (self._natoms + self._ndummies)
 
         self.internals = {key: [] for key in self._names}
         self._active = {key: [] for key in self._names}
@@ -758,7 +756,7 @@ class BaseInternals:
 
     @property
     def ndummies(self) -> int:
-        return self._ndummies
+        return len(self.dummies)
 
     @property
     def ntrans(self) -> int:
@@ -801,7 +799,7 @@ class BaseInternals:
 
     @property
     def ndof(self) -> int:
-        return self._ndof
+        return 3 * (self._natoms + len(self.dummies))
 
     @property
     def all_positions(self) -> np.ndarray:
