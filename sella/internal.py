@@ -422,7 +422,7 @@ class Rotation(Coordinate):
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
         result = np.array(self._eval2(
-            atoms.positions[self.indices], **self.kwargs
+            atoms[self.indices].positions, **self.kwargs
         ))
         # For linear molecules, the quaternion eigenvalue problem in
         # _rotation_q has degenerate eigenvalues, producing NaN second
