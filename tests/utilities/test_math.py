@@ -5,9 +5,15 @@ from sella.utilities.math import pseudo_inverse, modified_gram_schmidt
 
 from test_utils import get_matrix
 
-import pyximport
-pyximport.install(language_level=3)
-from math_wrappers import wrappers
+# Try to import Cython-based wrappers - skip tests if not available
+try:
+    import pyximport
+    pyximport.install(language_level=3)
+    from math_wrappers import wrappers
+    HAS_CYTHON = True
+except ImportError:
+    HAS_CYTHON = False
+    wrappers = None
 
 # TODO: figure out why m > n crashes
 @pytest.mark.parametrize("n,m,eps",
@@ -69,6 +75,7 @@ def test_modified_gram_schmidt(n, mx, my, eps1, eps2, maxiter):
     np.testing.assert_allclose(Xout2.T @ Xout2, np.eye(nxout2), **tol)
 
 
+@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,length',
                          [(0, 1),
                           (1, 2),
@@ -83,6 +90,7 @@ def test_normalize(rngstate, length):
     if length > 0:
         assert abs(np.linalg.norm(x) - 1.) < 1e-14
 
+@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,length,scale',
                          [(0, 1, 1.),
                           (1, 3, 0.5),
@@ -102,6 +110,7 @@ def test_vec_sum(rngstate, length, scale):
         assert wrappers['vec_sum'](x, y[:length-1], z, scale) == -1
         assert wrappers['vec_sum'](x, y, z[:length-1], scale) == -1
 
+@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,n,m',
                          [(0, 1, 1),
                           (1, 5, 5),
@@ -117,6 +126,7 @@ def test_symmetrize(rngstate, n, m):
     np.testing.assert_allclose(Y, Y.T)
 
 
+@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,scale',
                          [(0, 1.),
                           (1, 0.1),
@@ -128,6 +138,7 @@ def test_skew(rngstate, scale):
     wrappers['skew'](x, Y, scale)
     np.testing.assert_allclose(scale * np.cross(np.eye(3), x), Y)
 
+@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,n,mx,my',
                          [(2, 10, 2, 4)])
 def test_mgs(rngstate, n, mx, my):
@@ -152,4 +163,3 @@ def test_mgs(rngstate, n, mx, my):
     np.testing.assert_allclose(X[:, :mx2].T @ Y[:, :my2], np.zeros((mx2, my2)),
                                atol=1e-10)
     assert wrappers['mgs'](X, Y[:n-1]) < 0
-

@@ -71,7 +71,13 @@ class NumericalHessian(LinearOperator):
                     sign = -1.
                     break
 
-        vnorm = np.linalg.norm(v) * sign
+        vnorm = np.linalg.norm(v)
+        if vnorm < 1e-12:
+            # Zero input vector produces zero output
+            if self.Uproj is not None:
+                return np.zeros(self.Uproj.shape[1])
+            return np.zeros_like(v)
+        vnorm *= sign
         _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
         if self.threepoint:
             fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
@@ -324,6 +330,13 @@ class SparseInternalHessians:
 
     def asarray(self) -> np.ndarray:
         return np.array([hess.asarray() for hess in self.hessians])
+
+    def __array__(self, dtype=None):
+        """Support numpy array protocol for compatibility with np.zeros_like, etc."""
+        arr = self.asarray()
+        if dtype is not None:
+            return arr.astype(dtype)
+        return arr
 
     def ldot(self, v: np.ndarray) -> np.ndarray:
         M = np.zeros((self.natoms, 3, self.natoms, 3))

@@ -9,6 +9,12 @@ requires = [
 
 build-backend = "setuptools.build_meta"
 
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "cython >= 0.29.23",
+]
+
 [tool.cibuildwheel]
 skip = [
     # skip pypy

@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 
 from itertools import permutations
@@ -14,7 +16,7 @@ def poly_factory(dim, order, rng=None):
         coeff = np.zeros_like(tmp)
         for n, permute in enumerate(permutations(range(i))):
             coeff += np.transpose(tmp, permute)
-        coeffs.append(coeff / ((n + 1) * np.math.factorial(i)))
+        coeffs.append(coeff / ((n + 1) * math.factorial(i)))
 
     def poly(x):
         res = 0

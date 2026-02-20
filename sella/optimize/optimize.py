@@ -76,6 +76,8 @@ class Sella(Optimizer):
                 mode = "a" if append_trajectory else "w"
                 trajectory = Trajectory(trajectory, mode=mode,
                                         atoms=atoms, master=master)
+            # Register trajectory for cleanup when close() is called
+            self.closelater(trajectory)
 
         asetraj = None
         self.peskwargs = kwargs.copy()
