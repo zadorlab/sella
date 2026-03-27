@@ -44,12 +44,12 @@ test = ["pytest"]
 where = ["."]
 include = ["sella*"]
 
-[tool.setuptools]
-ext-modules = [
-  {name = "sella.force_match", sources = ["sella/force_match.pyx"]},
-  {name = "sella.utilities.blas", sources = ["sella/utilities/blas.pyx"]},
-  {name = "sella.utilities.math", sources = ["sella/utilities/math.pyx"]},
-]
+#[tool.setuptools]
+#ext-modules = [
+#  {name = "sella.force_match", sources = ["sella/force_match.pyx"]},
+#  {name = "sella.utilities.blas", sources = ["sella/utilities/blas.pyx"]},
+#  {name = "sella.utilities.math", sources = ["sella/utilities/math.pyx"]},
+#]
 
 [tool.setuptools_scm]
 # Version will be determined from git tags
