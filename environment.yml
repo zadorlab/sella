@@ -3,9 +3,15 @@ channels:
   - defaults
   - conda-forge
 dependencies:
-  - python >= 3.6
-  - scipy >=1.1.0
-  - cython
-  - ase
-  - jax >= 0.2.3
-  - jaxlib >= 0.1.56
+  - python >= 3.8
+  - numpy >= 1.14.0
+  - scipy >= 1.1.0
+  - cython >= 0.29.23
+  - ase >= 3.18.0
+  - jax >= 0.4.20
+  - jaxlib >= 0.4.20
+  - setuptools >= 74.1.0, < 82
+  - setuptools-scm >= 8.0
+  # Optional dependencies
+  - pip:
+    - pytest  # for testing
