@@ -13,6 +13,7 @@ import numpy as np
 from ase.build import molecule
 from ase.calculators.emt import EMT
 
+from sella import Sella
 from sella.linalg import ApproximateHessian, NumericalHessian, SparseInternalHessians
 from sella.internal import Internals
 from sella.peswrapper import PES, InternalPES
@@ -278,3 +279,29 @@ class TestNumericalHessian:
 
         # Check symmetry
         np.testing.assert_allclose(H12, H21, rtol=1e-5)
+
+
+class TestLinearMolecule:
+    """Test that linear molecules (e.g. N2) don't produce NaN in rotation
+    constraints.
+
+    Linear molecules have degenerate eigenvalues in the quaternion-based
+    rotation parameterization, which previously caused NaN in second
+    derivatives and zeroed Jacobians due to jnp.sign(0)==0.
+    """
+
+    def test_n2_cartesian(self):
+        """Test N2 optimization in Cartesian coordinates."""
+        atoms = molecule('N2')
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, logfile=None)
+        opt.run(fmax=0.01, steps=100)
+        assert opt.converged()
+
+    def test_n2_internal(self):
+        """Test N2 optimization with internal coordinates (TRICs)."""
+        atoms = molecule('N2')
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, logfile=None)
+        opt.run(fmax=0.01, steps=100)
+        assert opt.converged()

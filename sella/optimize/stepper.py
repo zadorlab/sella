@@ -71,6 +71,12 @@ class QuasiNewton(BaseStepper):
     ]
 
     def _stepper_init(self) -> None:
+        # Get eigenvalues and eigenvectors from the Hessian
+        # If not already computed, compute them now
+        if self.H.evals is None:
+            H_array = self.H.asarray()
+            self.H.evals, self.H.evecs = eigh(H_array)
+
         self.L = np.abs(self.H.evals)
         self.L[:self.order] *= -1
 
