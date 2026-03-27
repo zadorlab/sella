@@ -1,27 +1,78 @@
-[build-system]
-requires = [
-    "setuptools >= 54.2.0",
-    "setuptools_scm >= 2.0.0, <3",
-    "cython >= 0.29.23",
-    "numpy",
-    "scipy"
+[project]
+name = "sella"
+dynamic = ["version"] # Let setuptools-scm manage version
+description = "Saddle point optimization for molecular systems"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "LGPL-3.0" }
+authors = [{ name = "Eric Hermes", email = "ehermes@sandia.gov" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Cython",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy >= 1.14.0",
+  "scipy >= 1.1.0",
+  "ase >= 3.18.0",
+  "jax >= 0.4.20",
+  "jaxlib >= 0.4.20",
 ]
 
+[build-system]
+requires = [
+  "setuptools >= 74.1.0, < 82",
+  "setuptools-scm >= 8.0",
+  "cython >= 0.29.23",
+  "numpy >= 1.14.0",
+  "scipy >= 1.1.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
-test = [
-    "pytest",
-    "cython >= 0.29.23",
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sella*"]
+
+[tool.setuptools]
+ext-modules = [
+  {name = "sella.force_match", sources = ["sella/force_match.pyx"]},
+  {name = "sella.utilities.blas", sources = ["sella/utilities/blas.pyx"]},
+  {name = "sella.utilities.math", sources = ["sella/utilities/math.pyx"]},
 ]
+
+[tool.setuptools_scm]
+# Version will be determined from git tags
+# Fallback version for when git is not available (e.g., in sdist)
+fallback_version = "2.3.5"
+
+[tool.uv.extra-build-dependencies]
+sella = ["setuptools"]
 
 [tool.cibuildwheel]
 skip = [
-    # skip pypy
-    "pp*",
-    # skip 32-bit archs
-    "*-win32",
-    "*-manylinux_i686",
-    # skip musllinux
-    "*-musllinux*",
+  # skip pypy
+  "pp*",
+  # skip 32-bit archs
+  "*-win32",
+  "*-manylinux_i686",
+  # skip musllinux
+  "*-musllinux*",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.cython]
+compile_time_env = {}
+compiler_directives = { language_level = 3, wraparound = false, cdivision = true }

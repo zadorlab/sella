@@ -129,7 +129,8 @@ def expand(V, Y, P, B, lams, vecs, shift, method='jd0', seeking=0):
         Pprojv = solve(Pshift, vi)
         denom = vi.T @ Pprojv
         if abs(denom) < 1e-12:
-            return Pprojr  # Fall back when denominator is near zero
+            # Fallback when denominator is near zero
+            return Pprojr
         alpha = vi.T @ Pprojr / denom
         return Pprojv * alpha - Pprojr
     elif method == 'jd0':
