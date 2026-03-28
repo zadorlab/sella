@@ -46,7 +46,6 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip build setuptools cython numpy scipy ase jax jaxlib
-          python3 -m pip install -r requirements.txt
 
       - name: Build SDist
         run: python3 -m build --sdist
