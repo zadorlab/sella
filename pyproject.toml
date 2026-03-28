@@ -36,7 +36,7 @@ requires = [
   "setuptools-scm >= 8.0",
   "cython >= 0.29.23",
   "numpy >= 1.14.0",
-  "scipy >= 1.1.0",
+#  "scipy >= 1.1.0",
 ]
 build-backend = "setuptools.build_meta"
 
