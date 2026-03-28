@@ -5,9 +5,12 @@ description = "Saddle point optimization for molecular systems"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "LGPL-3.0" }
-authors = [{ name = "Eric Hermes", email = "ehermes@sandia.gov" }]
+authors = [
+  { name = "Eric Hermes", email = "erichermes@gmail.com" },
+  { name = "Daniel Levine", email = "levineds@gmail.com" }
+]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
@@ -54,7 +57,7 @@ include = ["sella*"]
 [tool.setuptools_scm]
 # Version will be determined from git tags
 # Fallback version for when git is not available (e.g., in sdist)
-fallback_version = "2.3.5"
+fallback_version = "0.0.0"
 
 [tool.uv.extra-build-dependencies]
 sella = ["setuptools"]
