@@ -13,6 +13,3 @@ dependencies:
   - jaxlib >= 0.4.20
   - setuptools >= 74.1.0, < 82
   - setuptools-scm >= 8.0
-  # Optional dependencies
-  - pip:
-    - pytest  # for testing
