@@ -4,6 +4,7 @@ channels:
   - conda-forge
 dependencies:
   - python >= 3.8
+  - pip
   - numpy >= 1.14.0
   - scipy >= 1.1.0
   - cython >= 0.29.23
