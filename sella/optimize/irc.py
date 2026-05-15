@@ -1,5 +1,5 @@
 import warnings
-from typing import Optional, Union, Dict, Any
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 from scipy.linalg import eigh
@@ -12,6 +12,11 @@ from sella.peswrapper import PES
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
 
+# Matches the default used by ASE's Optimizer when ``steps`` is
+# unspecified. Defined locally rather than imported because the
+# constant is not exported from ase.optimize.optimize in older ASE.
+DEFAULT_MAX_STEPS = 100_000_000
+
 
 class IRCInnerLoopConvergenceFailure(RuntimeError):
     pass
@@ -21,7 +26,7 @@ class IRC(Optimizer):
     def __init__(
         self,
         atoms: Atoms,
-        logfile: str = '-',
+        logfile: str = "-",
         trajectory: Optional[Union[str, TrajectoryWriter]] = None,
         master: Optional[bool] = None,
         ninner_iter: int = 10,
@@ -31,7 +36,7 @@ class IRC(Optimizer):
         gamma: float = 0.1,
         peskwargs: Optional[Dict[str, Any]] = None,
         keep_going: bool = False,
-        **kwargs
+        **kwargs,
     ):
         Optimizer.__init__(
             self,
@@ -44,31 +49,37 @@ class IRC(Optimizer):
         self.ninner_iter = ninner_iter
         self.irctol = irctol
         self.dx = dx
+        # Previously this branch had no ``else``, which silently left
+        # ``self.peskwargs`` unset whenever the caller supplied an
+        # explicit ``peskwargs`` dict, raising AttributeError on the
+        # first PES kick in ``irun``.
         if peskwargs is None:
             self.peskwargs = dict(gamma=gamma)
+        else:
+            self.peskwargs = peskwargs
 
-        if 'masses' not in self.atoms.arrays:
+        if "masses" not in self.atoms.arrays:
             try:
-                self.atoms.set_masses('most_common')
+                self.atoms.set_masses("most_common")
             except ValueError:
-                warnings.warn("The version of ASE that is installed does not "
-                              "contain the most common isotope masses, so "
-                              "Earth-abundance-averaged masses will be used "
-                              "instead!")
-                self.atoms.set_masses('defaults')
+                warnings.warn(
+                    "The version of ASE that is installed does not "
+                    "contain the most common isotope masses, so "
+                    "Earth-abundance-averaged masses will be used "
+                    "instead!"
+                )
+                self.atoms.set_masses("defaults")
 
         self.sqrtm = np.repeat(np.sqrt(self.atoms.get_masses()), 3)
 
-        self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False,
-                       **kwargs)
+        self.pes = PES(atoms, eta=eta, proj_trans=False, proj_rot=False, **kwargs)
 
         self.lastrun = None
         self.x0 = self.pes.get_x().copy()
         self.v0ts: Optional[np.ndarray] = None
         self.H0: Optional[np.ndarray] = None
         self.peslast = None
-        self.xi = 1.
-        self.first = True
+        self.xi = 1.0
         self.keep_going = keep_going
 
     def irun(
@@ -76,11 +87,16 @@ class IRC(Optimizer):
         fmax: float = 0.05,
         fmax_inner: float = 0.01,
         steps: Optional[int] = None,
-        direction: str = 'forward',
+        direction: str = "forward",
     ):
-        if direction not in ['forward', 'reverse']:
-            raise ValueError('direction must be one of "forward" or '
-                             '"reverse"!')
+        if direction not in ["forward", "reverse"]:
+            raise ValueError('direction must be one of "forward" or "reverse"!')
+
+        # ASE >= 3.23 requires ``steps`` to be an integer when irun is
+        # delegated upward; older ASE accepted None. Normalize here so
+        # both work without depending on which version is installed.
+        if steps is None:
+            steps = DEFAULT_MAX_STEPS
 
         if self.v0ts is None:
             # Initial diagonalization
@@ -104,24 +120,40 @@ class IRC(Optimizer):
             self.pes.last = self.peslast.copy()
             self.pes.set_H(self.H0.copy(), initialized=True)
 
-        if direction == 'forward':
+        if direction == "forward":
             self.d1 = self.v0ts.copy()
-        elif direction == 'reverse':
+        elif direction == "reverse":
             self.d1 = -self.v0ts.copy()
 
-        self.first = True
         self.fmax_inner = min(fmax, fmax_inner)
-        return Optimizer.irun(self, fmax, steps)
 
-    def run(self, *args, **kwargs):
-        for converged in self.irun(*args, **kwargs):
+        # Apply the initial kick off the transition state *before*
+        # handing control to the ASE optimizer loop. In ASE >= 3.23 the
+        # Optimizable interface was refactored such that the convergence
+        # check in Dynamics.irun no longer routes through self.converged
+        # on the subclass in a way that an IRC kick-in-step strategy can
+        # intercept.
+        self.pes.kick(self.d1)
+
+        return Optimizer.irun(self, fmax=fmax, steps=steps)
+
+    def run(
+        self,
+        fmax: float = 0.05,
+        fmax_inner: float = 0.01,
+        steps: Optional[int] = None,
+        direction: str = "forward",
+    ):
+        for converged in self.irun(
+            fmax=fmax,
+            fmax_inner=fmax_inner,
+            steps=steps,
+            direction=direction,
+        ):
             pass
         return converged
 
     def step(self):
-        if self.first:
-            self.pes.kick(self.d1)
-            self.first = False
         for n in range(self.ninner_iter):
             s, smag = IRCTrustRegion(
                 self.pes,
@@ -156,18 +188,17 @@ class IRC(Optimizer):
         else:
             if self.keep_going:
                 warnings.warn(
-                    'IRC inner loop failed to converge! The trajectory is no '
-                    'longer a trustworthy IRC.'
+                    "IRC inner loop failed to converge! The trajectory "
+                    "is no longer a trustworthy IRC."
                 )
             else:
                 raise IRCInnerLoopConvergenceFailure
 
-        self.d1 *= 0.
+        self.d1 *= 0.0
 
     def converged(self, forces=None):
         evals = self.pes.H.evals
-        return (self.pes.converged(self.fmax)[0]
-                and evals is not None and evals[0] > 0)
+        return self.pes.converged(self.fmax)[0] and evals is not None and evals[0] > 0
 
     def get_W(self):
-        return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))
+        return np.diag(1.0 / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))
