@@ -541,7 +541,9 @@ def _rotation_q(
         [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
     ])
     q = eigh_rightmost(F)
-    return q * jnp.sign(q[0])
+    # Use where instead of sign: sign(0)=0 in JAX which zeros the entire
+    # quaternion for linear molecules, making all rotation Jacobians zero.
+    return q * jnp.where(q[0] >= 0, 1.0, -1.0)
 
 
 # "inverse sinc" function, naive, undefined at x=1
@@ -606,7 +608,7 @@ def _rotation_3axis_masked(
         [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
     ])
     q = eigh_rightmost(F)
-    q = q * jnp.sign(q[0])
+    q = q * jnp.where(q[0] >= 0, 1.0, -1.0)
     a = asinc(q[0])
     return jnp.stack([2 * q[1] * a, 2 * q[2] * a, 2 * q[3] * a])
 
@@ -715,6 +717,18 @@ class Rotation(Coordinate):
     _eval0 = staticmethod(jit(_rotation))
     _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
     _eval2 = staticmethod(jit(jacfwd(jacfwd(_rotation, argnums=0), argnums=0)))
+
+    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+        result = np.array(self._eval2(
+            atoms.positions[self.indices], **self.kwargs
+        ))
+        # For linear molecules, the quaternion eigenvalue problem in
+        # _rotation_q has degenerate eigenvalues, producing NaN second
+        # derivatives. The corresponding rotation is physically
+        # meaningless (zero Jacobian), so replacing NaN with 0 is exact.
+        if np.any(np.isnan(result)):
+            np.nan_to_num(result, copy=False)
+        return result
 
 
 def _displacement(
@@ -1756,9 +1770,15 @@ class BaseInternals:
             atoms = self.light_atoms
             return [(r.indices, np.array(r.calc_hessian(atoms)))
                     for r in rotations]
-        hess_padded = np.asarray(device_get(_rotation_hess_padded_vmap(
+        hess_padded = np.array(device_get(_rotation_hess_padded_vmap(
             jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
         )))
+        # For linear molecules, the quaternion eigenvalue problem has
+        # degenerate eigenvalues producing NaN second derivatives. The
+        # corresponding rotation is physically meaningless (zero Jacobian),
+        # so replacing NaN with 0 is exact.
+        if np.any(np.isnan(hess_padded)):
+            np.nan_to_num(hess_padded, copy=False)
         # hess_padded.shape == (n_frags, 3, N_max, 3, N_max, 3)
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
@@ -3423,6 +3443,8 @@ class Internals(BaseInternals):
         S = svdvals(jac)
         ndeloc = np.sum(S > 1e-8)
 
+        # If TRICs (translations/rotations) are present, they span the full
+        # 3N DOF. Otherwise, 6 DOF are removed for global translation/rotation.
         has_trics = (len(self.internals['translations']) > 0 or
                      len(self.internals['rotations']) > 0)
         if has_trics:
