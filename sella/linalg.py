@@ -5,9 +5,10 @@ from itertools import product
 import numpy as np
 
 from sella.hessian_update import update_H
+from sella import _gpu as _gpu_mod
+from sella._gpu import gpu_eigh, gpu_eigh_t, to_gpu
 
 from scipy.sparse.linalg import LinearOperator
-from scipy.linalg import eigh
 
 
 class NumericalHessian(LinearOperator):
@@ -161,14 +162,50 @@ class ApproximateHessian(LinearOperator):
         self._evals = None
         self._evecs = None
         self._eigen_computed = False
+        # Lazy GPU upload of B, shared with downstream consumers
+        # (projection, etc.) so a single (N,N) transfer covers the step.
+        self._B_gpu = None
+        # Cached torch eigvals/eigvecs alongside the numpy versions, so the
+        # GPU-resident TS-BFGS update can read them without re-uploading.
+        self._evals_gpu = None
+        self._evecs_gpu = None
 
         self.set_B(B0)
 
     def _ensure_eigen_computed(self):
-        """Compute eigendecomposition if not already done."""
-        if not self._eigen_computed and self.B is not None:
-            self._evals, self._evecs = eigh(self.B)
-            self._eigen_computed = True
+        """Compute eigendecomposition if not already done.
+
+        Prefers the GPU-tensor path when B_gpu is cached so the eigvecs stay
+        on device for downstream consumers (e.g. _MS_TS_BFGS), while still
+        producing the numpy copies the rest of Sella expects.
+        """
+        if self._eigen_computed or self.B is None:
+            return
+        B_gpu = self._get_B_gpu()
+        if B_gpu is not None:
+            evals_t, evecs_t = gpu_eigh_t(B_gpu)
+            if evals_t is not None:
+                self._evals_gpu = evals_t
+                self._evecs_gpu = evecs_t
+                self._evals = evals_t.cpu().numpy()
+                self._evecs = evecs_t.cpu().numpy()
+                self._eigen_computed = True
+                return
+        # CPU fallback (no GPU or OOM)
+        self._evals, self._evecs = gpu_eigh(self.B, A_gpu=None)
+        self._eigen_computed = True
+
+    def _get_B_gpu(self):
+        """Return cached torch tensor of B on GPU, uploading lazily.
+
+        Returns None when no GPU is available, when B is below the size
+        threshold, or when an upload attempt has previously OOM'd.
+        """
+        if self.B is None:
+            return None
+        if self._B_gpu is None and _gpu_mod._gpu_ok(self.B.shape[0]):
+            self._B_gpu = to_gpu(self.B)
+        return self._B_gpu
 
     @property
     def evals(self):
@@ -200,6 +237,9 @@ class ApproximateHessian(LinearOperator):
             self._evals = None
             self._evecs = None
             self._eigen_computed = False
+            self._B_gpu = None
+            self._evals_gpu = None
+            self._evecs_gpu = None
             self.initialized = False
             return
         elif np.isscalar(target):
@@ -210,6 +250,27 @@ class ApproximateHessian(LinearOperator):
         self.B = target
         # Mark eigendecomposition as stale - will recompute on next access
         self._eigen_computed = False
+        # B has changed, so the GPU copies are stale. Don't re-upload eagerly:
+        # _get_B_gpu does it lazily on next read.
+        self._B_gpu = None
+        self._evals_gpu = None
+        self._evecs_gpu = None
+
+    def _set_from_gpu(self, B_numpy, B_gpu):
+        """Install (numpy, torch) copies of B that are already in sync.
+
+        Used by `update()` to avoid the round-trip when the GPU TS-BFGS path
+        produced both a numpy result and the same tensor on device.
+        """
+        assert B_numpy.shape == self.shape
+        self.B = B_numpy
+        self.initialized = True
+        self._B_gpu = B_gpu
+        self._eigen_computed = False
+        self._evals = None
+        self._evecs = None
+        self._evals_gpu = None
+        self._evecs_gpu = None
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
@@ -228,8 +289,20 @@ class ApproximateHessian(LinearOperator):
             self.set_B(B)
             return
 
-        self.set_B(update_H(B, dx, dg, method=self.update_method,
-                            symm=self.symm, lams=self.evals, vecs=self.evecs))
+        # Force GPU eig cache to populate alongside numpy lams/vecs (if a
+        # GPU is available); keeps update_H's GPU path eligible.
+        lams, vecs = self.evals, self.evecs
+
+        result = update_H(B, dx, dg, method=self.update_method,
+                          symm=self.symm, lams=lams, vecs=vecs,
+                          B_gpu=self._B_gpu,
+                          evals_gpu=self._evals_gpu,
+                          evecs_gpu=self._evecs_gpu)
+        if isinstance(result, tuple):
+            Bplus_numpy, Bplus_gpu = result
+            self._set_from_gpu(Bplus_numpy, Bplus_gpu)
+        else:
+            self.set_B(result)
 
     def project(self, U):
         """Project B into the subspace defined by U."""
@@ -395,80 +468,125 @@ class SparseInternalHessian(LinearOperator):
 # Uses np.einsum for batched matrix-vector products and np.add.at for scatter.
 # =============================================================================
 
-class SparseInternalHessians:
-    def __init__(
-        self,
-        hessians: List[SparseInternalHessian],
-        ndof: int
-    ):
-        self.hessians = hessians
-        self.natoms = ndof // 3
-        self.shape = (len(self.hessians), ndof, ndof)
-        # Pre-compute batched data structures for vectorized operations
-        self._prepare_batched_data()
+class SparseInternalHessiansSkeleton:
+    """Index-only data for SparseInternalHessians.
 
-    def _prepare_batched_data(self):
-        """Pre-compute index arrays for vectorized ldot and rdot operations."""
-        # Group hessians by size (number of atoms involved)
+    Holds the per-size groupings, atom-index arrays, and pre-computed flat
+    indices used by ldot/rdot. These derive only from the per-coord
+    ``indices`` and the global ``natoms`` — neither depends on the
+    coordinate Hessian *values* or atomic positions, so the skeleton can
+    be cached across optimizer steps and reused as long as the active
+    set of internal coordinates is unchanged.
+    """
+
+    def __init__(self, hessians: List[SparseInternalHessian], natoms: int):
+        self.natoms = natoms
+        self.n_hess = len(hessians)
+
+        # Group hessians by size (number of atoms involved).
         by_size = {}
-        for i, h in enumerate(self.hessians):
+        for i, h in enumerate(hessians):
             n = len(h.indices)
             if n not in by_size:
-                by_size[n] = {'orig_idx': [], 'indices': [], 'vals': []}
+                by_size[n] = {'orig_idx': [], 'indices': []}
             by_size[n]['orig_idx'].append(i)
             by_size[n]['indices'].append(h.indices)
-            by_size[n]['vals'].append(h.vals)
 
-        # Pre-compute the 3x3 index mesh for ldot
         i_idx, j_idx = np.meshgrid(np.arange(3), np.arange(3), indexing='ij')
         i_flat = i_idx.ravel()
         j_flat = j_idx.ravel()
 
-        self._batched_rdot = {}
-        self._batched_ldot = {}
+        # rdot only needs orig_idx + per-coord atom indices; vals are
+        # filled in per call by SparseInternalHessians.
+        self.rdot_meta = {}
+        # ldot also needs the precomputed flat 1D scatter index.
+        self.ldot_meta = {}
 
         for size, data in by_size.items():
             orig_idx = np.array(data['orig_idx'])
             indices = np.array(data['indices'])  # (batch, size)
-            vals = np.array(data['vals'])  # (batch, size, 3, size, 3)
             batch = len(orig_idx)
 
-            # For rdot: prepare gather/scatter indices
-            self._batched_rdot[size] = {
+            self.rdot_meta[size] = {
                 'orig_idx': orig_idx,
                 'indices': indices,
-                'vals': vals,
             }
 
-            # For ldot: prepare fully expanded index arrays
             n_pairs = size * size
-
-            # Create atom pair indices
             a_local, b_local = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
             a_local = a_local.ravel()
             b_local = b_local.ravel()
 
-            # Map to actual atom indices for each batch
             row_atoms = indices[:, a_local]  # (batch, size*size)
             col_atoms = indices[:, b_local]
-
-            # Expand for 3x3 blocks
             row_atoms = np.repeat(row_atoms, 9, axis=1)  # (batch, size*size*9)
             col_atoms = np.repeat(col_atoms, 9, axis=1)
             i_full = np.tile(i_flat, (batch, n_pairs))
             j_full = np.tile(j_flat, (batch, n_pairs))
 
-            # Reorder vals: (batch, size, 3, size, 3) -> (batch, size*size*9)
-            vals_reordered = vals.transpose(0, 1, 3, 2, 4)  # (batch, size, size, 3, 3)
-            vals_flat = vals_reordered.reshape(batch, -1)
+            # Pre-compute the flat 1D index used by the bincount-based ldot.
+            # M is (natoms, 3, natoms, 3); flat index =
+            # ((row*3 + i)*natoms + col)*3 + j.
+            linear_idx = ((row_atoms.ravel() * 3 + i_full.ravel())
+                          * natoms + col_atoms.ravel()) * 3 + j_full.ravel()
 
+            self.ldot_meta[size] = {
+                'orig_idx': orig_idx,
+                'linear_idx': linear_idx,
+                'batch': batch,
+                'n_pairs': n_pairs,
+            }
+
+
+class SparseInternalHessians:
+    def __init__(
+        self,
+        hessians: List[SparseInternalHessian],
+        ndof: int,
+        skeleton: 'SparseInternalHessiansSkeleton' = None,
+    ):
+        self.hessians = hessians
+        self.natoms = ndof // 3
+        self.shape = (len(self.hessians), ndof, ndof)
+
+        if skeleton is None:
+            skeleton = SparseInternalHessiansSkeleton(hessians, self.natoms)
+        elif skeleton.n_hess != len(hessians) or skeleton.natoms != self.natoms:
+            raise ValueError(
+                "skeleton was built for a different (n_hess, natoms); "
+                f"got skeleton ({skeleton.n_hess}, {skeleton.natoms}) vs "
+                f"this ({len(hessians)}, {self.natoms})"
+            )
+        self._skeleton = skeleton
+        self._build_value_views()
+
+    def _build_value_views(self):
+        """Stitch fresh per-coord vals onto the cached skeleton.
+
+        ``vals_flat`` is rebuilt on every call (it tracks atomic positions
+        via the per-coord Hessian values), but the index arrays are reused
+        from the skeleton.
+        """
+        hessians = self.hessians
+        self._batched_rdot = {}
+        self._batched_ldot = {}
+        for size, meta in self._skeleton.rdot_meta.items():
+            orig_idx = meta['orig_idx']
+            # Stack the current Hessian values for this size group.
+            vals = np.array([hessians[i].vals for i in orig_idx])
+            self._batched_rdot[size] = {
+                'orig_idx': orig_idx,
+                'indices': meta['indices'],
+                'vals': vals,
+            }
+            ldot_meta = self._skeleton.ldot_meta[size]
+            # Reorder vals: (batch, size, 3, size, 3) -> (batch, size*size*9)
+            vals_reordered = vals.transpose(0, 1, 3, 2, 4)
+            vals_flat = vals_reordered.reshape(ldot_meta['batch'], -1)
             self._batched_ldot[size] = {
                 'orig_idx': orig_idx,
                 'vals_flat': vals_flat,
-                'row_atoms': row_atoms,
-                'col_atoms': col_atoms,
-                'i_full': i_full,
-                'j_full': j_full,
+                'linear_idx': ldot_meta['linear_idx'],
             }
 
     def asarray(self) -> np.ndarray:
@@ -482,25 +600,23 @@ class SparseInternalHessians:
         return arr
 
     def ldot(self, v: np.ndarray) -> np.ndarray:
-        """Vectorized left dot: v^T @ D -> (ndof, ndof) matrix."""
-        M = np.zeros((self.natoms, 3, self.natoms, 3))
+        """Vectorized left dot: v^T @ D -> (ndof, ndof) matrix.
+
+        Uses np.bincount on a precomputed flat 1D index instead of np.add.at
+        on a 4D index. bincount handles duplicate indices in vectorized C
+        code, while np.add.at falls back to a Python-level loop for repeats.
+        On NACJAF (120 atoms, 72 constraints) this is ~2.5× faster.
+        """
+        n_dof = self.natoms * 3
+        M_flat = np.zeros(n_dof * n_dof)
 
         for size, data in self._batched_ldot.items():
-            orig_idx = data['orig_idx']
-            vals_flat = data['vals_flat']
-            row_atoms = data['row_atoms']
-            col_atoms = data['col_atoms']
-            i_full = data['i_full']
-            j_full = data['j_full']
+            weights = v[data['orig_idx']]
+            weighted = (data['vals_flat'] * weights[:, None]).ravel()
+            M_flat += np.bincount(data['linear_idx'], weights=weighted,
+                                  minlength=n_dof * n_dof)
 
-            weights = v[orig_idx]
-            weighted = vals_flat * weights[:, None]
-
-            np.add.at(M, (row_atoms.ravel(), i_full.ravel(),
-                         col_atoms.ravel(), j_full.ravel()),
-                      weighted.ravel())
-
-        return M.reshape(self.shape[1:])
+        return M_flat.reshape((n_dof, n_dof))
 
     def rdot(self, v: np.ndarray) -> np.ndarray:
         """Vectorized right dot: D @ v -> (nhess, ndof) matrix."""
