@@ -9,6 +9,8 @@ from itertools import (
 from functools import partialmethod
 import warnings
 
+from scipy import sparse
+from scipy.linalg import svdvals
 import numpy as np
 from ase import Atom, Atoms, units
 from ase.cell import Cell
@@ -22,7 +24,8 @@ import jax.numpy as jnp
 from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap, jvp, device_get
 
 from sella.linalg import (
-    SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians
+    SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians,
+    SparseInternalHessiansSkeleton
 )
 
 
@@ -32,7 +35,7 @@ from sella.linalg import (
 # Creating ASE Atoms objects has significant overhead (Atoms.__init__ validates
 # positions, sets up constraints, etc.). This lightweight wrapper provides just
 # the positions and cell attributes needed for coordinate calculations, reducing
-# Atoms.__init__ calls (~79% reduction).
+# Atoms.__init__ calls from ~1258 to ~266 per optimization run (~79% reduction).
 # =============================================================================
 
 class LightAtoms:
@@ -77,63 +80,109 @@ def _dihedral_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
     return jnp.arctan2(numer, denom)
 
 
+# Batched gradient functions: input shapes (n_coords, n_atoms, 3), (n_coords, n_vecs, 3)
+# Output shapes: (n_coords, n_atoms, 3)
+_bond_grad_batched = jit(vmap(grad(_bond_value, argnums=0), in_axes=(0, 0)))
+_angle_grad_batched = jit(vmap(grad(_angle_value, argnums=0), in_axes=(0, 0)))
+_dihedral_grad_batched = jit(vmap(grad(_dihedral_value, argnums=0), in_axes=(0, 0)))
+
+# Batched value functions
+_bond_value_batched = jit(vmap(_bond_value, in_axes=(0, 0)))
+_angle_value_batched = jit(vmap(_angle_value, in_axes=(0, 0)))
+_dihedral_value_batched = jit(vmap(_dihedral_value, in_axes=(0, 0)))
+
+# Batched hessian functions: output shapes (n_coords, n_atoms, 3, n_atoms, 3)
+_bond_hess_batched = jit(vmap(jacfwd(grad(_bond_value, argnums=0), argnums=0), in_axes=(0, 0)))
+_angle_hess_batched = jit(vmap(jacfwd(grad(_angle_value, argnums=0), argnums=0), in_axes=(0, 0)))
+_dihedral_hess_batched = jit(vmap(jacfwd(grad(_dihedral_value, argnums=0), argnums=0), in_axes=(0, 0)))
+
 # =============================================================================
-# Factory functions for creating batched JAX operations
+# Hessian-vector product (HVP) functions using forward-over-reverse mode
 # =============================================================================
-# These factories eliminate code duplication by generating value, gradient,
-# hessian, and HVP functions from a single coordinate value function.
+# These compute H @ v directly without materializing the full Hessian matrix.
+# Uses jvp(grad(f), x, v) which is O(n) instead of O(n²) for forming full Hessian.
 # =============================================================================
 
-def _make_batched_ops(func):
-    """Factory for batched value/gradient/hessian functions.
-
-    Args:
-        func: Coordinate value function with signature (pos, tvec) -> float
-
-    Returns:
-        Tuple of (value_batched, grad_batched, hess_batched) functions
-    """
-    return (
-        jit(vmap(func, in_axes=(0, 0))),
-        jit(vmap(grad(func, argnums=0), in_axes=(0, 0))),
-        jit(vmap(jacfwd(grad(func, argnums=0), argnums=0), in_axes=(0, 0))),
-    )
+def _bond_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+    """Compute Hessian @ tangent for a single bond without forming the Hessian."""
+    primals = (pos, tvec)
+    tangents = (tangent, jnp.zeros_like(tvec))
+    _, hvp_result = jvp(grad(_bond_value, argnums=0), primals, tangents)
+    return hvp_result
 
 
-def _make_hvp_single(func):
-    """Factory for Hessian-vector product function.
-
-    Uses forward-over-reverse mode: jvp(grad(f), x, v) computes H @ v
-    in O(n) instead of O(n²) for forming full Hessian.
-
-    Args:
-        func: Coordinate value function with signature (pos, tvec) -> float
-
-    Returns:
-        HVP function with signature (pos, tvec, tangent) -> hvp_result
-    """
-    def hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
-        primals = (pos, tvec)
-        tangents = (tangent, jnp.zeros_like(tvec))
-        _, hvp_result = jvp(grad(func, argnums=0), primals, tangents)
-        return hvp_result
-    return hvp_single
+def _angle_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+    """Compute Hessian @ tangent for a single angle without forming the Hessian."""
+    primals = (pos, tvec)
+    tangents = (tangent, jnp.zeros_like(tvec))
+    _, hvp_result = jvp(grad(_angle_value, argnums=0), primals, tangents)
+    return hvp_result
 
 
-# Create batched operations for each coordinate type
-# Input shapes: (n_coords, n_atoms, 3), (n_coords, n_vecs, 3)
-# Value output: (n_coords,), Grad output: (n_coords, n_atoms, 3)
-# Hessian output: (n_coords, n_atoms, 3, n_atoms, 3)
-_bond_value_batched, _bond_grad_batched, _bond_hess_batched = _make_batched_ops(_bond_value)
-_angle_value_batched, _angle_grad_batched, _angle_hess_batched = _make_batched_ops(_angle_value)
-_dihedral_value_batched, _dihedral_grad_batched, _dihedral_hess_batched = _make_batched_ops(_dihedral_value)
+def _dihedral_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+    """Compute Hessian @ tangent for a single dihedral without forming the Hessian."""
+    primals = (pos, tvec)
+    tangents = (tangent, jnp.zeros_like(tvec))
+    _, hvp_result = jvp(grad(_dihedral_value, argnums=0), primals, tangents)
+    return hvp_result
+
 
 # Batched HVP functions: compute H @ v for all coords at once
 # Input shapes: pos (n_coords, n_atoms, 3), tvec (n_coords, n_vecs, 3), tangent (n_coords, n_atoms, 3)
 # Output shapes: (n_coords, n_atoms, 3)
-_bond_hvp_batched = jit(vmap(_make_hvp_single(_bond_value), in_axes=(0, 0, 0)))
-_angle_hvp_batched = jit(vmap(_make_hvp_single(_angle_value), in_axes=(0, 0, 0)))
-_dihedral_hvp_batched = jit(vmap(_make_hvp_single(_dihedral_value), in_axes=(0, 0, 0)))
+_bond_hvp_batched = jit(vmap(_bond_hvp_single, in_axes=(0, 0, 0)))
+_angle_hvp_batched = jit(vmap(_angle_hvp_single, in_axes=(0, 0, 0)))
+_dihedral_hvp_batched = jit(vmap(_dihedral_hvp_single, in_axes=(0, 0, 0)))
+
+
+# =============================================================================
+# Cell-derivative functions for unit cell optimization
+# =============================================================================
+# These compute derivatives of internal coordinates with respect to cell matrix.
+# Used for coupled atomic + cell optimization in periodic systems.
+#
+# The chain rule is: d(coord)/d(cell) = d(coord)/d(tvec) @ d(tvec)/d(cell)
+# Since tvec = ncvec @ cell, we have d(tvec)/d(cell) = ncvec (Kronecker structure)
+# =============================================================================
+
+def _bond_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+    """Bond length with cell as explicit parameter for autodiff."""
+    tvec = ncvec @ cell  # (1, 3) @ (3, 3) -> (1, 3)
+    return jnp.linalg.norm(pos[1] - pos[0] + tvec[0])
+
+
+def _angle_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+    """Angle with cell as explicit parameter for autodiff."""
+    tvec = ncvec @ cell  # (2, 3) @ (3, 3) -> (2, 3)
+    dx1 = -(pos[1] - pos[0] + tvec[0])
+    dx2 = pos[2] - pos[1] + tvec[1]
+    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
+    return jnp.arccos(cos_angle)
+
+
+def _dihedral_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+    """Dihedral angle with cell as explicit parameter for autodiff."""
+    tvec = ncvec @ cell  # (3, 3) @ (3, 3) -> (3, 3)
+    dx1 = pos[1] - pos[0] + tvec[0]
+    dx2 = pos[2] - pos[1] + tvec[1]
+    dx3 = pos[3] - pos[2] + tvec[2]
+    numer = dx2 @ jnp.cross(jnp.cross(dx1, dx2), jnp.cross(dx2, dx3))
+    denom = jnp.linalg.norm(dx2) * jnp.cross(dx1, dx2) @ jnp.cross(dx2, dx3)
+    return jnp.arctan2(numer, denom)
+
+
+# Single-coordinate cell gradients: output shape (3, 3) for d(coord)/d(cell)
+_bond_cell_grad_single = jit(grad(_bond_with_cell, argnums=2))
+_angle_cell_grad_single = jit(grad(_angle_with_cell, argnums=2))
+_dihedral_cell_grad_single = jit(grad(_dihedral_with_cell, argnums=2))
+
+# Batched cell gradients: input (n_coords, n_atoms, 3), (n_coords, n_vecs, 3), (3, 3)
+# Output: (n_coords, 3, 3)
+# Note: cell is NOT batched (same cell for all coords), so in_axes=(0, 0, None)
+_bond_cell_grad_batched = jit(vmap(_bond_cell_grad_single, in_axes=(0, 0, None)))
+_angle_cell_grad_batched = jit(vmap(_angle_cell_grad_single, in_axes=(0, 0, None)))
+_dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0, None)))
 
 
 # =============================================================================
@@ -388,6 +437,31 @@ class Internal(Coordinate):
         )
         return np.array(self._eval2(atoms.positions[self.indices], tvecs))
 
+    @staticmethod
+    def _eval_cell_grad(
+        pos: jnp.ndarray, ncvecs: jnp.ndarray, cell: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Compute gradient of coordinate with respect to cell matrix.
+
+        Must be overridden in subclasses (Bond, Angle, Dihedral).
+        Returns shape (3, 3) for d(coord)/d(cell).
+        """
+        raise NotImplementedError
+
+    def calc_cell_gradient(self, atoms: Atoms) -> np.ndarray:
+        """Compute gradient of this coordinate w.r.t. cell matrix.
+
+        Returns:
+            np.ndarray: Shape (3, 3) array of d(coord)/d(cell[i,j])
+        """
+        ncvecs = jnp.asarray(self.kwargs['ncvecs'], dtype=np.float64)
+        cell = jnp.asarray(
+            atoms.cell.array,
+            dtype=np.float64
+        )
+        pos = jnp.asarray(atoms.positions[self.indices], dtype=np.float64)
+        return np.array(self._eval_cell_grad(pos, ncvecs, cell))
+
 
 def _translation(
     pos: jnp.ndarray,
@@ -511,6 +585,85 @@ def _rotation(
     return 2 * q[axis + 1] * asinc(q[0])
 
 
+def _rotation_3axis_masked(
+    pos: jnp.ndarray, refpos: jnp.ndarray, mask: jnp.ndarray
+) -> jnp.ndarray:
+    """All 3 rotation values for one fragment, padded + masked.
+
+    Returns an array of length 3 (one value per rotation axis). The
+    fragment is assumed centered: ``refpos`` is already the centered
+    reference, padded rows are zero. ``mask`` is 1 on real atoms and 0
+    on padding so the centroid divides by the actual atom count.
+    """
+    pos_eff = pos * mask[:, None]
+    natoms = jnp.sum(mask)
+    centroid = jnp.sum(pos_eff, axis=0) / natoms
+    dx = (pos - centroid) * mask[:, None]
+    refpos_centered = refpos * mask[:, None]
+    R = dx.T @ refpos_centered
+    Rtr = jnp.trace(R)
+    Ftop = jnp.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
+    F = jnp.block([
+        [Rtr, Ftop[None, :]],
+        [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
+    ])
+    q = eigh_rightmost(F)
+    q = q * jnp.where(q[0] >= 0, 1.0, -1.0)
+    a = asinc(q[0])
+    return jnp.stack([2 * q[1] * a, 2 * q[2] * a, 2 * q[3] * a])
+
+
+_rotation_3axis_hess_batched = jit(vmap(
+    jacfwd(jacfwd(_rotation_3axis_masked, argnums=0), argnums=0),
+    in_axes=(0, 0, 0)
+))
+
+
+_rotation_3axis_value_batched = jit(vmap(
+    _rotation_3axis_masked,
+    in_axes=(0, 0, 0)
+))
+
+
+_rotation_3axis_grad_batched = jit(vmap(
+    jacfwd(_rotation_3axis_masked, argnums=0),
+    in_axes=(0, 0, 0)
+))
+
+
+def _rotation_3axis_hvp(pos, refpos, mask, v):
+    """HVP for one fragment, all 3 axes at once.
+
+    Returns shape (3, N, 3) — the directional derivative of the
+    Jacobian (3, N, 3) along v (N, 3).
+    """
+    primals = (pos,)
+    tangents = (v,)
+    _, hvp = jvp(
+        lambda p: jacfwd(_rotation_3axis_masked, argnums=0)(p, refpos, mask),
+        primals, tangents
+    )
+    return hvp
+
+
+_rotation_3axis_hvp_batched_jit = jit(
+    vmap(_rotation_3axis_hvp, in_axes=(0, 0, 0, 0))
+)
+
+
+def _rotation_hess_padded_vmap(positions, refpos_padded, mask):
+    """JIT+vmap'd Hessian for all rotations of one fragment, batched.
+
+    positions: (B, N_max, 3) — fragment positions, padded
+    refpos_padded: (B, N_max, 3) — fragment refpos, centered+padded
+    mask: (B, N_max) — 1 on real atoms, 0 on padding
+
+    Returns: (B, 3, N_max, 3, N_max, 3) — per-fragment, per-axis, full
+    NxN Hessian with padded rows/cols zeroed out.
+    """
+    return _rotation_3axis_hess_batched(positions, refpos_padded, mask)
+
+
 def _rotation_hvp(
     pos: jnp.ndarray,
     axis: int,
@@ -557,7 +710,7 @@ class Rotation(Coordinate):
             return False
         if set(self.indices) != set(other.indices):
             return False
-        if np.any(self.kwargs['refpos'] != other.kwargs['refpos']):
+        if not np.allclose(self.kwargs['refpos'], other.kwargs['refpos']):
             return False
         return True
 
@@ -601,7 +754,7 @@ class Displacement(Coordinate):
     def __eq__(self, other: Coordinate) -> bool:
         if not Coordinate.__eq__(self, other):
             return False
-        return np.all(self.kwargs['refpos'] == other.kwargs['refpos'])
+        return np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
 
     _eval0 = staticmethod(jit(_displacement))
     _eval1 = staticmethod(jit(_gradient(_displacement)))
@@ -622,6 +775,7 @@ class Bond(Internal):
     _eval0 = staticmethod(jit(_bond))
     _eval1 = staticmethod(_gradient(_bond))
     _eval2 = staticmethod(_hessian(_bond))
+    _eval_cell_grad = staticmethod(_bond_cell_grad_single)
 
     def calc_vec(self, atoms: Atoms) -> np.ndarray:
         tvecs = np.asarray(
@@ -648,6 +802,7 @@ class Angle(Internal):
     _eval0 = staticmethod(jit(_angle))
     _eval1 = staticmethod(_gradient(_angle))
     _eval2 = staticmethod(_hessian(_angle))
+    _eval_cell_grad = staticmethod(_angle_cell_grad_single)
 
 
 def _dihedral(
@@ -667,6 +822,7 @@ class Dihedral(Internal):
     _eval0 = staticmethod(jit(_dihedral))
     _eval1 = staticmethod(_gradient(_dihedral))
     _eval2 = staticmethod(_hessian(_dihedral))
+    _eval_cell_grad = staticmethod(_dihedral_cell_grad_single)
 
 
 Bond.union = Angle
@@ -738,17 +894,24 @@ class BaseInternals:
         self.dummies = dummies
         self.dinds = dinds
 
-        # Cache atom count (atoms are never added/removed during optimization)
+        # Cache atom count (doesn't change during optimization)
         self._natoms = len(atoms)
 
         self.internals = {key: [] for key in self._names}
+        self._internals_set = {key: set() for key in self._names}
         self._active = {key: [] for key in self._names}
         self.cell = None
         self.rcell = None
+        self._rcell_reciprocal_T = None
         self.op = None
+        self._hessian_skeleton = None
 
         # Batched arrays for vectorized computation (built lazily)
         self._batched_arrays_valid = False
+
+        # Lazy caches.
+        self._tvecs_cache = None  # set to {'cell_hash': ..., 'tvecs': ...} on first build
+        self._hvp_buf = None  # reusable buffer for hessian_rdot output
 
     @property
     def natoms(self) -> int:
@@ -757,6 +920,10 @@ class BaseInternals:
     @property
     def ndummies(self) -> int:
         return len(self.dummies)
+
+    @property
+    def ndof(self) -> int:
+        return 3 * (self._natoms + len(self.dummies))
 
     @property
     def ntrans(self) -> int:
@@ -798,15 +965,21 @@ class BaseInternals:
         return len(self._active_indices)
 
     @property
-    def ndof(self) -> int:
-        return 3 * (self._natoms + len(self.dummies))
-
-    @property
     def all_positions(self) -> np.ndarray:
-        """Get combined positions without creating an Atoms object."""
-        if self.ndummies > 0:
-            return np.vstack([self.atoms.positions, self.dummies.positions])
-        return self.atoms.positions
+        """Get combined positions without creating an Atoms object.
+
+        Cached on ``self._cache['all_positions']`` so repeated reads
+        within a single position evaluation reuse the same vstack.
+        ``_cache_check`` clears the cache whenever positions change.
+        """
+        if self.ndummies == 0:
+            return self.atoms.positions
+        cached = self._cache.get('all_positions')
+        if cached is not None:
+            return cached
+        merged = np.vstack([self.atoms.positions, self.dummies.positions])
+        self._cache['all_positions'] = merged
+        return merged
 
     @property
     def all_atoms(self) -> Atoms:
@@ -815,7 +988,7 @@ class BaseInternals:
     @property
     def light_atoms(self) -> LightAtoms:
         """Get lightweight atoms-like object for coordinate calculations."""
-        cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+        cell = self.atoms.cell.array
         return LightAtoms(self.all_positions, cell)
 
     def _cache_check(self) -> None:
@@ -823,7 +996,10 @@ class BaseInternals:
         # the last time a property was calculated. These positions are floats,
         # but we use a strict equality check to compare to avoid subtle bugs
         # that might occur during fine-resolution geodesic steps.
-        current_pos = self.all_positions
+        if self.ndummies == 0:
+            current_pos = self.atoms.positions
+        else:
+            current_pos = np.vstack([self.atoms.positions, self.dummies.positions])
         if (
             self._lastpos is None
             or np.any(current_pos != self._lastpos)
@@ -831,6 +1007,10 @@ class BaseInternals:
             self._cache = dict()
             self._lastpos = current_pos.copy()
             self._cache_version += 1
+        # Park the freshly-merged positions in the cache so the next
+        # all_positions access doesn't redo the vstack.
+        if self.ndummies > 0:
+            self._cache.setdefault('all_positions', self._lastpos)
 
     def _build_batched_arrays(self) -> None:
         """Build batched index arrays for vectorized computation.
@@ -921,6 +1101,84 @@ class BaseInternals:
             self._dihedral_mask = np.empty(0, dtype=np.float64)
             self._n_dihedrals_actual = 0
 
+        # Precompute flat column indices for direct scatter in hessian_rdot.
+        # For bond (a,b), the non-zero columns in the (ndof,) output are
+        # [3a, 3a+1, 3a+2, 3b, 3b+1, 3b+2].  Analogous for angles (9 cols)
+        # and dihedrals (12 cols).  These are topology-dependent and
+        # invalidated together with the rest of the batched arrays.
+        offsets = np.arange(3)
+        if self._n_bonds_actual > 0:
+            bi = self._bond_indices  # (n_bonds, 2)
+            self._bond_flat_cols = np.concatenate([
+                bi[:, k:k+1] * 3 + offsets for k in range(2)
+            ], axis=1)  # (n_bonds, 6)
+        else:
+            self._bond_flat_cols = np.empty((0, 6), dtype=np.intp)
+
+        if self._n_angles_actual > 0:
+            ai = self._angle_indices  # (n_angles, 3)
+            self._angle_flat_cols = np.concatenate([
+                ai[:, k:k+1] * 3 + offsets for k in range(3)
+            ], axis=1)  # (n_angles, 9)
+        else:
+            self._angle_flat_cols = np.empty((0, 9), dtype=np.intp)
+
+        if self._n_dihedrals_actual > 0:
+            di = self._dihedral_indices  # (n_dihedrals, 4)
+            self._dihedral_flat_cols = np.concatenate([
+                di[:, k:k+1] * 3 + offsets for k in range(4)
+            ], axis=1)  # (n_dihedrals, 12)
+        else:
+            self._dihedral_flat_cols = np.empty((0, 12), dtype=np.intp)
+
+        # Build CSR structure for sparse hessian_rdot output.
+        # Bonds/angles/dihedrals have fixed nnz per row (6/9/12).
+        # Translations have zero rows. Rotations/other are dense (ndof cols).
+        ndof = self.ndof
+        n_trans = len(self.internals['translations'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+        n_active = (n_trans + self._n_bonds_actual + self._n_angles_actual
+                    + self._n_dihedrals_actual + n_other + n_rot)
+
+        col_blocks = []
+        nnz_per_row = []
+
+        # Translations: zero rows
+        for _ in range(n_trans):
+            nnz_per_row.append(0)
+
+        # Bonds: 6 nnz per row
+        if self._n_bonds_actual > 0:
+            col_blocks.append(self._bond_flat_cols.ravel())
+            nnz_per_row.extend([6] * self._n_bonds_actual)
+
+        # Angles: 9 nnz per row
+        if self._n_angles_actual > 0:
+            col_blocks.append(self._angle_flat_cols.ravel())
+            nnz_per_row.extend([9] * self._n_angles_actual)
+
+        # Dihedrals: 12 nnz per row
+        if self._n_dihedrals_actual > 0:
+            col_blocks.append(self._dihedral_flat_cols.ravel())
+            nnz_per_row.extend([12] * self._n_dihedrals_actual)
+
+        # Other/rotations: dense rows (ndof cols each)
+        for _ in range(n_other + n_rot):
+            col_blocks.append(np.arange(ndof))
+            nnz_per_row.append(ndof)
+
+        self._csr_indptr = np.zeros(n_active + 1, dtype=np.int32)
+        np.cumsum(nnz_per_row, out=self._csr_indptr[1:])
+        self._csr_indices = np.concatenate(col_blocks).astype(np.int32) if col_blocks else np.empty(0, dtype=np.int32)
+        self._csr_data = np.zeros(len(self._csr_indices), dtype=np.float64)
+        self._csr_n_active = n_active
+        # Precompute data offset for each section
+        self._csr_bond_offset = n_trans * 0  # bonds start after translations (0 nnz)
+        self._csr_angle_offset = self._csr_bond_offset + self._n_bonds_actual * 6
+        self._csr_dih_offset = self._csr_angle_offset + self._n_angles_actual * 9
+        self._csr_other_offset = self._csr_dih_offset + self._n_dihedrals_actual * 12
+
         self._batched_arrays_valid = True
 
     def _get_cached_tvecs(self, cell: np.ndarray) -> Dict[str, np.ndarray]:
@@ -932,7 +1190,7 @@ class BaseInternals:
         Returns both unpadded tvecs (for indexing) and padded tvecs (for batch ops).
         """
         cell_hash = cell.tobytes()
-        if hasattr(self, '_tvecs_cache') and self._tvecs_cache.get('cell_hash') == cell_hash:
+        if self._tvecs_cache is not None and self._tvecs_cache['cell_hash'] == cell_hash:
             return self._tvecs_cache['tvecs']
 
         self._build_batched_arrays()
@@ -977,161 +1235,152 @@ class BaseInternals:
         """Invalidate batched arrays (call when internals change)."""
         self._batched_arrays_valid = False
 
-    # =========================================================================
-    # Helper methods for batched computation
-    # =========================================================================
-
-    def _compute_batched_for_type(
-        self,
-        positions: np.ndarray,
-        indices_padded: np.ndarray,
-        n_actual: int,
-        tvecs_padded: np.ndarray,
-        jax_func,
-        empty_shape: Tuple[int, ...],
-    ):
-        """Compute batched JAX operation for a single coordinate type.
-
-        Args:
-            positions: Full position array
-            indices_padded: Padded indices array for this coord type
-            n_actual: Actual number of coordinates (before padding)
-            tvecs_padded: Padded translation vectors
-            jax_func: JAX function to apply (value, grad, or hess batched)
-            empty_shape: Shape to use for empty result if n_actual == 0
-
-        Returns:
-            Result array sliced to actual size, or empty array
-        """
-        if n_actual == 0:
-            return np.empty(empty_shape)
-        pos_batch = positions[indices_padded]
-        result_padded = np.asarray(device_get(jax_func(pos_batch, tvecs_padded)))
-        return result_padded[:n_actual]
-
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute all internal coordinate values using vectorized operations."""
+        """Compute all internal coordinate values using vectorized operations.
+
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
+        """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
+        result = {}
 
-        return {
-            'bonds': self._compute_batched_for_type(
-                positions, self._bond_indices_padded, self._n_bonds_actual,
-                tvecs['bonds_padded'], _bond_value_batched, (0,)),
-            'angles': self._compute_batched_for_type(
-                positions, self._angle_indices_padded, self._n_angles_actual,
-                tvecs['angles_padded'], _angle_value_batched, (0,)),
-            'dihedrals': self._compute_batched_for_type(
-                positions, self._dihedral_indices_padded, self._n_dihedrals_actual,
-                tvecs['dihedrals_padded'], _dihedral_value_batched, (0,)),
-        }
+        # Bonds - use padded arrays for consistent JAX shapes
+        if self._n_bonds_actual > 0:
+            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
+            values_padded = np.asarray(device_get(_bond_value_batched(bond_pos, tvecs['bonds_padded'])))
+            result['bonds'] = values_padded[:self._n_bonds_actual]
+        else:
+            result['bonds'] = np.empty(0)
+
+        # Angles
+        if self._n_angles_actual > 0:
+            angle_pos = positions[self._angle_indices_padded]  # (n_padded, 3, 3)
+            values_padded = np.asarray(device_get(_angle_value_batched(angle_pos, tvecs['angles_padded'])))
+            result['angles'] = values_padded[:self._n_angles_actual]
+        else:
+            result['angles'] = np.empty(0)
+
+        # Dihedrals
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = positions[self._dihedral_indices_padded]  # (n_padded, 4, 3)
+            values_padded = np.asarray(device_get(_dihedral_value_batched(dihedral_pos, tvecs['dihedrals_padded'])))
+            result['dihedrals'] = values_padded[:self._n_dihedrals_actual]
+        else:
+            result['dihedrals'] = np.empty(0)
+
+        return result
 
     def _compute_batched_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """Compute all internal coordinate gradients using vectorized operations.
 
         Returns dict mapping coord type to (indices, gradients) tuples.
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
+        result = {}
 
-        return {
-            'bonds': (
-                self._bond_indices,
-                self._compute_batched_for_type(
-                    positions, self._bond_indices_padded, self._n_bonds_actual,
-                    tvecs['bonds_padded'], _bond_grad_batched, (0, 2, 3))),
-            'angles': (
-                self._angle_indices,
-                self._compute_batched_for_type(
-                    positions, self._angle_indices_padded, self._n_angles_actual,
-                    tvecs['angles_padded'], _angle_grad_batched, (0, 3, 3))),
-            'dihedrals': (
-                self._dihedral_indices,
-                self._compute_batched_for_type(
-                    positions, self._dihedral_indices_padded, self._n_dihedrals_actual,
-                    tvecs['dihedrals_padded'], _dihedral_grad_batched, (0, 4, 3))),
-        }
+        # Bonds - use padded arrays
+        if self._n_bonds_actual > 0:
+            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
+            grads_padded = np.asarray(device_get(_bond_grad_batched(bond_pos, tvecs['bonds_padded'])))
+            result['bonds'] = (self._bond_indices, grads_padded[:self._n_bonds_actual])
+        else:
+            result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3)))
+
+        # Angles
+        if self._n_angles_actual > 0:
+            angle_pos = positions[self._angle_indices_padded]
+            grads_padded = np.asarray(device_get(_angle_grad_batched(angle_pos, tvecs['angles_padded'])))
+            result['angles'] = (self._angle_indices, grads_padded[:self._n_angles_actual])
+        else:
+            result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3)))
+
+        # Dihedrals
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = positions[self._dihedral_indices_padded]
+            grads_padded = np.asarray(device_get(_dihedral_grad_batched(dihedral_pos, tvecs['dihedrals_padded'])))
+            result['dihedrals'] = (self._dihedral_indices, grads_padded[:self._n_dihedrals_actual])
+        else:
+            result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3)))
+
+        return result
 
     def _compute_batched_hessians(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """Compute all internal coordinate hessians using vectorized operations.
 
         Returns dict mapping coord type to (indices, hessians) tuples.
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
+        result = {}
 
-        return {
-            'bonds': (
-                self._bond_indices,
-                self._compute_batched_for_type(
-                    positions, self._bond_indices_padded, self._n_bonds_actual,
-                    tvecs['bonds_padded'], _bond_hess_batched, (0, 2, 3, 2, 3))),
-            'angles': (
-                self._angle_indices,
-                self._compute_batched_for_type(
-                    positions, self._angle_indices_padded, self._n_angles_actual,
-                    tvecs['angles_padded'], _angle_hess_batched, (0, 3, 3, 3, 3))),
-            'dihedrals': (
-                self._dihedral_indices,
-                self._compute_batched_for_type(
-                    positions, self._dihedral_indices_padded, self._n_dihedrals_actual,
-                    tvecs['dihedrals_padded'], _dihedral_hess_batched, (0, 4, 3, 4, 3))),
-        }
+        # Bonds - use padded arrays
+        if self._n_bonds_actual > 0:
+            bond_pos = positions[self._bond_indices_padded]
+            hess_padded = np.asarray(device_get(_bond_hess_batched(bond_pos, tvecs['bonds_padded'])))
+            result['bonds'] = (self._bond_indices, hess_padded[:self._n_bonds_actual])
+        else:
+            result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3, 2, 3)))
 
-    # =========================================================================
-    # Helper methods for jacobian/hessian assembly
-    # =========================================================================
+        # Angles
+        if self._n_angles_actual > 0:
+            angle_pos = positions[self._angle_indices_padded]
+            hess_padded = np.asarray(device_get(_angle_hess_batched(angle_pos, tvecs['angles_padded'])))
+            result['angles'] = (self._angle_indices, hess_padded[:self._n_angles_actual])
+        else:
+            result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3, 3, 3)))
 
-    @staticmethod
-    def _scatter_jacobian_batch(
-        B: np.ndarray,
-        row: int,
-        indices: np.ndarray,
-        gradients: np.ndarray,
-        active_mask: List[bool],
-    ) -> int:
-        """Scatter batched gradients into Jacobian matrix.
+        # Dihedrals
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = positions[self._dihedral_indices_padded]
+            hess_padded = np.asarray(device_get(_dihedral_hess_batched(dihedral_pos, tvecs['dihedrals_padded'])))
+            result['dihedrals'] = (self._dihedral_indices, hess_padded[:self._n_dihedrals_actual])
+        else:
+            result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3, 4, 3)))
 
-        Args:
-            B: Jacobian matrix to fill
-            row: Starting row index
-            indices: Coordinate atom indices
-            gradients: Gradient values
-            active_mask: Boolean mask for active coordinates
+        return result
 
-        Returns:
-            New row index after scattering
+    def _compute_batched_cell_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute all internal coordinate cell gradients using vectorized operations.
+
+        Returns dict mapping coord type to cell gradient arrays.
+        Each gradient has shape (n_coords, 3, 3) for d(coord)/d(cell).
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
-        active_arr = np.array(active_mask, dtype=bool)
-        n_active = active_arr.sum()
-        if n_active > 0:
-            rows_idx = np.arange(row, row + n_active)[:, None]
-            B[rows_idx, indices[active_arr]] = gradients[active_arr]
-        return row + n_active
+        self._build_batched_arrays()
+        cell_jax = jnp.asarray(cell, dtype=np.float64)
+        result = {}
 
-    @staticmethod
-    def _append_hessians_batch(
-        hessians: List,
-        n_atoms: int,
-        indices: np.ndarray,
-        hess_values: np.ndarray,
-        active_mask: List[bool],
-    ) -> None:
-        """Append batched hessians to list for active coordinates.
+        # Bonds - use padded arrays for consistent JAX shapes
+        if self._n_bonds_actual > 0:
+            bond_pos = jnp.asarray(positions[self._bond_indices_padded], dtype=np.float64)
+            bond_ncvecs = jnp.asarray(self._bond_ncvecs_padded, dtype=np.float64)
+            grads_padded = np.asarray(device_get(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax)))
+            result['bonds'] = grads_padded[:self._n_bonds_actual]
+        else:
+            result['bonds'] = np.empty((0, 3, 3))
 
-        Args:
-            hessians: List to append SparseInternalHessian objects to
-            n_atoms: Total number of atoms
-            indices: Coordinate atom indices
-            hess_values: Hessian values
-            active_mask: Boolean mask for active coordinates
-        """
-        active_arr = np.array(active_mask, dtype=bool)
-        if active_arr.any():
-            active_idx = indices[active_arr]
-            active_hess = hess_values[active_arr]
-            for i in range(len(active_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_idx[i], active_hess[i].copy()))
+        # Angles
+        if self._n_angles_actual > 0:
+            angle_pos = jnp.asarray(positions[self._angle_indices_padded], dtype=np.float64)
+            angle_ncvecs = jnp.asarray(self._angle_ncvecs_padded, dtype=np.float64)
+            grads_padded = np.asarray(device_get(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax)))
+            result['angles'] = grads_padded[:self._n_angles_actual]
+        else:
+            result['angles'] = np.empty((0, 3, 3))
+
+        # Dihedrals
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = jnp.asarray(positions[self._dihedral_indices_padded], dtype=np.float64)
+            dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs_padded, dtype=np.float64)
+            grads_padded = np.asarray(device_get(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax)))
+            result['dihedrals'] = grads_padded[:self._n_dihedrals_actual]
+        else:
+            result['dihedrals'] = np.empty((0, 3, 3))
+
+        return result
 
     def copy(self) -> 'BaseInternals':
         raise NotImplementedError
@@ -1141,7 +1390,7 @@ class BaseInternals:
         self._cache_check()
         if 'coords' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_vals = self._compute_batched_values(positions, cell)
@@ -1167,9 +1416,13 @@ class BaseInternals:
             for coord in self.internals['other']:
                 all_coords.append(coord.calc(atoms))
 
-            # Rotations (not batched - usually few)
-            for coord in self.internals['rotations']:
-                all_coords.append(coord.calc(atoms))
+            # Rotations (batched if all 3 axes present per fragment)
+            rot_vals = self._batched_rotation_values(positions)
+            if rot_vals is None:
+                for coord in self.internals['rotations']:
+                    all_coords.append(coord.calc(atoms))
+            else:
+                all_coords.extend(rot_vals)
 
             self._cache['coords'] = np.array(all_coords)
 
@@ -1180,9 +1433,17 @@ class BaseInternals:
     def jacobian(self) -> np.ndarray:
         """Calculates the internal coordinate Jacobian matrix using vectorized operations."""
         self._cache_check()
+
+        # If a fully-built B was cached, return it directly. The cache is
+        # invalidated by _cache_check whenever positions change, and the active
+        # mask is stable within a single position evaluation.
+        cached_B = self._cache.get('jacobian_B')
+        if cached_B is not None:
+            return cached_B
+
         if 'jacobian' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_grads = self._compute_batched_gradients(positions, cell)
@@ -1193,8 +1454,10 @@ class BaseInternals:
                           for coord in self.internals['translations']]
             other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
                           for coord in self.internals['other']]
-            rot_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
-                        for coord in self.internals['rotations']]
+            rot_data = self._batched_rotation_gradients(positions)
+            if rot_data is None:
+                rot_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
+                            for coord in self.internals['rotations']]
 
             self._cache['jacobian_batched'] = batched_grads
             self._cache['jacobian_nonbatched'] = (trans_data, other_data, rot_data)
@@ -1239,15 +1502,41 @@ class BaseInternals:
                 np.add.at(B, (row, idx), jac)
                 row += 1
 
-        # Batched scatter for bonds, angles, dihedrals
+        # Bonds (batched) - vectorized scatter
         bond_indices, bond_grads = batched['bonds']
-        row = self._scatter_jacobian_batch(B, row, bond_indices, bond_grads, bonds_active)
+        bonds_active_arr = np.array(bonds_active, dtype=bool)
+        n_active_bonds = bonds_active_arr.sum()
+        if n_active_bonds > 0:
+            active_bond_idx = bond_indices[bonds_active_arr]
+            active_bond_grads = bond_grads[bonds_active_arr]
+            # Vectorized scatter: replace loop with advanced indexing
+            rows_idx = np.arange(row, row + n_active_bonds)[:, None]
+            B[rows_idx, active_bond_idx] = active_bond_grads
+            row += n_active_bonds
 
+        # Angles (batched) - vectorized scatter
         angle_indices, angle_grads = batched['angles']
-        row = self._scatter_jacobian_batch(B, row, angle_indices, angle_grads, angles_active)
+        angles_active_arr = np.array(angles_active, dtype=bool)
+        n_active_angles = angles_active_arr.sum()
+        if n_active_angles > 0:
+            active_angle_idx = angle_indices[angles_active_arr]
+            active_angle_grads = angle_grads[angles_active_arr]
+            # Vectorized scatter
+            rows_idx = np.arange(row, row + n_active_angles)[:, None]
+            B[rows_idx, active_angle_idx] = active_angle_grads
+            row += n_active_angles
 
+        # Dihedrals (batched) - vectorized scatter
         dihedral_indices, dihedral_grads = batched['dihedrals']
-        row = self._scatter_jacobian_batch(B, row, dihedral_indices, dihedral_grads, dihedrals_active)
+        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
+        n_active_dihedrals = dihedrals_active_arr.sum()
+        if n_active_dihedrals > 0:
+            active_dih_idx = dihedral_indices[dihedrals_active_arr]
+            active_dih_grads = dihedral_grads[dihedrals_active_arr]
+            # Vectorized scatter
+            rows_idx = np.arange(row, row + n_active_dihedrals)[:, None]
+            B[rows_idx, active_dih_idx] = active_dih_grads
+            row += n_active_dihedrals
 
         # Other (not batched)
         for i, (idx, jac) in enumerate(other_data):
@@ -1261,7 +1550,265 @@ class BaseInternals:
                 np.add.at(B, (row, idx), jac)
                 row += 1
 
-        return B.reshape((n_active, 3 * n_atoms))
+        result = B.reshape((n_active, 3 * n_atoms))
+        self._cache['jacobian_B'] = result
+        return result
+
+    def cell_jacobian(self) -> np.ndarray:
+        """Compute Jacobian of internal coordinates with respect to cell matrix.
+
+        Returns:
+            np.ndarray: Shape (n_active_coords, 9) matrix where each row is
+                        the flattened d(coord)/d(cell) gradient.
+
+        Note:
+            - Translations, rotations, and other non-periodic coordinates have
+              zero cell derivatives (they don't depend on the cell).
+            - Only bonds, angles, and dihedrals with non-zero ncvecs have
+              non-zero cell derivatives.
+
+        Raises:
+            ValueError: If the system does not have periodic boundary conditions.
+        """
+        if not np.any(self.atoms.pbc):
+            raise ValueError(
+                "cell_jacobian() requires periodic boundary conditions. "
+                "Set atoms.pbc = True for periodic systems."
+            )
+
+        self._cache_check()
+
+        if 'cell_jacobian' not in self._cache:
+            positions = self.all_positions
+            cell = self.atoms.cell.array
+
+            # Compute batched cell gradients for bonds, angles, dihedrals
+            cell_grads = self._compute_batched_cell_gradients(positions, cell)
+            self._cache['cell_jacobian_batched'] = cell_grads
+            self._cache['cell_jacobian'] = object()
+
+        cell_grads = self._cache['cell_jacobian_batched']
+
+        # Get counts for each type
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        # Build active masks per type
+        active_mask = self._active_mask
+        start = 0
+        trans_active = active_mask[start:start+n_trans]
+        start += n_trans
+        bonds_active = active_mask[start:start+n_bonds]
+        start += n_bonds
+        angles_active = active_mask[start:start+n_angles]
+        start += n_angles
+        dihedrals_active = active_mask[start:start+n_dihedrals]
+        start += n_dihedrals
+        other_active = active_mask[start:start+n_other]
+        start += n_other
+        rot_active = active_mask[start:start+n_rot]
+
+        n_active = sum(active_mask)
+        B_cell = np.zeros((n_active, 3, 3))
+        row = 0
+
+        # Translations have zero cell derivatives (they're CoM positions)
+        row += sum(trans_active)
+
+        # Bonds
+        bonds_active_arr = np.array(bonds_active, dtype=bool)
+        n_active_bonds = bonds_active_arr.sum()
+        if n_active_bonds > 0:
+            B_cell[row:row+n_active_bonds] = cell_grads['bonds'][bonds_active_arr]
+            row += n_active_bonds
+
+        # Angles
+        angles_active_arr = np.array(angles_active, dtype=bool)
+        n_active_angles = angles_active_arr.sum()
+        if n_active_angles > 0:
+            B_cell[row:row+n_active_angles] = cell_grads['angles'][angles_active_arr]
+            row += n_active_angles
+
+        # Dihedrals
+        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
+        n_active_dihedrals = dihedrals_active_arr.sum()
+        if n_active_dihedrals > 0:
+            B_cell[row:row+n_active_dihedrals] = cell_grads['dihedrals'][dihedrals_active_arr]
+            row += n_active_dihedrals
+
+        # Other has zero cell derivatives (custom coordinates, not periodic)
+        row += sum(other_active)
+
+        # Rotations have zero cell derivatives
+        row += sum(rot_active)
+
+        # Flatten cell matrix to 9-element vector (row-major order)
+        return B_cell.reshape((n_active, 9))
+
+    def _rotation_padded_inputs(self, positions: np.ndarray):
+        """Build padded (pos, refpos, mask) batches grouped by fragment.
+
+        Returns ``(pos_pad, ref_pad, mask, frag_indices, frag_axis_slots,
+        valid)`` where:
+          pos_pad/ref_pad shape (n_frags, N_max, 3),
+          mask shape (n_frags, N_max),
+          frag_indices: list of np.array per fragment,
+          frag_axis_slots: list of [axis0_idx, axis1_idx, axis2_idx]
+            per fragment (each entry is the original Rotation index),
+          valid: True if all fragments have all 3 axes.
+        Cached per geometry on ``self._cache``.
+        """
+        cached = self._cache.get('rotation_pad')
+        if cached is not None:
+            return cached
+        rotations = self.internals['rotations']
+        if not rotations:
+            out = (None, None, None, [], [], True)
+            self._cache['rotation_pad'] = out
+            return out
+        groups = {}
+        for i, r in enumerate(rotations):
+            key = (tuple(r.indices), r.kwargs['refpos'].tobytes())
+            slot = groups.setdefault(key, [None, None, None])
+            slot[r.kwargs['axis']] = i
+        if any(None in slot for slot in groups.values()):
+            out = (None, None, None, [], [], False)
+            self._cache['rotation_pad'] = out
+            return out
+        n_frags = len(groups)
+        n_max = max(len(r.indices) for r in rotations)
+        pos_pad = np.zeros((n_frags, n_max, 3), dtype=np.float64)
+        ref_pad = np.zeros((n_frags, n_max, 3), dtype=np.float64)
+        mask = np.zeros((n_frags, n_max), dtype=np.float64)
+        frag_indices = []
+        frag_axis_slots = []
+        for fi, slot in enumerate(groups.values()):
+            r0 = rotations[slot[0]]
+            n = len(r0.indices)
+            pos_pad[fi, :n] = positions[r0.indices]
+            ref_pad[fi, :n] = r0.kwargs['refpos']
+            mask[fi, :n] = 1.0
+            frag_indices.append(np.asarray(r0.indices))
+            frag_axis_slots.append(slot)
+        out = (pos_pad, ref_pad, mask, frag_indices, frag_axis_slots, True)
+        self._cache['rotation_pad'] = out
+        return out
+
+    def _batched_rotation_values(self, positions: np.ndarray):
+        """Per-Rotation values via one padded+vmapped JAX dispatch.
+
+        Returns a length-N_rotations list of floats in original order,
+        or None when the heterogeneous fall-back is required.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return []
+        pos_pad, ref_pad, mask, _, slots, valid = self._rotation_padded_inputs(positions)
+        if not valid:
+            return None
+        vals_padded = np.asarray(device_get(_rotation_3axis_value_batched(
+            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
+        )))
+        # vals_padded.shape == (n_frags, 3)
+        out = [None] * len(rotations)
+        for fi, slot in enumerate(slots):
+            for axis, rot_idx in enumerate(slot):
+                out[rot_idx] = float(vals_padded[fi, axis])
+        return out
+
+    def _batched_rotation_gradients(self, positions: np.ndarray):
+        """Per-Rotation gradients via one padded+vmapped JAX dispatch.
+
+        Returns a list of ``(indices, grad)`` tuples in original order,
+        or None when the heterogeneous fall-back is required.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return []
+        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+            self._rotation_padded_inputs(positions)
+        )
+        if not valid:
+            return None
+        grads_padded = np.asarray(device_get(_rotation_3axis_grad_batched(
+            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
+        )))
+        # grads_padded.shape == (n_frags, 3, N_max, 3)
+        out = [None] * len(rotations)
+        for fi, slot in enumerate(slots):
+            n = len(frag_indices[fi])
+            for axis, rot_idx in enumerate(slot):
+                out[rot_idx] = (frag_indices[fi], grads_padded[fi, axis, :n, :])
+        return out
+
+    def _batched_rotation_hessians(self, positions: np.ndarray):
+        """Compute per-Rotation Hessians via one padded+vmapped JAX dispatch.
+
+        Each fragment owns 3 Rotation objects (axes 0,1,2) that share
+        the same atom indices and refpos. We group them by fragment,
+        pad to the max-fragment-size across the system, run one
+        vmapped call to ``_rotation_hess_padded_vmap``, and slice the
+        result back into per-Rotation arrays.
+
+        On AJEYAQ (4 fragments x 3 axes = 12 Rotations) this drops the
+        rotation portion of int.hessian build from ~14ms to ~1ms.
+        Returns a list of ``(indices, hess)`` tuples in the original
+        per-Rotation order, matching the shape Internals.hessian
+        expects.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return []
+        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+            self._rotation_padded_inputs(positions)
+        )
+        if not valid:
+            atoms = self.light_atoms
+            return [(r.indices, np.array(r.calc_hessian(atoms)))
+                    for r in rotations]
+        hess_padded = np.array(device_get(_rotation_hess_padded_vmap(
+            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
+        )))
+        # For linear molecules, the quaternion eigenvalue problem has
+        # degenerate eigenvalues producing NaN second derivatives. The
+        # corresponding rotation is physically meaningless (zero Jacobian),
+        # so replacing NaN with 0 is exact.
+        if np.any(np.isnan(hess_padded)):
+            np.nan_to_num(hess_padded, copy=False)
+        # hess_padded.shape == (n_frags, 3, N_max, 3, N_max, 3)
+        out = [None] * len(rotations)
+        for fi, slot in enumerate(slots):
+            n = len(frag_indices[fi])
+            for axis, rot_idx in enumerate(slot):
+                h = hess_padded[fi, axis, :n, :, :n, :]
+                out[rot_idx] = (frag_indices[fi], h)
+        return out
+
+    def _get_hessian_skeleton(self, hessians):
+        """Return a cached SparseInternalHessiansSkeleton for ``hessians``.
+
+        The skeleton holds index-derived data (per-size groupings, scatter
+        indices) that depend only on which coordinates exist and which
+        atom indices they touch — not on positions or Hessian values. We
+        invalidate by total coord count + active mask, which jointly
+        cover the mutation paths: ``add_dummy_to_internals`` /
+        ``find_all_*`` / ``check_for_bad_internals`` regenerations grow
+        ``self.internals``, while ``apply_inequalities`` /
+        ``validate_inequalities`` flip ``self._active``.
+        """
+        key = (len(hessians), self.natoms + self.ndummies,
+               tuple(self._active_mask))
+        cached = self._hessian_skeleton
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        skeleton = SparseInternalHessiansSkeleton(hessians,
+                                                  self.natoms + self.ndummies)
+        self._hessian_skeleton = (key, skeleton)
+        return skeleton
 
     def hessian(self) -> np.ndarray:
         """Calculates the Hessian matrix for each internal coordinate using vectorized operations."""
@@ -1273,19 +1820,28 @@ class BaseInternals:
 
         if 'hessian' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_hess = self._compute_batched_hessians(positions, cell)
 
-            # Non-batched coords use lightweight atoms
+            # Non-batched coords use lightweight atoms. Translation hessians are
+            # identically zero (translations are linear in positions), so cache
+            # one zero array per (n,) and reuse — avoids 24+ JAX calls per
+            # hessian rebuild on systems with TRICs.
             atoms = self.light_atoms
-            trans_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
-                          for coord in self.internals['translations']]
+            trans_data = []
+            zero_cache = {}
+            for coord in self.internals['translations']:
+                n = len(coord.indices)
+                z = zero_cache.get(n)
+                if z is None:
+                    z = np.zeros((n, 3, n, 3))
+                    zero_cache[n] = z
+                trans_data.append((coord.indices, z))
             other_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
                           for coord in self.internals['other']]
-            rot_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
-                        for coord in self.internals['rotations']]
+            rot_data = self._batched_rotation_hessians(positions)
 
             self._cache['hessian_batched'] = batched_hess
             self._cache['hessian_nonbatched'] = (trans_data, other_data, rot_data)
@@ -1322,36 +1878,57 @@ class BaseInternals:
         n_atoms = self.natoms + self.ndummies
         hessians = []
 
-        # Translations (not batched)
+        # Translations (not batched). Hessian rows are stored in cached
+        # nonbatched data; SparseInternalHessian only reads .vals so views are
+        # safe.
         for i, (idx, hess) in enumerate(trans_data):
             if trans_active[i]:
-                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+                hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
-        # Batched hessian append for bonds, angles, dihedrals
+        # Bonds (batched). Fancy indexing already returns a fresh array; per-row
+        # views into it are read-only consumers, so no per-coord copy is needed.
         bond_indices, bond_hess = batched['bonds']
-        self._append_hessians_batch(hessians, n_atoms, bond_indices, bond_hess, bonds_active)
+        bonds_active_arr = np.asarray(bonds_active, dtype=bool)
+        if bonds_active_arr.any():
+            active_bond_idx = bond_indices[bonds_active_arr]
+            active_bond_hess = bond_hess[bonds_active_arr]
+            for i in range(len(active_bond_idx)):
+                hessians.append(SparseInternalHessian(n_atoms, active_bond_idx[i], active_bond_hess[i]))
 
+        # Angles (batched)
         angle_indices, angle_hess = batched['angles']
-        self._append_hessians_batch(hessians, n_atoms, angle_indices, angle_hess, angles_active)
+        angles_active_arr = np.asarray(angles_active, dtype=bool)
+        if angles_active_arr.any():
+            active_angle_idx = angle_indices[angles_active_arr]
+            active_angle_hess = angle_hess[angles_active_arr]
+            for i in range(len(active_angle_idx)):
+                hessians.append(SparseInternalHessian(n_atoms, active_angle_idx[i], active_angle_hess[i]))
 
+        # Dihedrals (batched)
         dihedral_indices, dihedral_hess = batched['dihedrals']
-        self._append_hessians_batch(hessians, n_atoms, dihedral_indices, dihedral_hess, dihedrals_active)
+        dihedrals_active_arr = np.asarray(dihedrals_active, dtype=bool)
+        if dihedrals_active_arr.any():
+            active_dih_idx = dihedral_indices[dihedrals_active_arr]
+            active_dih_hess = dihedral_hess[dihedrals_active_arr]
+            for i in range(len(active_dih_idx)):
+                hessians.append(SparseInternalHessian(n_atoms, active_dih_idx[i], active_dih_hess[i]))
 
         # Other (not batched)
         for i, (idx, hess) in enumerate(other_data):
             if other_active[i]:
-                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+                hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
         # Rotations (not batched)
         for i, (idx, hess) in enumerate(rot_data):
             if rot_active[i]:
-                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+                hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
-        result = SparseInternalHessians(hessians, self.ndof)
+        result = SparseInternalHessians(hessians, self.ndof,
+                                        skeleton=self._get_hessian_skeleton(hessians))
         self._cache['hessian_result'] = result
         return result
 
-    def hessian_rdot(self, v: np.ndarray) -> np.ndarray:
+    def hessian_rdot(self, v: np.ndarray):
         """Compute Hessian @ v for all internal coordinates using direct HVP.
 
         This computes the same result as hessian().rdot(v) but uses forward-over-reverse
@@ -1362,11 +1939,13 @@ class BaseInternals:
             v: Vector of shape (ndof,) to multiply with each coordinate's Hessian
 
         Returns:
-            Array of shape (n_active_coords, ndof) where each row is H_i @ v
+            Sparse CSR matrix of shape (n_active_coords, ndof) where each row
+            is H_i @ v. Returns dense ndarray as fallback when not all
+            coordinates are active.
         """
         self._cache_check()
         positions = self.all_positions
-        cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+        cell = self.atoms.cell.array
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
 
@@ -1397,22 +1976,294 @@ class BaseInternals:
         start += n_other
         rot_active = active_mask[start:start+n_rot]
 
-        results = []
+        n_active = sum(active_mask)
 
-        # Translations - Hessian is zero (translation is linear: mean of positions)
-        # So HVP is always zero, just append zero rows
+        # Fast path: when all coords are active, use pre-built CSR structure
+        use_sparse = (n_active == self._csr_n_active)
+
+        if use_sparse:
+            data = self._csr_data
+            data[:] = 0
+        else:
+            if (self._hvp_buf is None
+                    or self._hvp_buf.shape != (n_active, ndof)):
+                self._hvp_buf = np.zeros((n_active, ndof))
+            out = self._hvp_buf
+            out[:] = 0
+
+        row = 0  # Current write position in output
+
+        # Translations - Hessian is zero
         n_active_trans = sum(trans_active)
-        if n_active_trans > 0:
-            results.append(np.zeros((n_active_trans, ndof)))
+        # out[row:row+n_active_trans] is already zero from the clear
+        row += n_active_trans
 
-        # Bonds - use batched HVP with vectorized scatter
+        # Launch all JAX HVP computations, deferring device_get
+        # This allows JAX to pipeline the computations before we block on transfer
+
+        bond_jax_result = None
+        bond_active_idx = None
         if bonds_active.any() and self._n_bonds_actual > 0:
             if bonds_active.all():
-                # All bonds active - use padded arrays to avoid recompilation
                 bond_pos = positions[self._bond_indices_padded]
                 bond_tvecs = tvecs['bonds_padded']
                 v_sub = v_atoms[self._bond_indices_padded]
-                hvp_padded = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))
+                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
+                bond_active_idx = self._bond_indices
+            else:
+                bond_active_idx = self._bond_indices[bonds_active]
+                bond_pos = positions[bond_active_idx]
+                bond_tvecs = tvecs['bonds'][bonds_active]
+                v_sub = v_atoms[bond_active_idx]
+                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
+
+        angle_jax_result = None
+        angle_active_idx = None
+        if angles_active.any() and self._n_angles_actual > 0:
+            if angles_active.all():
+                angle_pos = positions[self._angle_indices_padded]
+                angle_tvecs = tvecs['angles_padded']
+                v_sub = v_atoms[self._angle_indices_padded]
+                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+                angle_active_idx = self._angle_indices
+            else:
+                angle_active_idx = self._angle_indices[angles_active]
+                angle_pos = positions[angle_active_idx]
+                angle_tvecs = tvecs['angles'][angles_active]
+                v_sub = v_atoms[angle_active_idx]
+                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+
+        dih_jax_result = None
+        dih_active_idx = None
+        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
+            if dihedrals_active.all():
+                dih_pos = positions[self._dihedral_indices_padded]
+                dih_tvecs = tvecs['dihedrals_padded']
+                v_sub = v_atoms[self._dihedral_indices_padded]
+                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+                dih_active_idx = self._dihedral_indices
+            else:
+                dih_active_idx = self._dihedral_indices[dihedrals_active]
+                dih_pos = positions[dih_active_idx]
+                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
+                v_sub = v_atoms[dih_active_idx]
+                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+
+        # Launch rotation HVPs: one vmapped dispatch per fragment x 3 axes
+        # when all rotations are active and all fragments have all 3 axes.
+        # Otherwise fall back to per-rotation calls.
+        rot_jax_results = []
+        rot_indices = []
+        rot_batched_result = None
+        rot_batched_slots = None
+        rot_batched_frag_indices = None
+        all_rot_active = bool(np.asarray(rot_active, dtype=bool).all())
+        if all_rot_active and self.internals['rotations']:
+            pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+                self._rotation_padded_inputs(positions)
+            )
+        else:
+            valid = False
+        if valid:
+            n_max = mask.shape[1]
+            v_pad = np.zeros((len(frag_indices), n_max, 3), dtype=np.float64)
+            for fi, fi_idx in enumerate(frag_indices):
+                v_pad[fi, :len(fi_idx)] = v_atoms[fi_idx]
+            rot_batched_result = _rotation_3axis_hvp_batched_jit(
+                jnp.asarray(pos_pad), jnp.asarray(ref_pad),
+                jnp.asarray(mask), jnp.asarray(v_pad),
+            )
+            rot_batched_slots = slots
+            rot_batched_frag_indices = frag_indices
+        else:
+            for i, coord in enumerate(self.internals['rotations']):
+                if rot_active[i]:
+                    idx = np.array(coord.indices)
+                    pos = positions[idx]
+                    v_sub = v_atoms[idx]
+                    axis = coord.kwargs['axis']
+                    refpos = coord.kwargs['refpos']
+                    rot_jax_results.append(
+                        (_rotation_hvp_jit(pos, axis, refpos, v_sub), idx)
+                    )
+
+        # Now collect results with device_get and scatter into output
+
+        if bond_jax_result is not None:
+            hvp = np.asarray(device_get(bond_jax_result))
+            if bonds_active.all():
+                hvp = hvp[:self._n_bonds_actual]
+            n_coords = self._n_bonds_actual if bonds_active.all() else int(bonds_active.sum())
+            if use_sparse:
+                off = self._csr_bond_offset
+                data[off:off + n_coords * 6] = hvp.reshape(-1)
+            else:
+                flat_cols = self._bond_flat_cols if bonds_active.all() else self._bond_flat_cols[bonds_active]
+                out[row:row+n_coords, :] = 0
+                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
+            row += n_coords
+
+        if angle_jax_result is not None:
+            hvp = np.asarray(device_get(angle_jax_result))
+            if angles_active.all():
+                hvp = hvp[:self._n_angles_actual]
+            n_coords = self._n_angles_actual if angles_active.all() else int(angles_active.sum())
+            if use_sparse:
+                off = self._csr_angle_offset
+                data[off:off + n_coords * 9] = hvp.reshape(-1)
+            else:
+                flat_cols = self._angle_flat_cols if angles_active.all() else self._angle_flat_cols[angles_active]
+                out[row:row+n_coords, :] = 0
+                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
+            row += n_coords
+
+        if dih_jax_result is not None:
+            hvp = np.asarray(device_get(dih_jax_result))
+            if dihedrals_active.all():
+                hvp = hvp[:self._n_dihedrals_actual]
+            n_coords = self._n_dihedrals_actual if dihedrals_active.all() else int(dihedrals_active.sum())
+            if use_sparse:
+                off = self._csr_dih_offset
+                data[off:off + n_coords * 12] = hvp.reshape(-1)
+            else:
+                flat_cols = self._dihedral_flat_cols if dihedrals_active.all() else self._dihedral_flat_cols[dihedrals_active]
+                out[row:row+n_coords, :] = 0
+                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
+            row += n_coords
+
+        # Other - use existing hessian computation (typically few coords, loop is fine)
+        atoms = self.light_atoms
+        off = self._csr_other_offset if use_sparse else 0
+        for i, coord in enumerate(self.internals['other']):
+            if other_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                if use_sparse:
+                    dense_row = np.zeros(ndof)
+                    dense_row.reshape((-1, 3))[idx] = hvp
+                    data[off:off + ndof] = dense_row
+                    off += ndof
+                else:
+                    out_row = out[row].reshape((-1, 3))
+                    out_row[idx] = hvp
+                row += 1
+
+        # Rotations - collect results (batched or per-rotation)
+        if rot_batched_result is not None:
+            hvp_padded = np.asarray(device_get(rot_batched_result))
+            # hvp_padded.shape == (n_frags, 3, N_max, 3)
+            # Reassemble in original Rotation order
+            ordered = [None] * len(self.internals['rotations'])
+            for fi, slot in enumerate(rot_batched_slots):
+                n = len(rot_batched_frag_indices[fi])
+                for axis, rot_idx in enumerate(slot):
+                    ordered[rot_idx] = (
+                        hvp_padded[fi, axis, :n, :],
+                        rot_batched_frag_indices[fi],
+                    )
+            for i, coord in enumerate(self.internals['rotations']):
+                if not rot_active[i]:
+                    continue
+                hvp, idx = ordered[i]
+                if use_sparse:
+                    dense_row = np.zeros(ndof)
+                    dense_row.reshape((-1, 3))[idx] = hvp
+                    data[off:off + ndof] = dense_row
+                    off += ndof
+                else:
+                    out_row = out[row].reshape((-1, 3))
+                    out_row[idx] = hvp
+                row += 1
+        else:
+            for jax_result, idx in rot_jax_results:
+                hvp = np.asarray(device_get(jax_result))
+                if use_sparse:
+                    dense_row = np.zeros(ndof)
+                    dense_row.reshape((-1, 3))[idx] = hvp
+                    data[off:off + ndof] = dense_row
+                    off += ndof
+                else:
+                    out_row = out[row].reshape((-1, 3))
+                    out_row[idx] = hvp
+                row += 1
+
+        if use_sparse:
+            return sparse.csr_matrix(
+                (data, self._csr_indices, self._csr_indptr),
+                shape=(self._csr_n_active, ndof), copy=False,
+            )
+        return out[:row]
+
+    def hessian_rdot_vecs(self, v: np.ndarray, *us: np.ndarray):
+        """Compute (H_i @ v) · u for all active internal coordinates.
+
+        Equivalent to ``[hessian_rdot(v) @ u for u in us]`` but avoids
+        materializing the dense (n_coords, ndof) matrix.  Each element *i*
+        of a result vector is the dot product of coordinate *i*'s
+        Hessian-vector product row with *u*.
+
+        Args:
+            v: Vector of shape (ndof,) — the HVP direction.
+            *us: One or more vectors of shape (ndof,) to contract with.
+
+        Returns:
+            Tuple of arrays, each of shape (n_active_coords,).
+        """
+        self._cache_check()
+        positions = self.all_positions
+        cell = self.atoms.cell.array
+        self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
+
+        v_atoms = v.reshape((-1, 3))
+        u_atoms_list = [u.reshape((-1, 3)) for u in us]
+        n_us = len(us)
+
+        # Active mask bookkeeping (same as hessian_rdot)
+        active_mask = self._active_mask
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        start = 0
+        trans_active = active_mask[start:start + n_trans]
+        start += n_trans
+        bonds_active = np.array(active_mask[start:start + n_bonds], dtype=bool)
+        start += n_bonds
+        angles_active = np.array(active_mask[start:start + n_angles], dtype=bool)
+        start += n_angles
+        dihedrals_active = np.array(
+            active_mask[start:start + n_dihedrals], dtype=bool
+        )
+        start += n_dihedrals
+        other_active = active_mask[start:start + n_other]
+        start += n_other
+        rot_active = active_mask[start:start + n_rot]
+
+        # Collect per-coordinate-type result fragments for each u
+        results = [[] for _ in range(n_us)]
+
+        # --- Translations: Hessian is zero → dot product is zero ---
+        n_active_trans = sum(trans_active)
+        if n_active_trans > 0:
+            z = np.zeros(n_active_trans)
+            for r in results:
+                r.append(z)
+
+        # --- Bonds ---
+        if bonds_active.any() and self._n_bonds_actual > 0:
+            if bonds_active.all():
+                bond_pos = positions[self._bond_indices_padded]
+                bond_tvecs = tvecs['bonds_padded']
+                v_sub = v_atoms[self._bond_indices_padded]
+                hvp_padded = np.asarray(
+                    device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))
+                )
                 hvp = hvp_padded[:self._n_bonds_actual]
                 active_idx = self._bond_indices
             else:
@@ -1420,21 +2271,26 @@ class BaseInternals:
                 bond_pos = positions[active_idx]
                 bond_tvecs = tvecs['bonds'][bonds_active]
                 v_sub = v_atoms[active_idx]
-                hvp = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))
-            # Vectorized scatter: replace loop with advanced indexing
-            n_coords = len(active_idx)
-            result = np.zeros((n_coords, n_atoms, 3))
-            row_idx = np.arange(n_coords)[:, None]
-            result[row_idx, active_idx] = hvp
-            results.append(result.reshape((n_coords, ndof)))
+                hvp = np.asarray(
+                    device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))
+                )
+            for k, u_atoms in enumerate(u_atoms_list):
+                u_gathered = u_atoms[active_idx]  # (n_bonds, 2, 3)
+                results[k].append(
+                    np.sum(hvp * u_gathered, axis=(1, 2))
+                )
 
-        # Angles - use batched HVP with vectorized scatter
+        # --- Angles ---
         if angles_active.any() and self._n_angles_actual > 0:
             if angles_active.all():
                 angle_pos = positions[self._angle_indices_padded]
                 angle_tvecs = tvecs['angles_padded']
                 v_sub = v_atoms[self._angle_indices_padded]
-                hvp_padded = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))
+                hvp_padded = np.asarray(
+                    device_get(
+                        _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+                    )
+                )
                 hvp = hvp_padded[:self._n_angles_actual]
                 active_idx = self._angle_indices
             else:
@@ -1442,21 +2298,30 @@ class BaseInternals:
                 angle_pos = positions[active_idx]
                 angle_tvecs = tvecs['angles'][angles_active]
                 v_sub = v_atoms[active_idx]
-                hvp = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))
-            # Vectorized scatter
-            n_coords = len(active_idx)
-            result = np.zeros((n_coords, n_atoms, 3))
-            row_idx = np.arange(n_coords)[:, None]
-            result[row_idx, active_idx] = hvp
-            results.append(result.reshape((n_coords, ndof)))
+                hvp = np.asarray(
+                    device_get(
+                        _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+                    )
+                )
+            for k, u_atoms in enumerate(u_atoms_list):
+                u_gathered = u_atoms[active_idx]  # (n_angles, 3, 3)
+                results[k].append(
+                    np.sum(hvp * u_gathered, axis=(1, 2))
+                )
 
-        # Dihedrals - use batched HVP with vectorized scatter
+        # --- Dihedrals ---
         if dihedrals_active.any() and self._n_dihedrals_actual > 0:
             if dihedrals_active.all():
                 dih_pos = positions[self._dihedral_indices_padded]
                 dih_tvecs = tvecs['dihedrals_padded']
                 v_sub = v_atoms[self._dihedral_indices_padded]
-                hvp_padded = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))
+                hvp_padded = np.asarray(
+                    device_get(
+                        _dihedral_hvp_batched(
+                            dih_pos, dih_tvecs, v_sub
+                        )
+                    )
+                )
                 hvp = hvp_padded[:self._n_dihedrals_actual]
                 active_idx = self._dihedral_indices
             else:
@@ -1464,15 +2329,20 @@ class BaseInternals:
                 dih_pos = positions[active_idx]
                 dih_tvecs = tvecs['dihedrals'][dihedrals_active]
                 v_sub = v_atoms[active_idx]
-                hvp = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))
-            # Vectorized scatter
-            n_coords = len(active_idx)
-            result = np.zeros((n_coords, n_atoms, 3))
-            row_idx = np.arange(n_coords)[:, None]
-            result[row_idx, active_idx] = hvp
-            results.append(result.reshape((n_coords, ndof)))
+                hvp = np.asarray(
+                    device_get(
+                        _dihedral_hvp_batched(
+                            dih_pos, dih_tvecs, v_sub
+                        )
+                    )
+                )
+            for k, u_atoms in enumerate(u_atoms_list):
+                u_gathered = u_atoms[active_idx]  # (n_dihedrals, 4, 3)
+                results[k].append(
+                    np.sum(hvp * u_gathered, axis=(1, 2))
+                )
 
-        # Other - use existing hessian computation (typically few coords, loop is fine)
+        # --- Other (typically few coords, loop is fine) ---
         atoms = self.light_atoms
         for i, coord in enumerate(self.internals['other']):
             if other_active[i]:
@@ -1480,11 +2350,13 @@ class BaseInternals:
                 idx = np.array(coord.indices)
                 v_sub = v_atoms[idx]
                 hvp = np.einsum('aibj,bj->ai', hess, v_sub)
-                row = np.zeros(ndof)
-                row.reshape((-1, 3))[idx] = hvp
-                results.append(row[None, :])  # Shape (1, ndof) for consistency
+                for k, u_atoms in enumerate(u_atoms_list):
+                    u_sub = u_atoms[idx]
+                    results[k].append(
+                        np.array([np.sum(hvp * u_sub)])
+                    )
 
-        # Rotations - use O(N) HVP (typically few coords, loop is fine)
+        # --- Rotations ---
         for i, coord in enumerate(self.internals['rotations']):
             if rot_active[i]:
                 idx = np.array(coord.indices)
@@ -1492,14 +2364,25 @@ class BaseInternals:
                 v_sub = v_atoms[idx]
                 axis = coord.kwargs['axis']
                 refpos = coord.kwargs['refpos']
-                hvp = np.asarray(device_get(_rotation_hvp_jit(pos, axis, refpos, v_sub)))
-                row = np.zeros(ndof)
-                row.reshape((-1, 3))[idx] = hvp
-                results.append(row[None, :])  # Shape (1, ndof) for consistency
+                hvp = np.asarray(
+                    device_get(
+                        _rotation_hvp_jit(pos, axis, refpos, v_sub)
+                    )
+                )
+                for k, u_atoms in enumerate(u_atoms_list):
+                    u_sub = u_atoms[idx]
+                    results[k].append(
+                        np.array([np.sum(hvp * u_sub)])
+                    )
 
-        if results:
-            return np.vstack(results)
-        return np.empty((0, ndof))
+        # Concatenate fragments for each u
+        out = []
+        for r in results:
+            if r:
+                out.append(np.concatenate(r))
+            else:
+                out.append(np.empty(0))
+        return tuple(out)
 
     def wrap(self, vec: np.ndarray) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""
@@ -1521,13 +2404,14 @@ class BaseInternals:
 
     def _get_neighbors(self, dx: np.ndarray) -> Iterator[np.ndarray]:
         pbc = self.atoms.pbc
-        if self.cell is None or not np.all(self.cell == self.atoms.cell):
+        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
             self.cell = self.atoms.cell.array.copy()
             rcell, self.op = minkowski_reduce(
                 complete_cell(self.cell), pbc=pbc
             )
             self.rcell = Cell(rcell)
-        dx_sc = dx @ self.rcell.reciprocal().T
+            self._rcell_reciprocal_T = self.rcell.reciprocal().T
+        dx_sc = dx @ self._rcell_reciprocal_T
         offset = np.zeros(3, dtype=np.int32)
         for _ in range(2):
             offset += pbc * ((dx_sc - offset) // 1.).astype(np.int32)
@@ -1598,20 +2482,22 @@ class BaseInternals:
     ) -> None:
         didx = self.dinds[idx]
         assert didx >= 0
+        npos = len(self.all_positions)
         for i, trans in enumerate(self.internals['translations']):
-            if idx in trans.indices:
-                new_indices = (*trans.indices[:-1], didx)
-                new_trans = Translation(new_indices, trans.dim)
+            if idx in trans.indices and didx not in trans.indices:
+                new_indices = (*trans.indices, didx)
+                new_trans = Translation(new_indices, trans.kwargs['dim'])
                 self.internals['translations'][i] = new_trans
 
         for i, rot in enumerate(self.internals['rotations']):
-            if idx in rot.indices[:-1]:
-                new_indices = (*rot.indices[:-1], didx)
-                new_rot = Rotation(
-                    new_indices, rot.axis,
-                    self.all_positions[new_indices]
-                )
-                self.internals['rotations'][i] = new_rot
+            if idx in rot.indices and didx not in rot.indices:
+                new_indices = np.array((*rot.indices, didx), dtype=np.int32)
+                if np.all(new_indices < npos):
+                    new_rot = Rotation(
+                        new_indices, rot.kwargs['axis'],
+                        self.all_positions[new_indices]
+                    )
+                    self.internals['rotations'][i] = new_rot
 
     def check_all_gradients(
         self, delta: float = 1e-4, atol: float = 1e-6
@@ -1669,6 +2555,14 @@ class Constraints(BaseInternals):
         if self.ignore_rotation and self.nrotations:
             res[-self.nrotations:] = 0.
         return res
+
+    def has_inequalities(self) -> bool:
+        """Check if any inequality constraints (lt/gt) exist."""
+        for name in self._names:
+            for kind in self._kind[name]:
+                if kind in ('lt', 'gt'):
+                    return True
+        return False
 
     def disable_satisfied_inequalities(self) -> None:
         for name in self._names:
@@ -1941,6 +2835,7 @@ class Internals(BaseInternals):
             for coord in self.cons.internals[kind]:
                 adder(coord)
         self.allow_fragments = allow_fragments
+        self.fragment_atom_groups = None
 
     def copy(self) -> 'Internals':
         new = self.__class__(
@@ -1953,6 +2848,7 @@ class Internals(BaseInternals):
         )
         for name in self._names:
             new.internals[name] = self.internals[name].copy()
+            new._internals_set[name] = self._internals_set[name].copy()
             new.forbidden[name] = self.forbidden[name].copy()
             new._active[name] = self._active[name].copy()
         return new
@@ -2036,12 +2932,14 @@ class Internals(BaseInternals):
         else:
             ncvecs = self._get_ncvecs(indices, ncvecs, mic)
             new = kind(indices, ncvecs=ncvecs)
+        key = (tuple(new.indices), tuple(map(tuple, new.kwargs['ncvecs'])))
         if (
-            new in self.internals[name]
+            key in self._internals_set[name]
             or new in self.forbidden[name]
         ):
             raise DuplicateInternalError
         self.internals[name].append(new)
+        self._internals_set[name].add(key)
         self._active[name].append(True)
 
     add_bond = partialmethod(_add_internal, Bond, 'bonds')
@@ -2130,6 +3028,112 @@ class Internals(BaseInternals):
                 labels[j] = label
                 Internals.flood_fill(j, nbonds, c10y, labels, label)
 
+    def _find_bonds_vectorized(self, labels, scale, rcov):
+        """Vectorized bond search across all candidate atom pairs.
+
+        Returns a list of (i, j, ts) tuples for bonds that pass the
+        distance threshold, where ts is the integer translation vector.
+        """
+        natoms = self.natoms
+        pos = self.atoms.positions
+        cell = self.atoms.cell.array
+        pbc = self.atoms.pbc
+
+        # Ensure cell/rcell/op are cached
+        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
+            self.cell = self.atoms.cell.array.copy()
+            rcell, self.op = minkowski_reduce(
+                complete_cell(self.cell), pbc=pbc
+            )
+            self.rcell = Cell(rcell)
+            self._rcell_reciprocal_T = self.rcell.reciprocal().T
+
+        # 1. Generate all candidate pairs (i <= j)
+        ii, jj = np.triu_indices(natoms, k=0)
+        # Skip pairs in the same labeled fragment
+        same_frag = (labels[ii] == labels[jj]) & (labels[ii] != -1)
+        keep = ~same_frag
+        ii, jj = ii[keep], jj[keep]
+
+        if len(ii) == 0:
+            return []
+
+        # 2. All pairwise displacements
+        dx = pos[jj] - pos[ii]  # (n_pairs, 3)
+
+        # 3. Pair-dependent offsets (vectorized _get_neighbors logic)
+        dx_sc = dx @ self._rcell_reciprocal_T
+        offset = np.zeros(dx_sc.shape, dtype=np.int32)
+        for _ in range(2):
+            offset += (pbc * ((dx_sc - offset) // 1.)).astype(np.int32)
+
+        # 4. Base translation vectors from PBC dimensions
+        ranges = [np.arange(-1 * p, p + 1) for p in pbc]
+        base_ts = np.array(
+            list(product(*ranges)), dtype=np.int32
+        )  # (n_ts, 3)
+
+        # 5. Shifted translations and Cartesian vectors
+        shifted = base_ts[None, :, :] - offset[:, None, :]  # (n_pairs, n_ts, 3)
+        tvecs_cart = (shifted @ self.op) @ cell  # (n_pairs, n_ts, 3)
+
+        # 6. Distances
+        dists = np.linalg.norm(
+            dx[:, None, :] + tvecs_cart, axis=2
+        )  # (n_pairs, n_ts)
+
+        # 7. Covalent radius threshold
+        thresholds = scale * (rcov[ii] + rcov[jj])
+        bond_mask = dists <= thresholds[:, None]
+
+        # 8. Exclude self-bonds (i==j) with zero translation
+        self_bond = (ii == jj)
+        zero_ts = np.all(shifted @ self.op == 0, axis=2)
+        bond_mask &= ~(self_bond[:, None] & zero_ts)
+
+        # 9. Collect hits
+        pair_idx, ts_idx = np.nonzero(bond_mask)
+        op = self.op
+        results = []
+        for k in range(len(pair_idx)):
+            p = pair_idx[k]
+            t = ts_idx[k]
+            ts = (shifted[p, t] @ op).astype(np.int32)
+            results.append((int(ii[p]), int(jj[p]), ts))
+        return results
+
+    def _wrap_fragment_positions(self, group, cumshifts):
+        """Shift atom positions so fragment atoms are contiguous across PBC.
+
+        BFS from first atom in group, using bond ncvecs to bring each
+        bonded neighbor into the same periodic image. Accumulates shifts
+        along bond chains so molecules spanning multiple cell boundaries
+        are fully contracted. Records cumulative shifts in cumshifts dict
+        for subsequent ncvec correction.
+        """
+        group_set = set(group)
+        cell = np.asarray(self.atoms.cell)
+
+        adj = {i: [] for i in group}
+        for bond in self.internals['bonds']:
+            i, j = bond.indices
+            if i in group_set and j in group_set:
+                ncvec = bond.kwargs['ncvecs'][0]
+                adj[i].append((j, ncvec))
+                adj[j].append((i, -ncvec))
+
+        anchor = group[0]
+        cumshifts[anchor] = np.zeros(3, dtype=int)
+        queue = [anchor]
+        while queue:
+            i = queue.pop(0)
+            for j, ncvec in adj[i]:
+                if j in cumshifts:
+                    continue
+                cumshifts[j] = ncvec + cumshifts[i]
+                self.atoms.positions[j] += cumshifts[j] @ cell
+                queue.append(j)
+
     def find_all_bonds(
         self,
         nbond_cart_thr: int = 6,
@@ -2173,32 +3177,19 @@ class Internals(BaseInternals):
             if self.allow_fragments and not first_run:
                 break
 
-            for i, j in cwr(range(self.natoms), 2):
-                # do not add a bond between atoms belonging to the same
-                # bonding network fragment
-                if labels[i] == labels[j] and labels[i] != -1:
+            candidates = self._find_bonds_vectorized(
+                labels, scale, rcov
+            )
+            for i, j, ts in candidates:
+                try:
+                    self.add_bond((i, j), ts)
+                except DuplicateInternalError:
                     continue
-                dx = self.atoms.positions[j] - self.atoms.positions[i]
-                for ts in self._get_neighbors(dx):
-                    # self-bonding is only allowed if a non-zero periodic
-                    # translation vector is used
-                    if i == j and np.all(ts == np.array((0, 0, 0))):
-                        continue
-                    dist = np.linalg.norm(dx + ts @ self.atoms.cell)
-                    if dist <= scale * (rcov[i] + rcov[j]):
-                        # try to add the bond. it doesn't matter if the
-                        # bond already exists.
-                        try:
-                            self.add_bond((i, j), ts)
-                        except DuplicateInternalError:
-                            continue
-                        if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
-                            c10y[i, nbonds[i]] = j
-                            nbonds[i] += 1
-                            c10y[j, nbonds[j]] = i
-                            nbonds[j] += 1
-                        else:
-                            pass
+                if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
+                    c10y[i, nbonds[i]] = j
+                    nbonds[i] += 1
+                    c10y[j, nbonds[j]] = i
+                    nbonds[j] += 1
             first_run = False
             scale *= 1.05
 
@@ -2211,11 +3202,27 @@ class Internals(BaseInternals):
                     self.add_translation(i)
                 else:
                     groups[label].append(i)
+            cumshifts = {}
+            self.fragment_atom_groups = []
             for group in groups:
                 if not group:
                     continue
+                self._wrap_fragment_positions(group, cumshifts)
+                self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
                 self.add_translation(group)
                 self.add_rotation(group)
+
+            # Update bond ncvecs to match the new wrapped positions.
+            # ncvec_new = ncvec_old - cumshift[j] + cumshift[i]
+            zero = np.zeros(3, dtype=int)
+            for bond in self.internals['bonds']:
+                i, j = bond.indices
+                shift_i = cumshifts.get(i, zero)
+                shift_j = cumshifts.get(j, zero)
+                if np.any(shift_i != 0) or np.any(shift_j != 0):
+                    bond.kwargs['ncvecs'] = np.array(
+                        [bond.kwargs['ncvecs'][0] - shift_j + shift_i]
+                    )
 
     def find_all_angles(
         self,
@@ -2276,6 +3283,7 @@ class Internals(BaseInternals):
                         # Add the dummy atom
                         dpos += self.atoms.positions[j]
                         self.dummies += Atom('X', dpos)
+                        self._batched_arrays_valid = False
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond, replace_ok=False)
@@ -2333,25 +3341,40 @@ class Internals(BaseInternals):
                             )
 
     def find_all_dihedrals(self) -> None:
-        # First, find proper dihedrals from angle combinations
-        for a1, a2 in combinations(self.internals['angles'], 2):
-            try:
-                new = a1 + a2
-            except NoValidInternalError:
-                continue
-            # this is a dihedral that has the same exact atom as both
-            # the first and last atom.
-            if (
-                new.indices[0] == new.indices[3]
-                and np.all(
-                    np.sum(new.kwargs['ncvecs'], axis=0) == np.array((0, 0, 0))
-                )
-            ):
-                continue
-            try:
-                self.add_dihedral(new)
-            except DuplicateInternalError:
-                continue
+        # First, find proper dihedrals from angle combinations.
+        # Group angles by their bond edges so we only try pairs that
+        # share a bond (required for __add__ to succeed).
+        edge_to_angles = {}
+        for angle in self.internals['angles']:
+            i, j, k = angle.indices
+            for edge_key in ((min(i, j), max(i, j)), (min(j, k), max(j, k))):
+                edge_to_angles.setdefault(edge_key, []).append(angle)
+
+        seen_pairs = set()
+        for angles_on_edge in edge_to_angles.values():
+            for a1, a2 in combinations(angles_on_edge, 2):
+                pair_key = (id(a1), id(a2))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                try:
+                    new = a1 + a2
+                except NoValidInternalError:
+                    continue
+                # this is a dihedral that has the same exact atom as both
+                # the first and last atom.
+                if (
+                    new.indices[0] == new.indices[3]
+                    and np.all(
+                        np.sum(new.kwargs['ncvecs'], axis=0)
+                        == np.array((0, 0, 0))
+                    )
+                ):
+                    continue
+                try:
+                    self.add_dihedral(new)
+                except DuplicateInternalError:
+                    continue
 
         # Second, add improper dihedrals for atoms with 3 or 4 neighbors that don't
         # have any proper dihedral passing through them. This is needed because:
@@ -2417,7 +3440,7 @@ class Internals(BaseInternals):
 
     def validate_basis(self) -> None:
         jac = self.jacobian()
-        U, S, VT = np.linalg.svd(jac)
+        S = svdvals(jac)
         ndeloc = np.sum(S > 1e-8)
 
         # If TRICs (translations/rotations) are present, they span the full
@@ -2427,7 +3450,19 @@ class Internals(BaseInternals):
         if has_trics:
             ndof = 3 * (self.natoms + self.ndummies)
         else:
-            ndof = 3 * (self.natoms + self.ndummies) - 6
+            ntot = self.natoms + self.ndummies
+            has_periodic_bonds = any(
+                np.any(bond.kwargs['ncvecs'] != 0)
+                for bond in self.internals['bonds']
+            )
+            if has_periodic_bonds:
+                ndof = 3 * ntot
+            elif ntot <= 1:
+                ndof = 0
+            elif ntot == 2:
+                ndof = 1
+            else:
+                ndof = 3 * ntot - 6
 
         if ndeloc != ndof:
             warnings.warn(
@@ -2450,7 +3485,7 @@ class Internals(BaseInternals):
         self._build_batched_arrays()
         if self._n_angles_actual > 0:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
             tvecs = self._get_cached_tvecs(cell)
             angle_pos = positions[self._angle_indices_padded]
             angle_vals_padded = np.asarray(_angle_value_batched(angle_pos, tvecs['angles_padded']))
@@ -2539,8 +3574,12 @@ class Internals(BaseInternals):
         for angle in self.internals['angles']:
             h0[idx] = self._h0_angle(angle)
             idx += 1
+        dummy_set = set(range(self.natoms, self.natoms + self.ndummies))
         for dihedral in self.internals['dihedrals']:
-            h0[idx] = self._h0_dihedral(dihedral, nbonds)
+            if any(j in dummy_set for j in dihedral.indices):
+                h0[idx] = 0.5 * units.Hartree
+            else:
+                h0[idx] = self._h0_dihedral(dihedral, nbonds)
             idx += 1
         # remaining degrees of freedom are rotations.
         # No idea what a good curvature is for these
