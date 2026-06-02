@@ -3792,9 +3792,10 @@ class Internals(BaseInternals):
     def guess_hessian(self, h0cart=70.) -> np.ndarray:
         nbonds = np.zeros(len(self.all_atoms), dtype=np.int32)
         h0 = np.zeros(self.nint, dtype=np.float64)
+        h0_tr = 0.05 * units.Hartree
         idx = 0
         for trans in self.internals['translations']:
-            h0[idx] = h0cart
+            h0[idx] = h0_tr if self.allow_fragments else h0cart
             idx += 1
         for bond in self.internals['bonds']:
             h0[idx] = self._h0_bond(bond)
@@ -3813,7 +3814,7 @@ class Internals(BaseInternals):
             else:
                 h0[idx] = self._h0_dihedral(dihedral, nbonds)
             idx += 1
-        # remaining degrees of freedom are rotations.
-        # No idea what a good curvature is for these
-        h0[idx:] = 1.
+        for rot in self.internals['rotations']:
+            h0[idx] = h0_tr if self.allow_fragments else h0cart
+            idx += 1
         return np.diag(np.abs(h0))
