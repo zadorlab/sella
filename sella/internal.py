@@ -3503,11 +3503,12 @@ class Internals(BaseInternals):
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond, replace_ok=False)
                     self.add_bond(dbond)
-                    # Fix one dummy angle
+                    # Fix one dummy angle (only one — for linear O1-C-O2
+                    # the angles O1-C-dummy and O2-C-dummy are supplementary,
+                    # so constraining both over-constrains real atoms)
                     dangle1 = b1 + dbond
                     self.cons.fix_angle(dangle1, replace_ok=False)
                     dangle2 = b2 + dbond
-                    self.cons.fix_angle(dangle2, replace_ok=False)
                     # Fix the improper dihedral and update relevant internals
                     if b2.indices[1] == j:
                         b2 = b2.reverse()
