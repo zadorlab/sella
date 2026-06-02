@@ -3498,6 +3498,7 @@ class Internals(BaseInternals):
                         dpos += self.atoms.positions[j]
                         self.dummies += Atom('X', dpos)
                         self._batched_arrays_valid = False
+                        self._cache.pop('all_positions', None)
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond, replace_ok=False)
