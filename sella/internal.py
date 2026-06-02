@@ -560,6 +560,11 @@ def _stabilize_quaternion(F, q_prev):
     ensuring continuity across geometry steps.
     """
     ws, vecs = np.linalg.eigh(F)
+    return _stabilize_quaternion_from_eigh(ws, vecs, q_prev)
+
+
+def _stabilize_quaternion_from_eigh(ws, vecs, q_prev):
+    """Compute branch-stable quaternion from pre-computed eigendecomposition."""
     if q_prev is None:
         q_prev = np.array([1.0, 0.0, 0.0, 0.0])
     top_mask = (ws[-1] - ws) < 1e-10
@@ -617,8 +622,7 @@ def _rotation_3axis_jacobian_np(pos, refpos, q):
                         1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
                         0.0)
 
-    P = np.eye(N) - 1.0 / N
-    Prefpos = P @ refpos
+    Prefpos = refpos  # refpos is already centered at construction
     dFc = _apply_dF(Prefpos, c, N)  # (N, 3, 4)
     dFc_flat = dFc.reshape(N * 3, 4)
     dc_flat = -(vecs @ (safe_inv[:, None] * (vecs.T @ dFc_flat.T))).T  # (N*3, 4)
@@ -802,8 +806,55 @@ def _rotation_hvp_closed(pos, axis, refpos, tangent, q_stable=None):
 
 
 
+def _build_dF_vec_batched(Pref, vec, n_batch, nr):
+    """Compute dF_{k,d} @ vec for all (k,d) in a batched fragment group.
+
+    Parameters
+    ----------
+    Pref : (n_batch, nr, 3), centered reference positions
+    vec  : (n_batch, 4), quaternion-space vector
+
+    Returns
+    -------
+    dF_vec : (n_batch, nr*3, 4)
+    """
+    v0 = vec[:, 0:1]       # (n_batch, 1)
+    v3 = vec[:, 1:]         # (n_batch, 3)
+    Pv3 = np.squeeze(Pref @ v3[:, :, None], -1)  # (n_batch, nr)
+
+    result = np.empty((n_batch, nr, 3, 4))
+    for d in range(3):
+        d1 = (d + 1) % 3
+        d2 = (d + 2) % 3
+        dRtr = Pref[:, :, d]  # (n_batch, nr)
+
+        dFtop_d1 = -Pref[:, :, d2]  # (n_batch, nr)
+        dFtop_d2 = Pref[:, :, d1]   # (n_batch, nr)
+
+        result[:, :, d, 0] = (dRtr * v0
+                              + dFtop_d1 * v3[:, d1:d1+1]
+                              + dFtop_d2 * v3[:, d2:d2+1])
+
+        vd = v3[:, d:d+1]  # (n_batch, 1)
+        for i_ax in range(3):
+            val = -dRtr * v3[:, i_ax:i_ax+1]
+            if i_ax == d:
+                val = val + Pv3
+            val = val + Pref[:, :, i_ax] * vd
+            if i_ax == d1:
+                dFtop_iax = dFtop_d1
+            elif i_ax == d2:
+                dFtop_iax = dFtop_d2
+            else:
+                dFtop_iax = 0.0
+            result[:, :, d, 1 + i_ax] = dFtop_iax * v0 + val
+
+    return result.reshape(n_batch, nr * 3, 4)
+
+
 def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
-                                       q_stable_all=None):
+                                       q_stable_all=None,
+                                       ws_all=None, vecs_all=None):
     """Batched HVP for multiple fragments using closed-form Hessians.
 
     Parameters
@@ -813,6 +864,8 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
     mask : (B, N_max)
     v_pad : (B, N_max, 3)
     q_stable_all : (B, 4), optional stabilized quaternions per fragment
+    ws_all : (B, 4), optional cached eigenvalues per fragment
+    vecs_all : (B, 4, 4), optional cached eigenvectors per fragment
 
     Returns
     -------
@@ -822,7 +875,6 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
     n_real = np.sum(mask, axis=1).astype(int)
     hvp = np.zeros((B, 3, N_max, 3))
 
-    # Group fragments by size to batch same-size eigendecompositions
     size_groups = {}
     for fi in range(B):
         nr = n_real[fi]
@@ -832,101 +884,84 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
         n_batch = len(frag_indices)
         idx = np.array(frag_indices)
 
-        # Extract real atoms for this size group
         pos_group = pos_pad[idx, :nr]    # (n_batch, nr, 3)
         ref_group = ref_pad[idx, :nr]    # (n_batch, nr, 3)
         v_group = v_pad[idx, :nr]        # (n_batch, nr, 3)
 
-        # Build F-matrices for all fragments in this group
-        dx = pos_group - pos_group.mean(axis=1, keepdims=True)  # (n_batch, nr, 3)
-        R = np.einsum('bni,bnj->bij', dx, ref_group)  # (n_batch, 3, 3)
-        Rtr = np.trace(R, axis1=1, axis2=2)  # (n_batch,)
-
-        Ftop = np.stack([
-            R[:, 1, 2] - R[:, 2, 1],
-            R[:, 2, 0] - R[:, 0, 2],
-            R[:, 0, 1] - R[:, 1, 0],
-        ], axis=1)  # (n_batch, 3)
-
-        F = np.zeros((n_batch, 4, 4))
-        F[:, 0, 0] = Rtr
-        F[:, 0, 1:] = Ftop
-        F[:, 1:, 0] = Ftop
-        for i in range(3):
-            F[:, 1+i, 1+i] = -Rtr
-        F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
-
-        # Batched eigendecomposition
-        ws, vecs = np.linalg.eigh(F)  # (n_batch, 4), (n_batch, 4, 4)
-        if q_stable_all is not None:
-            c = q_stable_all[idx]  # (n_batch, 4)
+        if ws_all is not None and vecs_all is not None:
+            ws = ws_all[idx]
+            vecs = vecs_all[idx]
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
         else:
-            c = vecs[:, :, -1]  # (n_batch, 4)
-            sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
-            c *= sign[:, None]
+            dx = pos_group - pos_group.mean(axis=1, keepdims=True)
+            R = np.matmul(dx.swapaxes(1, 2), ref_group)  # (n_batch, 3, 3)
+            Rtr = np.trace(R, axis1=1, axis2=2)
+            Ftop = np.stack([
+                R[:, 1, 2] - R[:, 2, 1],
+                R[:, 2, 0] - R[:, 0, 2],
+                R[:, 0, 1] - R[:, 1, 0],
+            ], axis=1)
+            F = np.zeros((n_batch, 4, 4))
+            F[:, 0, 0] = Rtr
+            F[:, 0, 1:] = Ftop
+            F[:, 1:, 0] = Ftop
+            for i in range(3):
+                F[:, 1+i, 1+i] = -Rtr
+            F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
+            ws, vecs = np.linalg.eigh(F)
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
 
-        gaps = ws - ws[:, -1:]  # (n_batch, 4)
+        gaps = ws - ws[:, -1:]
         safe_inv = np.where(
             np.abs(gaps) > 1e-14,
             1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
             0.0,
-        )  # (n_batch, 4)
+        )
 
-        # Prefpos: P @ refpos for each fragment
-        P = np.eye(nr) - 1.0 / nr
-        Pref = np.einsum('ij,bjk->bik', P, ref_group)  # (n_batch, nr, 3)
+        # refpos is already centered at construction
+        Pref = ref_group
 
-        # Compute dFc for all (k, d) — dF_{k,d} @ c
-        # This is the core per-fragment, per-coordinate computation
-        dFc = np.zeros((n_batch, nr, 3, 4))
-        Pref_c3 = np.einsum('bnj,bj->bn', Pref, c[:, 1:])  # (n_batch, nr)
-
-        for d in range(3):
-            d1 = (d + 1) % 3
-            d2 = (d + 2) % 3
-            dRtr = Pref[:, :, d]  # (n_batch, nr)
-
-            dFtop = np.zeros((n_batch, nr, 3))
-            dFtop[:, :, d1] = -Pref[:, :, d2]
-            dFtop[:, :, d2] = Pref[:, :, d1]
-
-            dFc[:, :, d, 0] = dRtr * c[:, 0:1] + np.einsum('bni,bi->bn', dFtop, c[:, 1:])
-            for i_ax in range(3):
-                val = -dRtr * c[:, 1+i_ax:2+i_ax]
-                if i_ax == d:
-                    val = val + Pref_c3
-                val = val + Pref[:, :, i_ax] * c[:, 1+d:2+d]
-                dFc[:, :, d, 1+i_ax] = dFtop[:, :, i_ax] * c[:, 0:1] + val
-
+        # dFc: dF @ c for all (k,d)
+        dFc_flat = _build_dF_vec_batched(Pref, c, n_batch, nr)  # (n_batch, M, 4)
         M = nr * 3
-        dFc_flat = dFc.reshape(n_batch, M, 4)  # (n_batch, M, 4)
 
-        dE_flat = np.einsum('bmi,bi->bm', dFc_flat, c)  # (n_batch, M)
-        # dc_flat = -M_inv_mat(dFc_flat^T)^T
-        # M_inv_mat(X) = vecs @ (safe_inv[:, None] * (vecs^T @ X))
-        proj = np.einsum('bji,bmj->bmi', vecs, dFc_flat)  # (n_batch, M, 4)
-        dc_flat = -np.einsum('bij,bmj->bmi', vecs, safe_inv[:, None, :] * proj)  # (n_batch, M, 4)
+        dE_flat = np.squeeze(dFc_flat @ c[:, :, None], -1)  # (n_batch, M)
+        # dc_flat = -vecs @ (safe_inv * (vecs^T @ dFc_flat^T))^T
+        proj = np.matmul(dFc_flat, vecs)  # (n_batch, M, 4)
+        dc_flat = -np.matmul(proj * safe_inv[:, None, :], vecs.swapaxes(1, 2))  # (n_batch, M, 4)
 
-        # Per-axis computation
+        # Axis-independent computations (hoisted from axis loop)
+        v_flat = v_group.reshape(n_batch, M)
+        dc_v = np.squeeze(dc_flat.swapaxes(1, 2) @ v_flat[:, :, None], -1)  # (n_batch, 4)
+        dE_v = (dE_flat * v_flat).sum(axis=1)  # (n_batch,)
+        d2E_v = 2 * np.squeeze(dFc_flat @ dc_v[:, :, None], -1)  # (n_batch, M)
+        dc_dot_v = np.squeeze(dc_flat @ dc_v[:, :, None], -1)  # (n_batch, M)
+
+        q0 = c[:, 0]
+        s2 = np.maximum(1 - q0**2, 1e-30)
+        s = np.sqrt(s2)
+        ac = np.arccos(np.clip(q0, -1+1e-15, 1-1e-15))
+        near_one = np.abs(q0 - 1.0) < 1e-8
+        y = q0 - 1.0
+        asinc_val = np.where(near_one, 1 - y/3 + 2*y**2/15, ac/s)
+        dasinc = np.where(near_one, -1.0/3 + 4*y/15, -1.0/s2 + q0*ac/(s*s2))
+        d2asinc = np.where(near_one, 4.0/15,
+                           (3*q0/s2 - (1+2*q0**2)*ac/(s*s2)) * (-1.0/s2))
+
         for axis in range(3):
             a = axis + 1
-            q0 = c[:, 0]
             qa = c[:, a]
 
-            # asinc and derivatives (vectorized)
-            s2 = np.maximum(1 - q0**2, 1e-30)
-            s = np.sqrt(s2)
-            ac = np.arccos(np.clip(q0, -1+1e-15, 1-1e-15))
-
-            near_one = np.abs(q0 - 1.0) < 1e-8
-            y = q0 - 1.0
-
-            asinc_val = np.where(near_one, 1 - y/3 + 2*y**2/15, ac/s)
-            dasinc = np.where(near_one, -1.0/3 + 4*y/15, -1.0/s2 + q0*ac/(s*s2))
-            d2asinc = np.where(near_one, 4.0/15,
-                               (3*q0/s2 - (1+2*q0**2)*ac/(s*s2)) * (-1.0/s2))
-
-            # df/dq and d2f/dq2 — per fragment
             df_dq = np.zeros((n_batch, 4))
             df_dq[:, 0] = 2 * qa * dasinc
             df_dq[:, a] = 2 * asinc_val
@@ -936,64 +971,29 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
             d2f_dq2[:, 0, a] = 2 * dasinc
             d2f_dq2[:, a, 0] = 2 * dasinc
 
-            # Term 1: dc^T d2f dc — for HVP we need (dc d2f dc^T) @ v_flat
-            # But we need HVP = hess @ v, and hess = term1 + term2
-            # hess_flat = dc_flat @ d2f_dq2 @ dc_flat^T  (n_batch, M, M)
-            # term1_hvp = hess_flat @ v_flat = dc_flat @ d2f_dq2 @ (dc_flat^T @ v_flat)
-            v_flat = v_group.reshape(n_batch, M)  # (n_batch, M)
-            dc_v = np.einsum('bmi,bm->bi', dc_flat, v_flat)  # (n_batch, 4)
-            t1_hvp = np.einsum('bmi,bi->bm', dc_flat, np.einsum('bij,bj->bi', d2f_dq2, dc_v))
+            # term1: dc @ d2f @ dc^T @ v = dc @ d2f @ dc_v
+            t1_hvp = np.squeeze(
+                dc_flat @ (d2f_dq2 @ dc_v[:, :, None]), -1
+            )  # (n_batch, M)
 
-            # Term 2: df_dq @ d2c, contracted with v
-            # w = M_inv(df_dq)
-            proj_w = np.einsum('bji,bj->bi', vecs, df_dq)
-            w = np.einsum('bij,bj->bi', vecs, safe_inv * proj_w)  # (n_batch, 4)
-            wc = np.einsum('bi,bi->b', w, c)  # (n_batch,)
-            w_dc = np.einsum('bmi,bi->bm', dc_flat, w)  # (n_batch, M)
-            fdq_c = np.einsum('bi,bi->b', df_dq, c)  # (n_batch,)
+            # term2: w = M_inv(df_dq)
+            proj_w = np.squeeze(vecs.swapaxes(1, 2) @ df_dq[:, :, None], -1)
+            w = np.squeeze(vecs @ (safe_inv * proj_w)[:, :, None], -1)  # (n_batch, 4)
+            wc = (w * c).sum(axis=1)  # (n_batch,)
+            w_dc = np.squeeze(dc_flat @ w[:, :, None], -1)  # (n_batch, M)
+            fdq_c = (df_dq * c).sum(axis=1)  # (n_batch,)
 
             # dFw: dF @ w for all (k,d)
-            dFw = np.zeros((n_batch, nr, 3, 4))
-            Pref_w3 = np.einsum('bnj,bj->bn', Pref, w[:, 1:])
-            for d in range(3):
-                d1 = (d + 1) % 3
-                d2 = (d + 2) % 3
-                dRtr = Pref[:, :, d]
-                dFtop = np.zeros((n_batch, nr, 3))
-                dFtop[:, :, d1] = -Pref[:, :, d2]
-                dFtop[:, :, d2] = Pref[:, :, d1]
-                dFw[:, :, d, 0] = dRtr * w[:, 0:1] + np.einsum('bni,bi->bn', dFtop, w[:, 1:])
-                for i_ax in range(3):
-                    val = -dRtr * w[:, 1+i_ax:2+i_ax]
-                    if i_ax == d:
-                        val = val + Pref_w3
-                    val = val + Pref[:, :, i_ax] * w[:, 1+d:2+d]
-                    dFw[:, :, d, 1+i_ax] = dFtop[:, :, i_ax] * w[:, 0:1] + val
-            dFw_flat = dFw.reshape(n_batch, M, 4)
+            dFw_flat = _build_dF_vec_batched(Pref, w, n_batch, nr)  # (n_batch, M, 4)
 
-            # All the matrix products for term2, contracted with v_flat
-            # term2[i,j] = dE[i]*w_dc[j] + dE[j]*w_dc[i] + d2E[i,j]*wc
-            #            - wdFdc[i,j] - wdFdc[j,i] - fdq_c * dc_dot[i,j]
-            # term2_hvp[i] = sum_j term2[i,j] * v[j]
-            # = dE[i] * (w_dc @ v) + (dE @ v) * w_dc[i] + wc * (d2E @ v)[i]
-            #   - (dFw @ dc^T @ v)[i] - (dFw_flat @ (dc_flat^T @ v_flat)...
+            w_dc_v = (w_dc * v_flat).sum(axis=1)  # (n_batch,)
 
-            dE_v = np.einsum('bm,bm->b', dE_flat, v_flat)  # (n_batch,)
-            w_dc_v = np.einsum('bm,bm->b', w_dc, v_flat)  # (n_batch,)
+            # wdFdc @ v = dFw_flat @ dc_v
+            wdFdc_v = np.squeeze(dFw_flat @ dc_v[:, :, None], -1)
 
-            # d2E @ v: d2E_mat = 2 * dFc_flat @ dc_flat^T
-            # d2E_v = 2 * dFc_flat @ (dc_flat^T @ v_flat)
-            d2E_v = 2 * np.einsum('bmi,bi->bm', dFc_flat, dc_v)  # (n_batch, M)
-
-            # wdFdc @ v = dFw_flat @ (dc_flat^T @ v)
-            wdFdc_v = np.einsum('bmi,bi->bm', dFw_flat, dc_v)  # (n_batch, M)
-
-            # wdFdc^T @ v = dc_flat @ (dFw_flat^T @ v) = dc_flat @ dFw_v
-            dFw_v = np.einsum('bmi,bm->bi', dFw_flat, v_flat)  # (n_batch, 4)
-            wdFdcT_v = np.einsum('bmi,bi->bm', dc_flat, dFw_v)  # (n_batch, M)
-
-            # dc_dot @ v = dc_flat @ (dc_flat^T @ v) = dc_flat @ dc_v
-            dc_dot_v = np.einsum('bmi,bi->bm', dc_flat, dc_v)  # (n_batch, M)
+            # wdFdc^T @ v = dc_flat @ (dFw_flat^T @ v)
+            dFw_v = np.squeeze(dFw_flat.swapaxes(1, 2) @ v_flat[:, :, None], -1)
+            wdFdcT_v = np.squeeze(dc_flat @ dFw_v[:, :, None], -1)
 
             t2_hvp = (dE_flat * w_dc_v[:, None]
                       + dE_v[:, None] * w_dc
@@ -2049,7 +2049,9 @@ class BaseInternals:
         """Return cached stabilized quaternions, recomputing if needed.
 
         Returns a list of (4,) numpy arrays, one per fragment, or None
-        if the batched path is invalid.
+        if the batched path is invalid.  Also caches per-fragment
+        eigenvalues/eigenvectors in ``self._cache['stabilized_q_eigh']``
+        for reuse in the HVP path.
         """
         cached = self._cache.get('stabilized_q')
         if cached is not None:
@@ -2057,13 +2059,18 @@ class BaseInternals:
         rotations = self.internals['rotations']
         if not rotations:
             self._cache['stabilized_q'] = []
+            self._cache['stabilized_q_eigh'] = (None, None)
             return []
         pos_pad, ref_pad, mask, frag_indices, slots, valid = (
             self._rotation_padded_inputs(positions)
         )
         if not valid:
             self._cache['stabilized_q'] = None
+            self._cache['stabilized_q_eigh'] = (None, None)
             return None
+        n_frags = len(slots)
+        ws_list = []
+        vecs_list = []
         qs = []
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
@@ -2072,11 +2079,17 @@ class BaseInternals:
             dx = pos_frag - pos_frag.mean(0)
             F = _build_F_matrix_np(dx, ref_frag)
             q_prev = rotations[slot[0]].q_prev
-            q = _stabilize_quaternion(F, q_prev)
+            ws_i, vecs_i = np.linalg.eigh(F)
+            ws_list.append(ws_i)
+            vecs_list.append(vecs_i)
+            q = _stabilize_quaternion_from_eigh(ws_i, vecs_i, q_prev)
             for axis in range(3):
                 rotations[slot[axis]].q_prev = q
             qs.append(q)
         self._cache['stabilized_q'] = qs
+        self._cache['stabilized_q_eigh'] = (
+            np.array(ws_list), np.array(vecs_list)
+        )
         return qs
 
     def _batched_rotation_values(self, positions: np.ndarray):
@@ -2428,6 +2441,8 @@ class BaseInternals:
         if valid:
             qs = self._get_stabilized_quaternions(positions)
             q_stable_all = np.array(qs) if qs is not None else None
+            cached_eigh = self._cache.get('stabilized_q_eigh', (None, None))
+            ws_cached, vecs_cached = cached_eigh
             n_max = mask.shape[1]
             v_pad = np.zeros((len(frag_indices), n_max, 3), dtype=np.float64)
             for fi, fi_idx in enumerate(frag_indices):
@@ -2435,6 +2450,7 @@ class BaseInternals:
             rot_batched_hvp = _rotation_3axis_hvp_batched_closed(
                 pos_pad, ref_pad, mask, v_pad,
                 q_stable_all=q_stable_all,
+                ws_all=ws_cached, vecs_all=vecs_cached,
             )
             rot_batched_slots = slots
             rot_batched_frag_indices = frag_indices
