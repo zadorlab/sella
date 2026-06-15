@@ -3,7 +3,7 @@ from typing import Union, Callable
 
 import numpy as np
 from scipy.linalg import eigh, expm, expm_frechet, logm, polar, qr, solve_triangular
-from scipy.integrate import LSODA
+from scipy.integrate import RK45 as _GeodesicSolver, BDF as _GeodesicStiffSolver
 from ase import Atoms
 from ase.build import niggli_reduce
 from ase.utils import basestring
@@ -827,8 +827,9 @@ class InternalPES(PES):
     def _set_x_ode(self, target):
         """ODE-based stepper for internal coordinate updates.
 
-        Uses LSODA to integrate the geodesic equation for reliable convergence
-        on large or ill-conditioned steps.
+        Integrates the geodesic equation for reliable convergence on large or
+        ill-conditioned steps; see :meth:`_run_geodesic` for the solver (RK45
+        with a BDF stiff fallback) and why LSODA is avoided.
         """
         dx = target - self.get_x()
         t0 = 0.
@@ -837,22 +838,7 @@ class InternalPES(PES):
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         Binv @ dx,
                         Binv @ self.curr.get('g', np.zeros_like(dx))))
-        ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
-
-        while ode.status == 'running':
-            ode.step()
-            y = ode.y
-            t0 = ode.t
-            self.bad_int = self.int.check_for_bad_internals()
-            if self.bad_int is not None:
-                break
-            if ode.nfev > 1000:
-                view(self.atoms + self.dummies)
-                raise RuntimeError("Geometry update ODE is taking too long "
-                                   "to converge!")
-
-        if ode.status == 'failed':
-            raise RuntimeError("Geometry update ODE failed to converge!")
+        y, t0 = self._run_geodesic(y0, t0, debug_view=True)
 
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)
@@ -864,6 +850,57 @@ class InternalPES(PES):
         g_final = B @ y[2]
         dx_initial = t0 * dx
         return dx_initial, dx_final, g_final
+
+    def _run_geodesic(self, y0, t0, debug_view=False):
+        """Integrate the geodesic ODE from ``(t0, y0)`` to ``t_bound=1``.
+
+        Returns ``(y, t)`` at the final integration point.
+
+        Solver choice and the memory leak it avoids: scipy's ``LSODA`` wraps
+        the Fortran lsoda integrator, which leaks its native ``rwork``/``iwork``
+        workspace on *every* instantiation (and reset) — memory the Python GC
+        cannot reclaim. Because this stepper builds a fresh integrator on every
+        optimizer step, that leak grows to many GB and OOMs over a few hundred
+        geometry optimizations. The geodesic RHS is smooth and, in practice,
+        non-stiff, so we integrate with the pure-Python explicit ``RK45``
+        (``_GeodesicSolver``): same ``OdeSolver`` API, no native workspace, and
+        empirically faster than LSODA on real (incl. saddle-point) searches.
+
+        As insurance for a genuinely stiff / ill-conditioned step, if RK45
+        stalls (``nfev`` exceeds the budget) or fails, we retry from the same
+        initial state with ``BDF`` (``_GeodesicStiffSolver``) — a pure-Python
+        *implicit* solver that handles stiffness without LSODA's native leak
+        (its only retained state is a reference cycle, which cyclic GC
+        reclaims). Both restart cleanly from ``y0`` because ``_q_ode`` resets
+        the atom positions from ``y`` on its first call.
+
+        Sets ``self.bad_int`` and returns the partial ``(y, t)`` if
+        ``check_for_bad_internals`` trips mid-integration — a legitimate early
+        stop, not a failure.
+        """
+        for Solver, is_stiff_fallback in (
+            (_GeodesicSolver, False), (_GeodesicStiffSolver, True),
+        ):
+            ode = Solver(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
+            stalled = False
+            while ode.status == 'running':
+                ode.step()
+                self.bad_int = self.int.check_for_bad_internals()
+                if self.bad_int is not None:
+                    return ode.y, ode.t
+                if ode.nfev > 1000:
+                    stalled = True
+                    break
+            if not stalled and ode.status != 'failed':
+                return ode.y, ode.t
+            if is_stiff_fallback:
+                if debug_view:
+                    view(self.atoms + self.dummies)
+                raise RuntimeError(
+                    "Geometry update ODE failed to converge with both RK45 "
+                    f"and BDF (status={ode.status}, nfev={ode.nfev})."
+                )
+            # else: RK45 stalled/failed -> fall through to the BDF retry
 
     # Position getter/setter
     def set_x(self, target):
@@ -2071,20 +2108,9 @@ class CellInternalPES(InternalPES):
             Binv @ dx,
             g_cart_for_ode,
         ))
-        ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
-
-        while ode.status == 'running':
-            ode.step()
-            y = ode.y
-            t0 = ode.t
-            self.bad_int = self.int.check_for_bad_internals()
-            if self.bad_int is not None:
-                break
-            if ode.nfev > 1000:
-                raise RuntimeError("Geometry update ODE is taking too long!")
-
-        if ode.status == 'failed':
-            raise RuntimeError("Geometry update ODE failed to converge!")
+        # See _run_geodesic: RK45 (leak-free) with a BDF fallback for stiff
+        # steps, replacing the Fortran LSODA that leaks native workspace.
+        y, t0 = self._run_geodesic(y0, t0)
 
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)

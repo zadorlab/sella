@@ -98,6 +98,35 @@ class IRC(Optimizer):
         if steps is None:
             steps = DEFAULT_MAX_STEPS
 
+        self.fmax_inner = min(fmax, fmax_inner)
+
+        # Apply the initial kick off the transition state *before*
+        # handing control to the ASE optimizer loop. In ASE >= 3.23 the
+        # Optimizable interface was refactored such that the convergence
+        # check in Dynamics.irun no longer routes through self.converged
+        # on the subclass in a way that an IRC kick-in-step strategy can
+        # intercept.
+        self.displace_along_mode(direction)
+
+        return Optimizer.irun(self, fmax=fmax, steps=steps)
+
+    def displace_along_mode(self, direction: str = "forward") -> np.ndarray:
+        """Displace the atoms once along the lowest-eigenvalue Hessian mode.
+
+        Applies a single initial IRC kick of magnitude ``self.dx`` (in
+        mass-weighted coordinates) away from the transition state, *without*
+        running the IRC optimization. Returns the new Cartesian positions.
+
+        Safe to call repeatedly on the same object (e.g. ``"forward"`` then
+        ``"reverse"``): the transition-state geometry and Hessian are cached
+        on the first call and restored before every subsequent displacement,
+        so each call displaces from the same starting structure rather than
+        compounding kicks. This is also the helper ``irun`` uses to apply the
+        initial kick, so the two paths stay in sync.
+        """
+        if direction not in ["forward", "reverse"]:
+            raise ValueError('direction must be one of "forward" or "reverse"!')
+
         if self.v0ts is None:
             # Initial diagonalization
             self.pes.kick(0, True, **self.peskwargs)
@@ -125,17 +154,9 @@ class IRC(Optimizer):
         elif direction == "reverse":
             self.d1 = -self.v0ts.copy()
 
-        self.fmax_inner = min(fmax, fmax_inner)
-
-        # Apply the initial kick off the transition state *before*
-        # handing control to the ASE optimizer loop. In ASE >= 3.23 the
-        # Optimizable interface was refactored such that the convergence
-        # check in Dynamics.irun no longer routes through self.converged
-        # on the subclass in a way that an IRC kick-in-step strategy can
-        # intercept.
         self.pes.kick(self.d1)
 
-        return Optimizer.irun(self, fmax=fmax, steps=steps)
+        return self.atoms.get_positions()
 
     def run(
         self,
