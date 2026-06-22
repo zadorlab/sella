@@ -165,6 +165,8 @@ class IRC(Optimizer):
         self.d1 *= 0.
 
     def converged(self, forces=None):
+        if self.first:
+            return False
         evals = self.pes.H.evals
         return (self.pes.converged(self.fmax)[0]
                 and evals is not None and evals[0] > 0)
