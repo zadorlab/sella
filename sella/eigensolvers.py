@@ -62,7 +62,7 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
         AV = AV @ vecs
         V = V @ vecs
         vecs = np.eye(V.shape[1])
-        if V.shape[1] >= maxiter:
+        if V.shape[1] >= min(n, maxiter):
             return lams, V, AV
 
         Ytilde = symmetrize_Y(V, AV, symm=symm)
