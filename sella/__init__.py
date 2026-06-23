@@ -6,9 +6,8 @@ import os
 # Cache dir is given by an environment variable, or a fallback if not set
 # Explicitly setting the environment variable is recommended if the home
 # directory is not writable
-default_cache_dir = os.path.expanduser("~/.cache/sella/jax_cache")
 _cache_dir = os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
-                                   default_cache_dir)
+                                   os.path.expanduser("~/.cache/sella/jax_cache"))
 os.makedirs(_cache_dir, exist_ok=True)
 # JAX is used only for AD, not linalg; GPU linalg routes through torch
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
