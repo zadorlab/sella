@@ -31,7 +31,7 @@ class NumericalHessian(LinearOperator):
         else:
             n = self.ntrue
 
-        self.shape = (n, n)
+        super().__init__(self.dtype, (n, n))
 
         self.Vs = np.empty((self.ntrue, 0), dtype=self.dtype)
         self.AVs = np.empty((self.ntrue, 0), dtype=self.dtype)
@@ -109,8 +109,8 @@ class MatrixSum(LinearOperator):
         # For example, if two matrices are provided with the detypes
         # np.int64 and np.float64, then this MatrixSum object will be
         # np.float64.
-        self.dtype = sorted([mat.dtype for mat in matrices], reverse=True)[0]
-        self.shape = matrices[0].shape
+        dtype = sorted([mat.dtype for mat in matrices], reverse=True)[0]
+        super().__init__(dtype, matrices[0].shape)
 
         mnum = None
         self.matrices = []
@@ -153,8 +153,7 @@ class ApproximateHessian(LinearOperator):
         """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
         self.ncart = ncart
-        self.shape = (self.dim, self.dim)
-        self.dtype = np.float64
+        super().__init__(np.float64, (dim, dim))
         self.update_method = update_method
         self.symm = symm
         self.initialized = initialized
@@ -373,7 +372,7 @@ class SparseInternalJacobian(LinearOperator):
         self.indices = indices
         self.vals = vals
         self.nints = len(self.indices)
-        self.shape = (self.nints, 3 * self.natoms)
+        super().__init__(self.dtype, (self.nints, 3 * self.natoms))
 
     def asarray(self) -> np.ndarray:
         B = np.zeros((self.nints, self.natoms, 3))
@@ -418,7 +417,7 @@ class SparseInternalHessian(LinearOperator):
         vals: np.ndarray,
     ) -> None:
         self.natoms = natoms
-        self.shape = (3 * self.natoms, 3 * self.natoms)
+        super().__init__(self.dtype, (3 * natoms, 3 * natoms))
         self.indices = np.asarray(indices)
         self.vals = np.asarray(vals)
 
