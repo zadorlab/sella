@@ -830,7 +830,7 @@ class InternalPES(PES):
         Uses LSODA to integrate the geodesic equation for reliable convergence
         on large or ill-conditioned steps.
         """
-        dx = target - self.get_x()
+        dx = self.wrap_dx(target - self.get_x())
         t0 = 0.
         Binv = self._get_Binv()
         self._ode_Binv = Binv
@@ -2055,7 +2055,7 @@ class CellInternalPES(InternalPES):
     def _set_x_ode_internal(self, q_target: np.ndarray, old_g_cart=None):
         """ODE-based stepper for internal coords only (cell already updated)."""
         x0 = self.int.calc()
-        dx = q_target - x0
+        dx = self.wrap_dx(q_target - x0)
         t0 = 0.
         Binv = self._get_Binv()
         self._ode_Binv = Binv

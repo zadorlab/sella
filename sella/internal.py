@@ -21,7 +21,7 @@ from ase.constraints import (
 )
 
 import jax.numpy as jnp
-from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap, jvp, device_get
+from jax import jit, grad, jacfwd, jacrev, vmap, jvp, device_get
 
 from sella.linalg import (
     SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians,
@@ -502,133 +502,509 @@ class Translation(Coordinate):
 # We are assuming here that the eigenvector of interest corresponds
 # to a simple (non-degenerate) eigenvalue (though we permit the
 # possibility of there being other degenerate eigenvalues).
-#
-# As far as I can tell, we are limited to forward-auto-differentation,
-# at least for the first derivative, as backwards-mode requires
-# consideration of all eigenvalues/eigenvectors, which may be undefined.
-@custom_jvp
-def eigh_rightmost(X):
-    return jnp.linalg.eigh((X + X.T) / 2.)[1][:, -1]
 
 
-@eigh_rightmost.defjvp
-def eigh_rightmost_jvp(primals, tangents):
-    X, = primals
-    X = (X + X.T) / 2.
-    dX, = tangents
-    dX = (dX + dX.T) / 2.
-    dim = X.shape[0]
-    ws, vecs = jnp.linalg.eigh(X)
-    v = vecs[:, -1]
-    ldot = v.T @ dX @ v
-    # Note that the last term, `-ldot * v`, does not actually contribute
-    # to the first derivative since `v` is orthogonal to
-    # `pinv(ws[-1] * eye(dim) - X)`. However, this term must be included for
-    # the *second* derivative to be correct.
-    return v, jnp.linalg.pinv(ws[-1] * jnp.eye(dim) - X) @ (dX @ v - ldot * v)
+def _rotation_hessian_np(pos, axis, refpos, q_stable=None):
+    """Closed-form Hessian of the rotation coordinate w.r.t. positions.
 
+    Uses an analytic eigenvector second derivative that handles degenerate
+    eigenvalues (linear molecules) via the Moore-Penrose pseudoinverse,
+    avoiding the NaN that JAX autodiff produces in that case.
 
-def _rotation_q(
-    pos: jnp.ndarray,
-    refpos: jnp.ndarray
-) -> float:
-    dx = pos - pos.mean(0)
-    R = dx.T @ refpos
-    Rtr = jnp.trace(R)
-    Ftop = jnp.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
-    F = jnp.block([
-        [Rtr, Ftop[None, :]],
-        [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
-    ])
-    q = eigh_rightmost(F)
-    # Use where instead of sign: sign(0)=0 in JAX which zeros the entire
-    # quaternion for linear molecules, making all rotation Jacobians zero.
-    return q * jnp.where(q[0] >= 0, 1.0, -1.0)
+    Parameters
+    ----------
+    pos : ndarray (N, 3)
+    axis : int (0, 1, or 2)
+    refpos : ndarray (N, 3), already centered
+    q_stable : ndarray (4,), optional stabilized quaternion
 
-
-# "inverse sinc" function, naive, undefined at x=1
-def _asinc_naive(x):
-    return jnp.arccos(x) / jnp.sqrt(1 - x**2)
-
-
-# Taylor series expansion of _asinc_naive around x=1
-def _asinc_taylor(x):
-    y = x - 1
-    return (
-        1
-        - y / 3
-        + 2 * y**2 / 15
-        - 2 * y**3 / 35
-        + 8 * y**4 / 315
-        - 8 * y**5 / 693
-        + 16 * y**6 / 3003
-        - 16 * y**7 / 6435
-        + 128 * y**8 / 109395
-        - 128 * y**9 / 230945
-    )
-
-
-def asinc(x):
-    return jnp.where(
-        x < 0.97,
-        _asinc_naive(jnp.where(x < 0.97, x, 0.97)),
-        _asinc_taylor(x)
-    )
-
-
-def _rotation(
-    pos: jnp.ndarray,
-    axis: int,
-    refpos: jnp.ndarray
-) -> float:
-    q = _rotation_q(pos, refpos)
-    return 2 * q[axis + 1] * asinc(q[0])
-
-
-def _rotation_3axis_masked(
-    pos: jnp.ndarray, refpos: jnp.ndarray, mask: jnp.ndarray
-) -> jnp.ndarray:
-    """All 3 rotation values for one fragment, padded + masked.
-
-    Returns an array of length 3 (one value per rotation axis). The
-    fragment is assumed centered: ``refpos`` is already the centered
-    reference, padded rows are zero. ``mask`` is 1 on real atoms and 0
-    on padding so the centroid divides by the actual atom count.
+    Returns
+    -------
+    hessian : ndarray (N, 3, N, 3)
     """
-    pos_eff = pos * mask[:, None]
-    natoms = jnp.sum(mask)
-    centroid = jnp.sum(pos_eff, axis=0) / natoms
-    dx = (pos - centroid) * mask[:, None]
-    refpos_centered = refpos * mask[:, None]
-    R = dx.T @ refpos_centered
-    Rtr = jnp.trace(R)
-    Ftop = jnp.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
-    F = jnp.block([
-        [Rtr, Ftop[None, :]],
-        [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
-    ])
-    q = eigh_rightmost(F)
-    q = q * jnp.where(q[0] >= 0, 1.0, -1.0)
-    a = asinc(q[0])
-    return jnp.stack([2 * q[1] * a, 2 * q[2] * a, 2 * q[3] * a])
+    return _rotation_hessian_single(
+        np.asarray(pos, dtype=np.float64),
+        axis,
+        np.asarray(refpos, dtype=np.float64),
+        q_stable=q_stable,
+    )
 
 
-_rotation_3axis_hess_batched = jit(vmap(
-    jacfwd(jacfwd(_rotation_3axis_masked, argnums=0), argnums=0),
-    in_axes=(0, 0, 0)
-))
+def _build_F_matrix_np(dx, refpos):
+    """Build the 4x4 quaternion F-matrix in numpy.
+
+    Parameters
+    ----------
+    dx : ndarray (N, 3), centered positions (pos - centroid)
+    refpos : ndarray (N, 3), centered reference positions
+    """
+    R = dx.T @ refpos
+    Rtr = np.trace(R)
+    Ftop = np.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
+    F = np.empty((4, 4))
+    F[0, 0] = Rtr
+    F[0, 1:] = Ftop
+    F[1:, 0] = Ftop
+    F[1:, 1:] = -Rtr * np.eye(3) + R + R.T
+    return F
 
 
-_rotation_3axis_value_batched = jit(vmap(
-    _rotation_3axis_masked,
-    in_axes=(0, 0, 0)
-))
+def _stabilize_quaternion(F, q_prev):
+    """Compute branch-stable quaternion from F-matrix eigendecomposition.
+
+    Projects q_prev onto the top eigenspace of F and normalizes.
+    For non-degenerate cases (1D top eigenspace), this is equivalent
+    to picking the rightmost eigenvector with consistent sign.
+    For degenerate cases (2-atom / linear fragments with 2D+ top
+    eigenspace), this picks the linear combination closest to q_prev,
+    ensuring continuity across geometry steps.
+    """
+    ws, vecs = np.linalg.eigh(F)
+    return _stabilize_quaternion_from_eigh(ws, vecs, q_prev)
 
 
-_rotation_3axis_grad_batched = jit(vmap(
-    jacfwd(_rotation_3axis_masked, argnums=0),
-    in_axes=(0, 0, 0)
-))
+def _stabilize_quaternion_from_eigh(ws, vecs, q_prev):
+    """Compute branch-stable quaternion from pre-computed eigendecomposition."""
+    if q_prev is None:
+        q_prev = np.array([1.0, 0.0, 0.0, 0.0])
+    top_mask = (ws[-1] - ws) < 1e-10
+    top_vecs = vecs[:, top_mask]
+    coeffs = top_vecs.T @ q_prev
+    q = top_vecs @ coeffs
+    norm = np.linalg.norm(q)
+    if norm < 1e-14:
+        q = vecs[:, -1].copy()
+    else:
+        q /= norm
+    if q[0] < 0:
+        q = -q
+    return q
+
+
+def _asinc_np(x):
+    """Inverse sinc: arccos(x) / sqrt(1 - x^2), with Taylor branch near x=1."""
+    if x < 0.97:
+        return np.arccos(x) / np.sqrt(1.0 - x * x)
+    y = x - 1.0
+    return (1.0 - y / 3 + 2 * y**2 / 15 - 2 * y**3 / 35
+            + 8 * y**4 / 315 - 8 * y**5 / 693 + 16 * y**6 / 3003
+            - 16 * y**7 / 6435 + 128 * y**8 / 109395
+            - 128 * y**9 / 230945)
+
+
+def _expmap_np(q):
+    """Convert unit quaternion to rotation vector (3,)."""
+    a = _asinc_np(q[0])
+    return 2.0 * q[1:4] * a
+
+
+def _rotation_3axis_jacobian_np(pos, refpos, q):
+    """Jacobian of all 3 rotation values w.r.t. positions, using quaternion q.
+
+    Parameters
+    ----------
+    pos    : (N, 3)
+    refpos : (N, 3), already centered
+    q      : (4,), stabilized quaternion
+
+    Returns
+    -------
+    jac : (3, N, 3) — Jacobian[axis, atom, xyz]
+    """
+    N = len(pos)
+    dx = pos - pos.mean(0)
+    F = _build_F_matrix_np(dx, refpos)
+    ws, vecs = np.linalg.eigh(F)
+
+    c = q
+    gaps = ws - ws[-1]
+    safe_inv = np.where(np.abs(gaps) > 1e-14,
+                        1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
+                        0.0)
+
+    Prefpos = refpos  # refpos is already centered at construction
+    dFc = _apply_dF(Prefpos, c, N)  # (N, 3, 4)
+    dFc_flat = dFc.reshape(N * 3, 4)
+    dc_flat = -(vecs @ (safe_inv[:, None] * (vecs.T @ dFc_flat.T))).T  # (N*3, 4)
+
+    q0 = c[0]
+    asinc_val = _asinc_np(q0)
+    if abs(q0 - 1.0) < 1e-8:
+        y = q0 - 1.0
+        dasinc = -1.0 / 3 + 4 * y / 15
+    elif abs(q0) < 1.0 - 1e-12:
+        s2 = 1 - q0**2
+        s = np.sqrt(s2)
+        ac = np.arccos(q0)
+        dasinc = -1.0 / s2 + q0 * ac / (s * s2)
+    else:
+        dasinc = 0.0
+
+    jac = np.zeros((3, N, 3))
+    for k in range(3):
+        a = k + 1
+        jac_flat = 2 * (dc_flat[:, a] * asinc_val + c[a] * dasinc * dc_flat[:, 0])
+        jac[k] = jac_flat.reshape(N, 3)
+    return jac
+
+
+def _apply_dF(Prefpos, vec, N):
+    """Compute dF_{k,d} @ vec for all (k,d), batched over fragments.
+
+    Prefpos : (B, N, 3) or (N, 3)
+    vec     : (B, 4) or (4,)
+
+    Returns : (B, N, 3, 4) or (N, 3, 4)
+    """
+    single = Prefpos.ndim == 2
+    if single:
+        Prefpos = Prefpos[None]
+        vec = vec[None]
+    B = Prefpos.shape[0]
+
+    v0 = vec[:, 0]        # (B,)
+    v3 = vec[:, 1:]       # (B, 3)
+    Pv3 = np.einsum('bni,bi->bn', Prefpos, v3)  # (B, N) = Prefpos @ v3
+
+    result = np.zeros((B, N, 3, 4))
+    for d in range(3):
+        dRtr = Prefpos[:, :, d]  # (B, N)
+        # dFtop for this d
+        d1 = (d + 1) % 3
+        d2 = (d + 2) % 3
+        # dR[d1,d2]-dR[d2,d1] etc., with dR[i,j]=Prefpos[k,j]*delta_{i,d}
+        dFtop = np.zeros((B, N, 3))
+        # Antisymmetric part of dR: dR[i,j]-dR[j,i]
+        # Only nonzero entries: dR[d,j] = Pref[k,j], dR[j,d] = 0 for j!=d
+        # So: component 0 = dR[1,2]-dR[2,1]:
+        #   if d==1: Pref[k,2]; if d==2: -Pref[k,1]; else 0
+        # Simpler pattern: cross-product-like
+        dFtop[:, :, d1] = -Prefpos[:, :, d2]
+        dFtop[:, :, d2] = Prefpos[:, :, d1]
+        # dFtop[d] = 0 (already)
+
+        # result[:, :, d, 0] = dRtr * v0 + dFtop @ v3
+        result[:, :, d, 0] = dRtr * v0 + np.einsum('bni,bi->bn', dFtop, v3)
+
+        # result[:, :, d, 1:] = dFtop * v0 + (-dRtr*I + dR + dR.T) @ v3
+        for i_ax in range(3):
+            val = -dRtr * v3[:, i_ax, None]  # (B, N) — broadcast
+            val = val.squeeze(-1) if val.ndim > 2 else val
+            # Correction: val shape should be (B, N)
+            val = -dRtr * v3[:, i_ax:i_ax+1]  # (B, 1) broadcast with (B, N) -> (B, N)
+            if i_ax == d:
+                val = val + Pv3  # (B, N)
+            val = val + Prefpos[:, :, i_ax] * v3[:, d:d+1]  # (B, N)
+            result[:, :, d, 1 + i_ax] = dFtop[:, :, i_ax] * v0[:, None] + val
+
+    if single:
+        return result[0]
+    return result
+
+
+
+def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
+    """Closed-form Hessian for a single rotation on a single fragment.
+
+    pos    : (N, 3)
+    axis   : int
+    refpos : (N, 3), already centered
+    q_stable : (4,), optional stabilized quaternion
+
+    Returns (N, 3, N, 3)
+    """
+    N = len(pos)
+    a = axis + 1
+
+    # F-matrix
+    dx = pos - pos.mean(0)
+    F = _build_F_matrix_np(dx, refpos)
+
+    # Eigendecomposition + safe pseudoinverse
+    ws, vecs = np.linalg.eigh(F)
+    if q_stable is not None:
+        c = q_stable
+    else:
+        c = vecs[:, -1]
+        if c[0] < 0:
+            c = -c
+    gaps = ws - ws[-1]
+    safe_inv = np.where(np.abs(gaps) > 1e-14, 1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0), 0.0)
+
+    def M_inv_mat(mat):
+        return vecs @ (safe_inv[:, None] * (vecs.T @ mat))
+
+    # Prefpos and dFc
+    P = np.eye(N) - 1.0 / N
+    Prefpos = P @ refpos  # (N, 3)
+    dFc = _apply_dF(Prefpos, c, N)  # (N, 3, 4)
+    dFc_flat = dFc.reshape(N * 3, 4)
+
+    dE_flat = dFc_flat @ c  # (N*3,)
+    dc_flat = -M_inv_mat(dFc_flat.T).T  # (N*3, 4)
+
+    # asinc derivatives
+    q0 = c[0]
+    qa = c[a]
+    if abs(q0 - 1.0) < 1e-8:
+        y = q0 - 1.0
+        asinc_val = 1 - y / 3 + 2 * y**2 / 15
+        dasinc = -1.0 / 3 + 4 * y / 15
+        d2asinc = 4.0 / 15
+    elif abs(q0) < 1.0 - 1e-12:
+        s2 = 1 - q0**2
+        s = np.sqrt(s2)
+        ac = np.arccos(q0)
+        asinc_val = ac / s
+        dasinc = -1.0 / s2 + q0 * ac / (s * s2)
+        d2asinc = (3 * q0 / s2 - (1 + 2 * q0**2) * ac / (s * s2)) * (-1.0 / s2)
+    else:
+        asinc_val = np.pi / 2 if q0 > 0 else -np.pi / 2
+        dasinc = 0.0
+        d2asinc = 0.0
+
+    df_dq = np.zeros(4)
+    df_dq[0] = 2 * qa * dasinc
+    df_dq[a] = 2 * asinc_val
+
+    d2f_dq2 = np.zeros((4, 4))
+    d2f_dq2[0, 0] = 2 * qa * d2asinc
+    d2f_dq2[0, a] = 2 * dasinc
+    d2f_dq2[a, 0] = 2 * dasinc
+
+    # Term 1: quadratic in first derivatives
+    hess_flat = dc_flat @ d2f_dq2 @ dc_flat.T
+
+    # Term 2: df_dq contracted with d2c
+    w = vecs @ (safe_inv * (vecs.T @ df_dq))
+    wc = w @ c
+    w_dc = dc_flat @ w
+    fdq_c = df_dq @ c
+
+    dFw = _apply_dF(Prefpos, w, N)
+    dFw_flat = dFw.reshape(N * 3, 4)
+    wdFdc = dFw_flat @ dc_flat.T
+
+    d2E_mat = 2 * dFc_flat @ dc_flat.T
+    dc_dot = dc_flat @ dc_flat.T
+
+    term2 = (dE_flat[:, None] * w_dc[None, :]
+             + dE_flat[None, :] * w_dc[:, None]
+             + d2E_mat * wc
+             - wdFdc - wdFdc.T
+             - fdq_c * dc_dot)
+
+    hess_flat += term2
+    return hess_flat.reshape(N, 3, N, 3)
+
+
+def _rotation_hvp_closed(pos, axis, refpos, tangent, q_stable=None):
+    """HVP for a single rotation using the closed-form Hessian."""
+    hess = _rotation_hessian_single(pos, axis, refpos, q_stable=q_stable)
+    return np.einsum('aibj,bj->ai', hess, tangent)
+
+
+
+
+def _build_dF_vec_batched(Pref, vec, n_batch, nr):
+    """Compute dF_{k,d} @ vec for all (k,d) in a batched fragment group.
+
+    Parameters
+    ----------
+    Pref : (n_batch, nr, 3), centered reference positions
+    vec  : (n_batch, 4), quaternion-space vector
+
+    Returns
+    -------
+    dF_vec : (n_batch, nr*3, 4)
+    """
+    v0 = vec[:, 0:1]       # (n_batch, 1)
+    v3 = vec[:, 1:]         # (n_batch, 3)
+    Pv3 = np.squeeze(Pref @ v3[:, :, None], -1)  # (n_batch, nr)
+
+    result = np.empty((n_batch, nr, 3, 4))
+    for d in range(3):
+        d1 = (d + 1) % 3
+        d2 = (d + 2) % 3
+        dRtr = Pref[:, :, d]  # (n_batch, nr)
+
+        dFtop_d1 = -Pref[:, :, d2]  # (n_batch, nr)
+        dFtop_d2 = Pref[:, :, d1]   # (n_batch, nr)
+
+        result[:, :, d, 0] = (dRtr * v0
+                              + dFtop_d1 * v3[:, d1:d1+1]
+                              + dFtop_d2 * v3[:, d2:d2+1])
+
+        vd = v3[:, d:d+1]  # (n_batch, 1)
+        for i_ax in range(3):
+            val = -dRtr * v3[:, i_ax:i_ax+1]
+            if i_ax == d:
+                val = val + Pv3
+            val = val + Pref[:, :, i_ax] * vd
+            if i_ax == d1:
+                dFtop_iax = dFtop_d1
+            elif i_ax == d2:
+                dFtop_iax = dFtop_d2
+            else:
+                dFtop_iax = 0.0
+            result[:, :, d, 1 + i_ax] = dFtop_iax * v0 + val
+
+    return result.reshape(n_batch, nr * 3, 4)
+
+
+def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
+                                       q_stable_all=None,
+                                       ws_all=None, vecs_all=None):
+    """Batched HVP for multiple fragments using closed-form Hessians.
+
+    Parameters
+    ----------
+    pos_pad : (B, N_max, 3)
+    ref_pad : (B, N_max, 3)
+    mask : (B, N_max)
+    v_pad : (B, N_max, 3)
+    q_stable_all : (B, 4), optional stabilized quaternions per fragment
+    ws_all : (B, 4), optional cached eigenvalues per fragment
+    vecs_all : (B, 4, 4), optional cached eigenvectors per fragment
+
+    Returns
+    -------
+    hvp : (B, 3, N_max, 3)
+    """
+    B, N_max, _ = pos_pad.shape
+    n_real = np.sum(mask, axis=1).astype(int)
+    hvp = np.zeros((B, 3, N_max, 3))
+
+    size_groups = {}
+    for fi in range(B):
+        nr = n_real[fi]
+        size_groups.setdefault(nr, []).append(fi)
+
+    for nr, frag_indices in size_groups.items():
+        n_batch = len(frag_indices)
+        idx = np.array(frag_indices)
+
+        pos_group = pos_pad[idx, :nr]    # (n_batch, nr, 3)
+        ref_group = ref_pad[idx, :nr]    # (n_batch, nr, 3)
+        v_group = v_pad[idx, :nr]        # (n_batch, nr, 3)
+
+        if ws_all is not None and vecs_all is not None:
+            ws = ws_all[idx]
+            vecs = vecs_all[idx]
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
+        else:
+            dx = pos_group - pos_group.mean(axis=1, keepdims=True)
+            R = np.matmul(dx.swapaxes(1, 2), ref_group)  # (n_batch, 3, 3)
+            Rtr = np.trace(R, axis1=1, axis2=2)
+            Ftop = np.stack([
+                R[:, 1, 2] - R[:, 2, 1],
+                R[:, 2, 0] - R[:, 0, 2],
+                R[:, 0, 1] - R[:, 1, 0],
+            ], axis=1)
+            F = np.zeros((n_batch, 4, 4))
+            F[:, 0, 0] = Rtr
+            F[:, 0, 1:] = Ftop
+            F[:, 1:, 0] = Ftop
+            for i in range(3):
+                F[:, 1+i, 1+i] = -Rtr
+            F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
+            ws, vecs = np.linalg.eigh(F)
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
+
+        gaps = ws - ws[:, -1:]
+        safe_inv = np.where(
+            np.abs(gaps) > 1e-14,
+            1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
+            0.0,
+        )
+
+        # refpos is already centered at construction
+        Pref = ref_group
+
+        # dFc: dF @ c for all (k,d)
+        dFc_flat = _build_dF_vec_batched(Pref, c, n_batch, nr)  # (n_batch, M, 4)
+        M = nr * 3
+
+        dE_flat = np.squeeze(dFc_flat @ c[:, :, None], -1)  # (n_batch, M)
+        # dc_flat = -vecs @ (safe_inv * (vecs^T @ dFc_flat^T))^T
+        proj = np.matmul(dFc_flat, vecs)  # (n_batch, M, 4)
+        dc_flat = -np.matmul(proj * safe_inv[:, None, :], vecs.swapaxes(1, 2))  # (n_batch, M, 4)
+
+        # Axis-independent computations (hoisted from axis loop)
+        v_flat = v_group.reshape(n_batch, M)
+        dc_v = np.squeeze(dc_flat.swapaxes(1, 2) @ v_flat[:, :, None], -1)  # (n_batch, 4)
+        dE_v = (dE_flat * v_flat).sum(axis=1)  # (n_batch,)
+        d2E_v = 2 * np.squeeze(dFc_flat @ dc_v[:, :, None], -1)  # (n_batch, M)
+        dc_dot_v = np.squeeze(dc_flat @ dc_v[:, :, None], -1)  # (n_batch, M)
+
+        q0 = c[:, 0]
+        s2 = np.maximum(1 - q0**2, 1e-30)
+        s = np.sqrt(s2)
+        ac = np.arccos(np.clip(q0, -1+1e-15, 1-1e-15))
+        near_one = np.abs(q0 - 1.0) < 1e-8
+        y = q0 - 1.0
+        asinc_val = np.where(near_one, 1 - y/3 + 2*y**2/15, ac/s)
+        dasinc = np.where(near_one, -1.0/3 + 4*y/15, -1.0/s2 + q0*ac/(s*s2))
+        d2asinc = np.where(near_one, 4.0/15,
+                           (3*q0/s2 - (1+2*q0**2)*ac/(s*s2)) * (-1.0/s2))
+
+        for axis in range(3):
+            a = axis + 1
+            qa = c[:, a]
+
+            df_dq = np.zeros((n_batch, 4))
+            df_dq[:, 0] = 2 * qa * dasinc
+            df_dq[:, a] = 2 * asinc_val
+
+            d2f_dq2 = np.zeros((n_batch, 4, 4))
+            d2f_dq2[:, 0, 0] = 2 * qa * d2asinc
+            d2f_dq2[:, 0, a] = 2 * dasinc
+            d2f_dq2[:, a, 0] = 2 * dasinc
+
+            # term1: dc @ d2f @ dc^T @ v = dc @ d2f @ dc_v
+            t1_hvp = np.squeeze(
+                dc_flat @ (d2f_dq2 @ dc_v[:, :, None]), -1
+            )  # (n_batch, M)
+
+            # term2: w = M_inv(df_dq)
+            proj_w = np.squeeze(vecs.swapaxes(1, 2) @ df_dq[:, :, None], -1)
+            w = np.squeeze(vecs @ (safe_inv * proj_w)[:, :, None], -1)  # (n_batch, 4)
+            wc = (w * c).sum(axis=1)  # (n_batch,)
+            w_dc = np.squeeze(dc_flat @ w[:, :, None], -1)  # (n_batch, M)
+            fdq_c = (df_dq * c).sum(axis=1)  # (n_batch,)
+
+            # dFw: dF @ w for all (k,d)
+            dFw_flat = _build_dF_vec_batched(Pref, w, n_batch, nr)  # (n_batch, M, 4)
+
+            w_dc_v = (w_dc * v_flat).sum(axis=1)  # (n_batch,)
+
+            # wdFdc @ v = dFw_flat @ dc_v
+            wdFdc_v = np.squeeze(dFw_flat @ dc_v[:, :, None], -1)
+
+            # wdFdc^T @ v = dc_flat @ (dFw_flat^T @ v)
+            dFw_v = np.squeeze(dFw_flat.swapaxes(1, 2) @ v_flat[:, :, None], -1)
+            wdFdcT_v = np.squeeze(dc_flat @ dFw_v[:, :, None], -1)
+
+            t2_hvp = (dE_flat * w_dc_v[:, None]
+                      + dE_v[:, None] * w_dc
+                      + wc[:, None] * d2E_v
+                      - wdFdc_v - wdFdcT_v
+                      - fdq_c[:, None] * dc_dot_v)
+
+            hvp_axis = (t1_hvp + t2_hvp).reshape(n_batch, nr, 3)
+            hvp[idx, axis, :nr, :] = hvp_axis
+
+    return hvp
 
 
 def _rotation_3axis_hvp(pos, refpos, mask, v):
@@ -651,44 +1027,6 @@ _rotation_3axis_hvp_batched_jit = jit(
 )
 
 
-def _rotation_hess_padded_vmap(positions, refpos_padded, mask):
-    """JIT+vmap'd Hessian for all rotations of one fragment, batched.
-
-    positions: (B, N_max, 3) — fragment positions, padded
-    refpos_padded: (B, N_max, 3) — fragment refpos, centered+padded
-    mask: (B, N_max) — 1 on real atoms, 0 on padding
-
-    Returns: (B, 3, N_max, 3, N_max, 3) — per-fragment, per-axis, full
-    NxN Hessian with padded rows/cols zeroed out.
-    """
-    return _rotation_3axis_hess_batched(positions, refpos_padded, mask)
-
-
-def _rotation_hvp(
-    pos: jnp.ndarray,
-    axis: int,
-    refpos: jnp.ndarray,
-    tangent: jnp.ndarray
-) -> jnp.ndarray:
-    """Compute Hessian @ tangent for rotation without forming the full Hessian.
-
-    Uses forward-over-reverse mode autodiff: jvp(grad(f)) which is O(N) instead
-    of O(N²) for materializing the full Hessian via jacfwd(jacfwd(f)).
-    """
-    primals = (pos,)
-    tangents = (tangent,)
-    # grad returns gradient w.r.t. pos; jvp computes directional derivative
-    _, hvp_result = jvp(
-        lambda p: grad(_rotation, argnums=0)(p, axis, refpos),
-        primals,
-        tangents
-    )
-    return hvp_result
-
-
-_rotation_hvp_jit = jit(_rotation_hvp, static_argnums=(1,))
-
-
 class Rotation(Coordinate):
     def __init__(
         self,
@@ -700,6 +1038,7 @@ class Rotation(Coordinate):
         Coordinate.__init__(self, indices)
         self.kwargs['axis'] = axis
         self.kwargs['refpos'] = refpos.copy() - refpos.mean(0)
+        self.q_prev = None
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
@@ -714,21 +1053,29 @@ class Rotation(Coordinate):
             return False
         return True
 
-    _eval0 = staticmethod(jit(_rotation))
-    _eval1 = staticmethod(jit(jacfwd(_rotation, argnums=0)))
-    _eval2 = staticmethod(jit(jacfwd(jacfwd(_rotation, argnums=0), argnums=0)))
+    def calc(self, atoms: Atoms) -> float:
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        dx = pos - pos.mean(0)
+        refpos = self.kwargs['refpos']
+        F = _build_F_matrix_np(dx, refpos)
+        q = _stabilize_quaternion(F, self.q_prev)
+        self.q_prev = q
+        axis = self.kwargs['axis']
+        return float(2.0 * q[axis + 1] * _asinc_np(q[0]))
+
+    def calc_gradient(self, atoms: Atoms) -> np.ndarray:
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        refpos = self.kwargs['refpos']
+        jac = _rotation_3axis_jacobian_np(pos, refpos, self.q_prev)
+        return jac[self.kwargs['axis']]
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        result = np.array(self._eval2(
-            atoms.positions[self.indices], **self.kwargs
-        ))
-        # For linear molecules, the quaternion eigenvalue problem in
-        # _rotation_q has degenerate eigenvalues, producing NaN second
-        # derivatives. The corresponding rotation is physically
-        # meaningless (zero Jacobian), so replacing NaN with 0 is exact.
-        if np.any(np.isnan(result)):
-            np.nan_to_num(result, copy=False)
-        return result
+        return _rotation_hessian_np(
+            atoms.positions[self.indices],
+            self.kwargs['axis'],
+            self.kwargs['refpos'],
+            q_stable=self.q_prev,
+        )
 
 
 def _displacement(
@@ -1698,8 +2045,55 @@ class BaseInternals:
         self._cache['rotation_pad'] = out
         return out
 
+    def _get_stabilized_quaternions(self, positions: np.ndarray):
+        """Return cached stabilized quaternions, recomputing if needed.
+
+        Returns a list of (4,) numpy arrays, one per fragment, or None
+        if the batched path is invalid.  Also caches per-fragment
+        eigenvalues/eigenvectors in ``self._cache['stabilized_q_eigh']``
+        for reuse in the HVP path.
+        """
+        cached = self._cache.get('stabilized_q')
+        if cached is not None:
+            return cached
+        rotations = self.internals['rotations']
+        if not rotations:
+            self._cache['stabilized_q'] = []
+            self._cache['stabilized_q_eigh'] = (None, None)
+            return []
+        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+            self._rotation_padded_inputs(positions)
+        )
+        if not valid:
+            self._cache['stabilized_q'] = None
+            self._cache['stabilized_q_eigh'] = (None, None)
+            return None
+        n_frags = len(slots)
+        ws_list = []
+        vecs_list = []
+        qs = []
+        for fi, slot in enumerate(slots):
+            n = len(frag_indices[fi])
+            pos_frag = pos_pad[fi, :n]
+            ref_frag = ref_pad[fi, :n]
+            dx = pos_frag - pos_frag.mean(0)
+            F = _build_F_matrix_np(dx, ref_frag)
+            q_prev = rotations[slot[0]].q_prev
+            ws_i, vecs_i = np.linalg.eigh(F)
+            ws_list.append(ws_i)
+            vecs_list.append(vecs_i)
+            q = _stabilize_quaternion_from_eigh(ws_i, vecs_i, q_prev)
+            for axis in range(3):
+                rotations[slot[axis]].q_prev = q
+            qs.append(q)
+        self._cache['stabilized_q'] = qs
+        self._cache['stabilized_q_eigh'] = (
+            np.array(ws_list), np.array(vecs_list)
+        )
+        return qs
+
     def _batched_rotation_values(self, positions: np.ndarray):
-        """Per-Rotation values via one padded+vmapped JAX dispatch.
+        """Per-Rotation values with projective quaternion stabilization.
 
         Returns a length-N_rotations list of floats in original order,
         or None when the heterogeneous fall-back is required.
@@ -1707,21 +2101,19 @@ class BaseInternals:
         rotations = self.internals['rotations']
         if not rotations:
             return []
-        pos_pad, ref_pad, mask, _, slots, valid = self._rotation_padded_inputs(positions)
-        if not valid:
+        qs = self._get_stabilized_quaternions(positions)
+        if qs is None:
             return None
-        vals_padded = np.asarray(device_get(_rotation_3axis_value_batched(
-            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
-        )))
-        # vals_padded.shape == (n_frags, 3)
+        _, _, _, _, slots, _ = self._rotation_padded_inputs(positions)
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
+            vals = _expmap_np(qs[fi])
             for axis, rot_idx in enumerate(slot):
-                out[rot_idx] = float(vals_padded[fi, axis])
+                out[rot_idx] = float(vals[axis])
         return out
 
     def _batched_rotation_gradients(self, positions: np.ndarray):
-        """Per-Rotation gradients via one padded+vmapped JAX dispatch.
+        """Per-Rotation gradients using stabilized quaternion.
 
         Returns a list of ``(indices, grad)`` tuples in original order,
         or None when the heterogeneous fall-back is required.
@@ -1729,62 +2121,46 @@ class BaseInternals:
         rotations = self.internals['rotations']
         if not rotations:
             return []
-        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+        qs = self._get_stabilized_quaternions(positions)
+        if qs is None:
+            return None
+        pos_pad, ref_pad, _, frag_indices, slots, _ = (
             self._rotation_padded_inputs(positions)
         )
-        if not valid:
-            return None
-        grads_padded = np.asarray(device_get(_rotation_3axis_grad_batched(
-            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
-        )))
-        # grads_padded.shape == (n_frags, 3, N_max, 3)
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
+            pos_frag = pos_pad[fi, :n]
+            ref_frag = ref_pad[fi, :n]
+            jac = _rotation_3axis_jacobian_np(pos_frag, ref_frag, qs[fi])
             for axis, rot_idx in enumerate(slot):
-                out[rot_idx] = (frag_indices[fi], grads_padded[fi, axis, :n, :])
+                out[rot_idx] = (frag_indices[fi], jac[axis])
         return out
 
     def _batched_rotation_hessians(self, positions: np.ndarray):
-        """Compute per-Rotation Hessians via one padded+vmapped JAX dispatch.
+        """Compute per-Rotation Hessians using stabilized quaternion.
 
-        Each fragment owns 3 Rotation objects (axes 0,1,2) that share
-        the same atom indices and refpos. We group them by fragment,
-        pad to the max-fragment-size across the system, run one
-        vmapped call to ``_rotation_hess_padded_vmap``, and slice the
-        result back into per-Rotation arrays.
-
-        On AJEYAQ (4 fragments x 3 axes = 12 Rotations) this drops the
-        rotation portion of int.hessian build from ~14ms to ~1ms.
         Returns a list of ``(indices, hess)`` tuples in the original
-        per-Rotation order, matching the shape Internals.hessian
-        expects.
+        per-Rotation order.
         """
         rotations = self.internals['rotations']
         if not rotations:
             return []
-        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+        qs = self._get_stabilized_quaternions(positions)
+        if qs is None:
+            return [(r.indices, np.array(r.calc_hessian(
+                self.light_atoms))) for r in rotations]
+        pos_pad, ref_pad, _, frag_indices, slots, _ = (
             self._rotation_padded_inputs(positions)
         )
-        if not valid:
-            atoms = self.light_atoms
-            return [(r.indices, np.array(r.calc_hessian(atoms)))
-                    for r in rotations]
-        hess_padded = np.array(device_get(_rotation_hess_padded_vmap(
-            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
-        )))
-        # For linear molecules, the quaternion eigenvalue problem has
-        # degenerate eigenvalues producing NaN second derivatives. The
-        # corresponding rotation is physically meaningless (zero Jacobian),
-        # so replacing NaN with 0 is exact.
-        if np.any(np.isnan(hess_padded)):
-            np.nan_to_num(hess_padded, copy=False)
-        # hess_padded.shape == (n_frags, 3, N_max, 3, N_max, 3)
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
+            pos_frag = np.asarray(pos_pad[fi, :n], dtype=np.float64)
+            ref_frag = np.asarray(ref_pad[fi, :n], dtype=np.float64)
             for axis, rot_idx in enumerate(slot):
-                h = hess_padded[fi, axis, :n, :, :n, :]
+                h = _rotation_hessian_single(pos_frag, axis, ref_frag,
+                                             q_stable=qs[fi])
                 out[rot_idx] = (frag_indices[fi], h)
         return out
 
@@ -2049,14 +2425,12 @@ class BaseInternals:
                 v_sub = v_atoms[dih_active_idx]
                 dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
 
-        # Launch rotation HVPs: one vmapped dispatch per fragment x 3 axes
-        # when all rotations are active and all fragments have all 3 axes.
-        # Otherwise fall back to per-rotation calls.
-        rot_jax_results = []
-        rot_indices = []
-        rot_batched_result = None
+        # Compute rotation HVPs using closed-form Hessian (handles
+        # degenerate eigenvalues for linear/near-linear fragments).
+        rot_closed_results = []
         rot_batched_slots = None
         rot_batched_frag_indices = None
+        rot_batched_hvp = None
         all_rot_active = bool(np.asarray(rot_active, dtype=bool).all())
         if all_rot_active and self.internals['rotations']:
             pos_pad, ref_pad, mask, frag_indices, slots, valid = (
@@ -2065,13 +2439,18 @@ class BaseInternals:
         else:
             valid = False
         if valid:
+            qs = self._get_stabilized_quaternions(positions)
+            q_stable_all = np.array(qs) if qs is not None else None
+            cached_eigh = self._cache.get('stabilized_q_eigh', (None, None))
+            ws_cached, vecs_cached = cached_eigh
             n_max = mask.shape[1]
             v_pad = np.zeros((len(frag_indices), n_max, 3), dtype=np.float64)
             for fi, fi_idx in enumerate(frag_indices):
                 v_pad[fi, :len(fi_idx)] = v_atoms[fi_idx]
-            rot_batched_result = _rotation_3axis_hvp_batched_jit(
-                jnp.asarray(pos_pad), jnp.asarray(ref_pad),
-                jnp.asarray(mask), jnp.asarray(v_pad),
+            rot_batched_hvp = _rotation_3axis_hvp_batched_closed(
+                pos_pad, ref_pad, mask, v_pad,
+                q_stable_all=q_stable_all,
+                ws_all=ws_cached, vecs_all=vecs_cached,
             )
             rot_batched_slots = slots
             rot_batched_frag_indices = frag_indices
@@ -2083,9 +2462,9 @@ class BaseInternals:
                     v_sub = v_atoms[idx]
                     axis = coord.kwargs['axis']
                     refpos = coord.kwargs['refpos']
-                    rot_jax_results.append(
-                        (_rotation_hvp_jit(pos, axis, refpos, v_sub), idx)
-                    )
+                    hvp = _rotation_hvp_closed(pos, axis, refpos, v_sub,
+                                               q_stable=coord.q_prev)
+                    rot_closed_results.append((hvp, idx))
 
         # Now collect results with device_get and scatter into output
 
@@ -2150,11 +2529,11 @@ class BaseInternals:
                     out_row[idx] = hvp
                 row += 1
 
-        # Rotations - collect results (batched or per-rotation)
-        if rot_batched_result is not None:
-            hvp_padded = np.asarray(device_get(rot_batched_result))
+        # Rotations - collect results from closed-form Hessian (no NaN
+        # for degenerate eigenvalues)
+        if rot_batched_hvp is not None:
+            hvp_padded = rot_batched_hvp
             # hvp_padded.shape == (n_frags, 3, N_max, 3)
-            # Reassemble in original Rotation order
             ordered = [None] * len(self.internals['rotations'])
             for fi, slot in enumerate(rot_batched_slots):
                 n = len(rot_batched_frag_indices[fi])
@@ -2177,8 +2556,7 @@ class BaseInternals:
                     out_row[idx] = hvp
                 row += 1
         else:
-            for jax_result, idx in rot_jax_results:
-                hvp = np.asarray(device_get(jax_result))
+            for hvp, idx in rot_closed_results:
                 if use_sparse:
                     dense_row = np.zeros(ndof)
                     dense_row.reshape((-1, 3))[idx] = hvp
@@ -2196,206 +2574,57 @@ class BaseInternals:
             )
         return out[:row]
 
-    def hessian_rdot_vecs(self, v: np.ndarray, *us: np.ndarray):
-        """Compute (H_i @ v) · u for all active internal coordinates.
-
-        Equivalent to ``[hessian_rdot(v) @ u for u in us]`` but avoids
-        materializing the dense (n_coords, ndof) matrix.  Each element *i*
-        of a result vector is the dot product of coordinate *i*'s
-        Hessian-vector product row with *u*.
-
-        Args:
-            v: Vector of shape (ndof,) — the HVP direction.
-            *us: One or more vectors of shape (ndof,) to contract with.
-
-        Returns:
-            Tuple of arrays, each of shape (n_active_coords,).
-        """
-        self._cache_check()
-        positions = self.all_positions
-        cell = self.atoms.cell.array
-        self._build_batched_arrays()
-        tvecs = self._get_cached_tvecs(cell)
-
-        v_atoms = v.reshape((-1, 3))
-        u_atoms_list = [u.reshape((-1, 3)) for u in us]
-        n_us = len(us)
-
-        # Active mask bookkeeping (same as hessian_rdot)
-        active_mask = self._active_mask
-        n_trans = len(self.internals['translations'])
-        n_bonds = len(self.internals['bonds'])
-        n_angles = len(self.internals['angles'])
-        n_dihedrals = len(self.internals['dihedrals'])
-        n_other = len(self.internals['other'])
-        n_rot = len(self.internals['rotations'])
-
-        start = 0
-        trans_active = active_mask[start:start + n_trans]
-        start += n_trans
-        bonds_active = np.array(active_mask[start:start + n_bonds], dtype=bool)
-        start += n_bonds
-        angles_active = np.array(active_mask[start:start + n_angles], dtype=bool)
-        start += n_angles
-        dihedrals_active = np.array(
-            active_mask[start:start + n_dihedrals], dtype=bool
-        )
-        start += n_dihedrals
-        other_active = active_mask[start:start + n_other]
-        start += n_other
-        rot_active = active_mask[start:start + n_rot]
-
-        # Collect per-coordinate-type result fragments for each u
-        results = [[] for _ in range(n_us)]
-
-        # --- Translations: Hessian is zero → dot product is zero ---
-        n_active_trans = sum(trans_active)
-        if n_active_trans > 0:
-            z = np.zeros(n_active_trans)
-            for r in results:
-                r.append(z)
-
-        # --- Bonds ---
-        if bonds_active.any() and self._n_bonds_actual > 0:
-            if bonds_active.all():
-                bond_pos = positions[self._bond_indices_padded]
-                bond_tvecs = tvecs['bonds_padded']
-                v_sub = v_atoms[self._bond_indices_padded]
-                hvp_padded = np.asarray(
-                    device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))
-                )
-                hvp = hvp_padded[:self._n_bonds_actual]
-                active_idx = self._bond_indices
-            else:
-                active_idx = self._bond_indices[bonds_active]
-                bond_pos = positions[active_idx]
-                bond_tvecs = tvecs['bonds'][bonds_active]
-                v_sub = v_atoms[active_idx]
-                hvp = np.asarray(
-                    device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))
-                )
-            for k, u_atoms in enumerate(u_atoms_list):
-                u_gathered = u_atoms[active_idx]  # (n_bonds, 2, 3)
-                results[k].append(
-                    np.sum(hvp * u_gathered, axis=(1, 2))
-                )
-
-        # --- Angles ---
-        if angles_active.any() and self._n_angles_actual > 0:
-            if angles_active.all():
-                angle_pos = positions[self._angle_indices_padded]
-                angle_tvecs = tvecs['angles_padded']
-                v_sub = v_atoms[self._angle_indices_padded]
-                hvp_padded = np.asarray(
-                    device_get(
-                        _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-                    )
-                )
-                hvp = hvp_padded[:self._n_angles_actual]
-                active_idx = self._angle_indices
-            else:
-                active_idx = self._angle_indices[angles_active]
-                angle_pos = positions[active_idx]
-                angle_tvecs = tvecs['angles'][angles_active]
-                v_sub = v_atoms[active_idx]
-                hvp = np.asarray(
-                    device_get(
-                        _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-                    )
-                )
-            for k, u_atoms in enumerate(u_atoms_list):
-                u_gathered = u_atoms[active_idx]  # (n_angles, 3, 3)
-                results[k].append(
-                    np.sum(hvp * u_gathered, axis=(1, 2))
-                )
-
-        # --- Dihedrals ---
-        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
-            if dihedrals_active.all():
-                dih_pos = positions[self._dihedral_indices_padded]
-                dih_tvecs = tvecs['dihedrals_padded']
-                v_sub = v_atoms[self._dihedral_indices_padded]
-                hvp_padded = np.asarray(
-                    device_get(
-                        _dihedral_hvp_batched(
-                            dih_pos, dih_tvecs, v_sub
-                        )
-                    )
-                )
-                hvp = hvp_padded[:self._n_dihedrals_actual]
-                active_idx = self._dihedral_indices
-            else:
-                active_idx = self._dihedral_indices[dihedrals_active]
-                dih_pos = positions[active_idx]
-                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
-                v_sub = v_atoms[active_idx]
-                hvp = np.asarray(
-                    device_get(
-                        _dihedral_hvp_batched(
-                            dih_pos, dih_tvecs, v_sub
-                        )
-                    )
-                )
-            for k, u_atoms in enumerate(u_atoms_list):
-                u_gathered = u_atoms[active_idx]  # (n_dihedrals, 4, 3)
-                results[k].append(
-                    np.sum(hvp * u_gathered, axis=(1, 2))
-                )
-
-        # --- Other (typically few coords, loop is fine) ---
-        atoms = self.light_atoms
-        for i, coord in enumerate(self.internals['other']):
-            if other_active[i]:
-                hess = np.array(coord.calc_hessian(atoms))
-                idx = np.array(coord.indices)
-                v_sub = v_atoms[idx]
-                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
-                for k, u_atoms in enumerate(u_atoms_list):
-                    u_sub = u_atoms[idx]
-                    results[k].append(
-                        np.array([np.sum(hvp * u_sub)])
-                    )
-
-        # --- Rotations ---
-        for i, coord in enumerate(self.internals['rotations']):
-            if rot_active[i]:
-                idx = np.array(coord.indices)
-                pos = positions[idx]
-                v_sub = v_atoms[idx]
-                axis = coord.kwargs['axis']
-                refpos = coord.kwargs['refpos']
-                hvp = np.asarray(
-                    device_get(
-                        _rotation_hvp_jit(pos, axis, refpos, v_sub)
-                    )
-                )
-                for k, u_atoms in enumerate(u_atoms_list):
-                    u_sub = u_atoms[idx]
-                    results[k].append(
-                        np.array([np.sum(hvp * u_sub)])
-                    )
-
-        # Concatenate fragments for each u
-        out = []
-        for r in results:
-            if r:
-                out.append(np.concatenate(r))
-            else:
-                out.append(np.empty(0))
-        return tuple(out)
-
     def wrap(self, vec: np.ndarray) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""
-        # TODO: make this more robust to the addition of other arbitrary
-        # internal coordinates.
         start = 0
         for name in self._names:
+            n = len(self.internals[name])
             if name == 'dihedrals':
-                end = start + len(self.internals[name])
-                break
-            start += len(self.internals[name])
-        vec[start:end] = (vec[start:end] + np.pi) % (2 * np.pi) - np.pi
+                vec[start:start + n] = (vec[start:start + n] + np.pi) % (2 * np.pi) - np.pi
+            elif name == 'rotations' and n > 0:
+                self._wrap_rotation_diff(vec, start)
+            start += n
         return vec
+
+    def _wrap_rotation_diff(self, vec, rot_start):
+        """Wrap rotation coordinate differences along rotation axis.
+
+        The exponential map has period 2π along the rotation axis
+        direction. For each fragment's 3 rotation components, find the
+        minimum-image difference by adding/subtracting 2π * v̂.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return
+        # Group rotations by fragment (same indices and refpos)
+        groups = {}
+        for i, r in enumerate(rotations):
+            key = (tuple(r.indices), r.kwargs['refpos'].tobytes())
+            groups.setdefault(key, []).append(i)
+
+        for key, indices in groups.items():
+            if len(indices) != 3:
+                continue
+            # Get the 3-component rotation difference vector
+            idx = [rot_start + i for i in indices]
+            v = vec[idx].copy()
+            vnorm = np.linalg.norm(v)
+            if vnorm < 1e-10:
+                continue
+            vh = v / vnorm
+            # Try adding/subtracting 2π along v̂ to minimize |v|
+            best_v = v.copy()
+            best_d2 = np.dot(v, v)
+            for direction in [1, -1]:
+                vt = v.copy()
+                while True:
+                    vt += direction * 2 * np.pi * vh
+                    d2 = np.dot(vt, vt)
+                    if d2 >= best_d2:
+                        break
+                    best_v = vt.copy()
+                    best_d2 = d2
+            vec[idx] = best_v
 
     def __iter__(self) -> Iterator[Coordinate]:
         for name in self._names:
@@ -3210,7 +3439,8 @@ class Internals(BaseInternals):
                 self._wrap_fragment_positions(group, cumshifts)
                 self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
                 self.add_translation(group)
-                self.add_rotation(group)
+                if len(group) >= 2:
+                    self.add_rotation(group)
 
             # Update bond ncvecs to match the new wrapped positions.
             # ncvec_new = ncvec_old - cumshift[j] + cumshift[i]
@@ -3284,15 +3514,17 @@ class Internals(BaseInternals):
                         dpos += self.atoms.positions[j]
                         self.dummies += Atom('X', dpos)
                         self._batched_arrays_valid = False
+                        self._cache.pop('all_positions', None)
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond, replace_ok=False)
                     self.add_bond(dbond)
-                    # Fix one dummy angle
+                    # Fix one dummy angle (only one — for linear O1-C-O2
+                    # the angles O1-C-dummy and O2-C-dummy are supplementary,
+                    # so constraining both over-constrains real atoms)
                     dangle1 = b1 + dbond
                     self.cons.fix_angle(dangle1, replace_ok=False)
                     dangle2 = b2 + dbond
-                    self.cons.fix_angle(dangle2, replace_ok=False)
                     # Fix the improper dihedral and update relevant internals
                     if b2.indices[1] == j:
                         b2 = b2.reverse()
@@ -3560,9 +3792,10 @@ class Internals(BaseInternals):
     def guess_hessian(self, h0cart=70.) -> np.ndarray:
         nbonds = np.zeros(len(self.all_atoms), dtype=np.int32)
         h0 = np.zeros(self.nint, dtype=np.float64)
+        h0_tr = 0.05 * units.Hartree
         idx = 0
         for trans in self.internals['translations']:
-            h0[idx] = h0cart
+            h0[idx] = h0_tr if self.allow_fragments else h0cart
             idx += 1
         for bond in self.internals['bonds']:
             h0[idx] = self._h0_bond(bond)
@@ -3581,7 +3814,7 @@ class Internals(BaseInternals):
             else:
                 h0[idx] = self._h0_dihedral(dihedral, nbonds)
             idx += 1
-        # remaining degrees of freedom are rotations.
-        # No idea what a good curvature is for these
-        h0[idx:] = 1.
+        for rot in self.internals['rotations']:
+            h0[idx] = h0_tr if self.allow_fragments else h0cart
+            idx += 1
         return np.diag(np.abs(h0))
