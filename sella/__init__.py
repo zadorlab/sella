@@ -3,9 +3,12 @@ import os
 # Enable JAX persistent compilation cache before importing jax
 # This caches compiled XLA programs to disk, eliminating ~5s of JIT
 # compilation overhead on subsequent runs
-_cache_dir = os.path.expanduser("~/.cache/sella/jax_cache")
+# Cache dir is given by an environment variable, or a fallback if not set
+# Explicitly setting the environment variable is recommended if the home
+# directory is not writable
+_cache_dir = os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
+                                   os.path.expanduser("~/.cache/sella/jax_cache"))
 os.makedirs(_cache_dir, exist_ok=True)
-os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _cache_dir)
 # JAX is used only for AD, not linalg; GPU linalg routes through torch
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
