@@ -22,7 +22,7 @@ _default_kwargs = dict(
         delta0=1e-1,
         sigma_inc=1.15,
         sigma_dec=0.90,
-        rho_inc=4./3.,
+        rho_inc=1.035,
         rho_dec=100,
         method='qn',
         eig=False
@@ -76,6 +76,7 @@ class Sella(Optimizer):
         niggli: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        exact_geodesic: bool = None,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -120,6 +121,8 @@ class Sella(Optimizer):
             default = _default_kwargs['minimum']
         else:
             default = _default_kwargs['saddle']
+
+        self.exact_geodesic = exact_geodesic if exact_geodesic is not None else True
 
         # Validate cell optimization parameters
         self.optimize_cell = optimize_cell
@@ -275,6 +278,7 @@ class Sella(Optimizer):
                     v0=v0,
                     auto_find_internals=auto_find_internals,
                     hessian_function=hessian_function,
+                    exact_geodesic=self.exact_geodesic,
                     **kwargs
                 )
         else:
