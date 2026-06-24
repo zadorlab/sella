@@ -69,6 +69,19 @@ def _split_cons_subspace(drdxnred, tol_factor=1e-6):
     return Q[:, :ncons], Q[:, ncons:]
 
 
+def _range_space_projector(B):
+    """Orthogonal projector onto range(B) with rank truncation via pivoting QR."""
+    Q, R, _ = qr(B, mode='full', pivoting=True, check_finite=False)
+    rdiag = np.abs(np.diag(R))
+    rcond = max(B.shape) * np.finfo(B.dtype).eps
+    if rdiag.size and rdiag[0] > 0:
+        nkeep = int(np.sum(rdiag > rcond * rdiag[0]))
+    else:
+        nkeep = 0
+    Q_r = Q[:, :nkeep]
+    return Q_r @ Q_r.T
+
+
 def _logm_3x3(F):
     """Closed-form 3x3 matrix logarithm via eigendecomposition.
 
@@ -602,6 +615,7 @@ class InternalPES(PES):
         H0: np.ndarray = None,
         iterative_stepper: int = 0,
         auto_find_internals: bool = True,
+        exact_geodesic: bool = False,
         **kwargs
     ):
         self.int_orig = internals
@@ -631,8 +645,7 @@ class InternalPES(PES):
             # Construct guess hessian and zero out components in
             # infeasible subspace
             B = self.int.jacobian()
-            Q, _ = qr(B, mode='economic')
-            P = Q @ Q.T
+            P = _range_space_projector(B)
             H0 = P @ self.int.guess_hessian() @ P
             self.set_H(H0, initialized=False)
         else:
@@ -641,6 +654,7 @@ class InternalPES(PES):
         # Flag used to indicate that new internal coordinates are required
         self.bad_int = None
         self.iterative_stepper = iterative_stepper
+        self.exact_geodesic = exact_geodesic
 
         self._pinv_cache = _LRU2()
         self._qr_cache = _LRU2()
@@ -1198,7 +1212,7 @@ class InternalPES(PES):
         # Batch the two D_rdot @ vector products into one (D_rdot @ matrix)
         # matmul, then one Binv @ matrix matmul, halving the matmul count.
         D_rdot = self.int.hessian_rdot(dxdt)
-        Binv = self._ode_Binv
+        Binv = self._get_Binv() if self.exact_geodesic else self._ode_Binv
         rhs = np.column_stack((dxdt, g))     # (ndof, 2)
         out = -Binv @ (D_rdot @ rhs)          # (ndof, 2)
         dydt[1] = out[:, 0]
@@ -1449,8 +1463,7 @@ class CellInternalPES(InternalPES):
             H0_full[:self.n_internal, :self.n_internal] = H_old
         else:
             B = self.int.jacobian()
-            Q, _ = qr(B, mode='economic')
-            P = Q @ Q.T
+            P = _range_space_projector(B)
             H_internal = P @ self.int.guess_hessian() @ P
             H0_full[:self.n_internal, :self.n_internal] = H_internal
 
