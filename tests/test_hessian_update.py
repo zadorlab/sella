@@ -4,7 +4,9 @@ from scipy.linalg import eigh, lstsq
 
 from test_utils import get_matrix
 
-from sella.hessian_update import update_H, _MS_TS_BFGS, _MS_PSB
+from sella.hessian_update import (
+    update_H, symmetrize_Y, _MS_TS_BFGS, _MS_PSB,
+)
 
 
 @pytest.mark.parametrize("dim,subdim,method,symm, pd",
@@ -70,3 +72,23 @@ def test_rank_one_ts_bfgs_matches_general_formula():
 
     actual = _MS_TS_BFGS(B, S, Y, lams, vecs)
     np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize('method', [0, 1, 2])
+def test_symmetrize_Y_enforces_symmetric_secant_products(method):
+    """Every Y symmetrization method must make S.T @ Y symmetric."""
+    rng = np.random.default_rng(7)
+    S = rng.normal(size=(8, 3))
+    Y = rng.normal(size=(8, 3))
+    original_product = S.T @ Y
+
+    assert not np.allclose(original_product, original_product.T)
+
+    Y_symmetric = symmetrize_Y(S, Y, symm=method)
+    corrected_product = S.T @ Y_symmetric
+
+    np.testing.assert_allclose(
+        corrected_product, corrected_product.T, atol=1e-12
+    )
+    np.testing.assert_array_equal(Y_symmetric[:, 0], Y[:, 0])
+    assert not np.allclose(Y_symmetric, Y)

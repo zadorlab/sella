@@ -76,7 +76,9 @@ def test_irc_takes_first_step_from_converged_ts():
     for direction in ('forward', 'reverse'):
         atoms = _ts()
         irc = IRC(atoms, dx=0.1, keep_going=True, logfile=None)
-        irc.run(fmax=0.05, steps=100, direction=direction)
+        converged = irc.run(fmax=0.05, steps=100, direction=direction)
+        assert converged
+        assert irc.converged()
         assert irc.nsteps > 0, f"{direction} IRC took no steps"
         assert np.abs(atoms.get_positions() - x0).max() > 1e-3, \
             f"{direction} IRC did not leave the TS"
