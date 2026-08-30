@@ -3,21 +3,9 @@ import numpy as np
 
 from sella.utilities.math import pseudo_inverse, modified_gram_schmidt
 
-from test_utils import get_matrix
-
-# Try to import Cython-based wrappers - skip tests if not available
-try:
-    import pyximport
-    pyximport.install(language_level=3)
-    from math_wrappers import wrappers
-    HAS_CYTHON = True
-except ImportError:
-    HAS_CYTHON = False
-    wrappers = None
-
-# TODO: figure out why m > n crashes
 @pytest.mark.parametrize("n,m,eps",
                          [(3, 3, 1e-10),
+                          (3, 5, 1e-10),
                           (100, 3, 1e-6),
                           ])
 def test_mppi(n, m, eps):
@@ -25,7 +13,7 @@ def test_mppi(n, m, eps):
 
     tol = dict(atol=1e-6, rtol=1e-6)
 
-    A = get_matrix(n, m, rng=rng)
+    A = rng.normal(size=(n, m))
     U1, s1, VT1, Ainv, nsing1 = pseudo_inverse(A.copy(), eps=eps)
 
     A_test = U1[:, :nsing1] @ np.diag(s1) @ VT1[:nsing1, :]
@@ -37,6 +25,20 @@ def test_mppi(n, m, eps):
     nsingB = nsing1 - 1
     B = U1[:, :nsingB] @ np.diag(s1[:nsingB]) @ VT1[:nsingB, :]
     U2, s2, VT2, Binv, nsing2 = pseudo_inverse(B.copy(), eps=eps)
+    assert nsing2 == nsingB
+    np.testing.assert_allclose(B @ Binv @ B, B, **tol)
+
+
+def test_pseudo_inverse_zero_rank():
+    A = np.zeros((4, 2))
+    U, s, VT, Ainv, rank = pseudo_inverse(A)
+
+    assert U.shape == (4, 4)
+    assert s.shape == (2,)
+    assert VT.shape == (2, 2)
+    assert Ainv.shape == (2, 4)
+    assert rank == 0
+    np.testing.assert_array_equal(Ainv, 0.0)
 
 
 @pytest.mark.parametrize("n,mx,my,eps1,eps2,maxiter",
@@ -49,7 +51,7 @@ def test_modified_gram_schmidt(n, mx, my, eps1, eps2, maxiter):
     tol = dict(atol=1e-6, rtol=1e-6)
     mgskw = dict(eps1=eps1, eps2=eps2, maxiter=maxiter)
 
-    X = get_matrix(n, mx, rng=rng)
+    X = rng.normal(size=(n, mx))
 
     Xout1 = modified_gram_schmidt(X, **mgskw)
     _, nxout1 = Xout1.shape
@@ -59,7 +61,7 @@ def test_modified_gram_schmidt(n, mx, my, eps1, eps2, maxiter):
                                np.linalg.det(X.T @ Xout1)**2, **tol)
 
 
-    Y = get_matrix(n, my, rng=rng)
+    Y = rng.normal(size=(n, my))
     Xout2 = modified_gram_schmidt(X, Y, **mgskw)
     _, nxout2 = Xout2.shape
 
@@ -75,91 +77,29 @@ def test_modified_gram_schmidt(n, mx, my, eps1, eps2, maxiter):
     np.testing.assert_allclose(Xout2.T @ Xout2, np.eye(nxout2), **tol)
 
 
-@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
-@pytest.mark.parametrize('rngstate,length',
-                         [(0, 1),
-                          (1, 2),
-                          (2, 10),
-                          (3, 1024),
-                          (4, 0)])
-def test_normalize(rngstate, length):
-    rng = np.random.RandomState(rngstate)
-    x = rng.normal(size=(length,))
-    wrappers['normalize'](x)
+def test_modified_gram_schmidt_empty_and_invalid_inputs():
+    output = modified_gram_schmidt(np.empty((5, 0)))
+    assert output.shape == (5, 0)
 
-    if length > 0:
-        assert abs(np.linalg.norm(x) - 1.) < 1e-14
-
-@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
-@pytest.mark.parametrize('rngstate,length,scale',
-                         [(0, 1, 1.),
-                          (1, 3, 0.5),
-                          (2, 100, 4.),
-                          (3, 10, 0.),
-                          (4, 0, 1.)])
-def test_vec_sum(rngstate, length, scale):
-    rng = np.random.RandomState(rngstate)
-    x = rng.normal(size=(length,))
-    y = rng.normal(size=(length,))
-    z = np.zeros(length)
-    err = wrappers['vec_sum'](x, y, z, scale)
-    assert err == 0
-    np.testing.assert_allclose(z, x + scale * y)
-
-    if length > 0:
-        assert wrappers['vec_sum'](x, y[:length-1], z, scale) == -1
-        assert wrappers['vec_sum'](x, y, z[:length-1], scale) == -1
-
-@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
-@pytest.mark.parametrize('rngstate,n,m',
-                         [(0, 1, 1),
-                          (1, 5, 5),
-                          (2, 3, 7),
-                          (3, 8, 4),
-                          (6, 100, 100)])
-def test_symmetrize(rngstate, n, m):
-    rng = np.random.RandomState(rngstate)
-    X = get_matrix(n, m, rng=rng)
-    minnm = min(n, m)
-    Y = X[:minnm, :minnm]
-    wrappers['symmetrize'](Y)
-    np.testing.assert_allclose(Y, Y.T)
+    with pytest.raises(ValueError, match="two-dimensional"):
+        modified_gram_schmidt(np.ones(5))
+    with pytest.raises(ValueError, match="same number of rows"):
+        modified_gram_schmidt(np.ones((5, 1)), np.ones((4, 1)))
 
 
-@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
-@pytest.mark.parametrize('rngstate,scale',
-                         [(0, 1.),
-                          (1, 0.1),
-                          (2, 100.)])
-def test_skew(rngstate, scale):
-    rng = np.random.RandomState(rngstate)
-    x = rng.normal(size=(3,))
-    Y = get_matrix(3, 3, rng=rng)
-    wrappers['skew'](x, Y, scale)
-    np.testing.assert_allclose(scale * np.cross(np.eye(3), x), Y)
+def test_modified_gram_schmidt_maxiter():
+    rng = np.random.RandomState(3)
+    with pytest.raises(RuntimeError, match="converge"):
+        modified_gram_schmidt(rng.normal(size=(10, 2)), maxiter=1)
 
-@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
-@pytest.mark.parametrize('rngstate,n,mx,my',
-                         [(2, 10, 2, 4)])
-def test_mgs(rngstate, n, mx, my):
-    rng = np.random.RandomState(rngstate)
-    X = get_matrix(n, mx, rng=rng)
-    assert wrappers['mgs'](X, None, maxiter=1) < 0
-    X = get_matrix(n, mx, rng=rng)
-    assert wrappers['mgs'](X, None, eps2=1e10) == 0
-    X = get_matrix(n, mx, rng=rng)
-    Y = get_matrix(n, my, rng=rng)
-    assert wrappers['mgs'](X, Y, eps2=1e10) == 0
-    Y = get_matrix(n, my, rng=rng)
-    my2 = wrappers['mgs'](Y, None)
-    assert my2 >= 0
-    np.testing.assert_allclose(Y[:, :my2].T @ Y[:, :my2], np.eye(my2),
-                               atol=1e-10)
-    X = get_matrix(n, mx, rng=rng)
-    mx2 = wrappers['mgs'](X, Y)
-    assert mx2 >= 0
-    np.testing.assert_allclose(X[:, :mx2].T @ X[:, :mx2], np.eye(mx2),
-                               atol=1e-10)
-    np.testing.assert_allclose(X[:, :mx2].T @ Y[:, :my2], np.zeros((mx2, my2)),
-                               atol=1e-10)
-    assert wrappers['mgs'](X, Y[:n-1]) < 0
+
+def test_modified_gram_schmidt_orthonormal_basis_fast_path():
+    rng = np.random.RandomState(4)
+    Y, _ = np.linalg.qr(rng.normal(size=(20, 5)))
+    Y_before = Y.copy()
+
+    output = modified_gram_schmidt(rng.normal(size=(20, 2)), Y)
+
+    np.testing.assert_array_equal(Y, Y_before)
+    np.testing.assert_allclose(output.T @ output, np.eye(2), atol=1e-12)
+    np.testing.assert_allclose(output.T @ Y, 0.0, atol=1e-12)
