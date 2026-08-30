@@ -141,7 +141,7 @@ class IRC(Optimizer):
             self.d1 += s
 
             self.pes.kick(s)
-            g1 = self.pes.get_g()
+            g1 = -self.pes.get_projected_forces().ravel()
 
             d1m = self.d1 * self.sqrtm
             d1m /= np.linalg.norm(d1m)
@@ -181,6 +181,11 @@ class IRC(Optimizer):
         # IRC started from a TS with |F| < fmax "converges" before the first
         # step, never applies the initial displacement, and returns 0 steps.
         return self.converged()
+
+    def log(self, gradient=None):
+        """Log forces after projecting out Sella-owned constraints."""
+        projected_gradient = -self.pes.get_projected_forces().ravel()
+        return super().log(projected_gradient)
 
     def get_W(self):
         return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))

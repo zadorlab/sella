@@ -1,16 +1,38 @@
 import numpy as np
+import pytest
 
 from ase import Atoms
 from ase.build import molecule
+from ase.calculators.calculator import Calculator, all_changes
 from ase.calculators.lj import LennardJones
+from ase.constraints import FixAtoms
 
-from sella import IRC
+from sella import Constraints, IRC
 
 
 # A first-order saddle of the 6-atom Lennard-Jones cluster (one imaginary mode).
 _LJ6_TS = [[-0.819098, -0.456198, -0.221436], [0.233188, -0.375765, -0.567537],
            [-0.259168, 0.501054, -0.063452], [-0.504031, -0.163298, 0.804587],
            [0.800850, 0.577070, -0.410659], [0.548259, -0.082862, 0.458498]]
+
+
+class _SaddleWithFrozenForce(Calculator):
+    """Quadratic saddle with a nonzero force on the frozen atom."""
+
+    implemented_properties = ['energy', 'forces']
+
+    def calculate(self, atoms=None, properties=('energy',),
+                  system_changes=all_changes):
+        super().calculate(atoms, properties, system_changes)
+        x = atoms.positions.ravel()
+        curvature = np.ones_like(x)
+        curvature[3] = -1.0
+        gradient = curvature * x
+        gradient[0] += 1.0
+        self.results = {
+            'energy': 0.5 * np.dot(curvature * x, x) + x[0],
+            'forces': -gradient.reshape((-1, 3)),
+        }
 
 
 def _ts():
@@ -62,3 +84,41 @@ def test_irc_takes_first_step_from_converged_ts():
 
     # forward and reverse must descend to opposite sides of the TS
     assert np.abs(ends['forward'] - ends['reverse']).max() > 1e-2
+
+
+@pytest.mark.parametrize('constraint_source', ['ase', 'sella'])
+def test_irc_inner_loop_ignores_forces_on_fixed_atoms(constraint_source):
+    atoms = Atoms('HH', positions=np.zeros((2, 3)))
+    atoms.calc = _SaddleWithFrozenForce()
+    kwargs = {}
+    if constraint_source == 'ase':
+        atoms.set_constraint(FixAtoms([0]))
+    else:
+        constraints = Constraints(atoms)
+        constraints.fix_translation(0)
+        kwargs['constraints'] = constraints
+
+    irc = IRC(
+        atoms, dx=0.1, ninner_iter=3, eta=1e-4, logfile=None, **kwargs
+    )
+    irc.run(direction='forward', fmax=1e-4, fmax_inner=1e-4, steps=1)
+
+    assert irc.nsteps == 1
+
+
+def test_irc_log_uses_projected_forces(tmp_path):
+    atoms = Atoms('HH', positions=np.zeros((2, 3)))
+    atoms.calc = _SaddleWithFrozenForce()
+    constraints = Constraints(atoms)
+    constraints.fix_translation(0)
+    logfile = tmp_path / 'irc.log'
+
+    irc = IRC(atoms, constraints=constraints, logfile=str(logfile))
+    irc.run(fmax=1e-4, steps=0)
+    irc.close()
+
+    row = next(
+        line for line in logfile.read_text().splitlines()
+        if line.startswith('IRC:')
+    )
+    assert float(row.split()[-1]) == pytest.approx(0.0)
