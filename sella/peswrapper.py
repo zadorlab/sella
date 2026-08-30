@@ -482,8 +482,10 @@ class PES:
             x=None,
             f=None,
             g=None,
+            traj_id=None,
         )
         self.last = self.curr.copy()
+        self._last_eval_traj_id = None
 
         # Internal coordinate specific things
         self.int = None
@@ -629,6 +631,7 @@ class PES:
         self.curr['x'] = None
         self.curr['f'] = None
         self.curr['g'] = None
+        self.curr['traj_id'] = None
         return H_cols
 
     def _fd_cartesian_hessian(self, delta: float) -> np.ndarray:
@@ -660,6 +663,7 @@ class PES:
         self.curr['x'] = None
         self.curr['f'] = None
         self.curr['g'] = None
+        self.curr['traj_id'] = None
         return (H_cols + H_cols.T) / 2
 
     # Hessian getter/setter
@@ -739,8 +743,11 @@ class PES:
         return result
 
     def write_traj(self):
+        self._last_eval_traj_id = None
         if self.traj is not None:
             self.traj.write()
+            self._last_eval_traj_id = len(self.traj) - 1
+        return self._last_eval_traj_id
 
     def _get_potential_energy_raw(self):
         return self.atoms.get_potential_energy(apply_constraint=False)
@@ -793,9 +800,14 @@ class PES:
 
         if feval:
             f, g = self.eval()
+            # Numerical-Hessian probes call eval() directly, so retain the
+            # frame written for this cached geometry instead of consulting
+            # the trajectory length later when the optimizer logs the step.
+            traj_id = self._last_eval_traj_id
         else:
             f = None
             g = None
+            traj_id = None
 
         if new_point:
             self.last = self.curr.copy()
@@ -804,6 +816,7 @@ class PES:
         self.curr['state_hash'] = state
         self.curr['f'] = f
         self.curr['g'] = g
+        self.curr['traj_id'] = traj_id
         self._update_basis(basis)
         return True
 
@@ -2149,6 +2162,7 @@ class InternalPES(PES):
         return dydt.ravel()
 
     def write_traj(self):
+        self._last_eval_traj_id = None
         if self.traj is not None:
             energy = self.atoms.calc.results['energy']
             forces = np.zeros((len(self.atoms) + len(self.dummies), 3))
@@ -2157,6 +2171,8 @@ class InternalPES(PES):
             atoms_tmp.calc = SinglePointCalculator(atoms_tmp, energy=energy,
                                                    forces=forces)
             self.traj.write(atoms_tmp)
+            self._last_eval_traj_id = len(self.traj) - 1
+        return self._last_eval_traj_id
 
     def _update(self, feval=True):
         if not PES._update(self, feval=feval):
@@ -2360,7 +2376,7 @@ class _CellPESMixin:
 
         self.orig_cell = self.atoms.get_cell().array.copy()
         self.set_H(H, initialized=True)
-        self.curr = dict(x=None, f=None, g=None)
+        self.curr = dict(x=None, f=None, g=None, traj_id=None)
         self.last = self.curr.copy()
         return True
 

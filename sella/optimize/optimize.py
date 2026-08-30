@@ -593,36 +593,50 @@ class Sella(Optimizer):
                 result = self.pes.converged(fmax, smax=self.smax)
             _, fmax, cmax, smax_actual = result
             e = self.pes.get_f()
+            traj_id = self.pes.curr.get('traj_id')
             T = strftime("%H:%M:%S", localtime())
             name = self.__class__.__name__
             buf = " " * len(name)
             if self.nsteps == 0:
-                self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                                   "{:>12s} {:>12s} {:>12s} {:>12s}\n"
-                                   .format("Step", "Time", "Energy", "fmax",
-                                           "smax", "cmax", "rtrust",
-                                           "strust", "rho"))
-            self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                               "{:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
-                               .format(name, self.nsteps, T, e, fmax, smax_actual,
-                                       cmax, self.delta, self.delta_cell,
-                                       self.rho))
+                header = buf + (
+                    "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} {:>12s} "
+                    "{:>12s} {:>12s} {:>12s}"
+                ).format("Step", "Time", "Energy", "fmax", "smax", "cmax",
+                         "rtrust", "strust", "rho")
+                if traj_id is not None:
+                    header += " {:>7s}".format("trjid")
+                self.logfile.write(header + "\n")
+            line = (
+                "{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                "{:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}"
+            ).format(name, self.nsteps, T, e, fmax, smax_actual, cmax,
+                     self.delta, self.delta_cell, self.rho)
+            if traj_id is not None:
+                line += " {:>7d}".format(traj_id)
+            self.logfile.write(line + "\n")
         else:
             result = self._last_converged
             if result is None or len(result) != 3:
                 result = self.pes.converged(self.fmax)
             _, fmax, cmax = result
             e = self.pes.get_f()
+            traj_id = self.pes.curr.get('traj_id')
             T = strftime("%H:%M:%S", localtime())
             name = self.__class__.__name__
             buf = " " * len(name)
             if self.nsteps == 0:
-                self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                                   "{:>12s} {:>12s}\n"
-                                   .format("Step", "Time", "Energy", "fmax",
-                                           "cmax", "rtrust", "rho"))
-            self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                               "{:>12.4f} {:>12.4f}\n"
-                               .format(name, self.nsteps, T, e, fmax, cmax,
-                                       self.delta, self.rho))
+                header = buf + (
+                    "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} {:>12s} {:>12s}"
+                ).format("Step", "Time", "Energy", "fmax", "cmax", "rtrust",
+                         "rho")
+                if traj_id is not None:
+                    header += " {:>7s}".format("trjid")
+                self.logfile.write(header + "\n")
+            line = (
+                "{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                "{:>12.4f} {:>12.4f}"
+            ).format(name, self.nsteps, T, e, fmax, cmax, self.delta, self.rho)
+            if traj_id is not None:
+                line += " {:>7d}".format(traj_id)
+            self.logfile.write(line + "\n")
         flush_logfile(self.logfile)
