@@ -8,11 +8,8 @@ on:
 
 jobs:
   build:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+    name: Build distributions
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -23,52 +20,29 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install cibuildwheel
-        run: python3 -m pip install cibuildwheel==2.16.5
+      - name: Install build tools
+        run: python3 -m pip install --upgrade pip build twine
 
-      - name: Build wheels
-        run: python3 -m cibuildwheel --output-dir wheelhouse
+      - name: Build wheel and source distribution
+        run: python3 -m build
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cibw-${{ matrix.os }}-${{ strategy.job-index }}
-          path: ./wheelhouse/*.whl
-
-  make_sdist:
-    name: Make SDist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python3 -m pip install --upgrade pip build setuptools cython numpy scipy ase jax jaxlib
-
-      - name: Build SDist
-        run: python3 -m build --sdist
+      - name: Check distributions
+        run: python3 -m twine check dist/*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cibw-sdist
-          path: dist/*.tar.gz
+          name: distributions
+          path: dist/*
 
   upload:
-    needs: [build, make_sdist]
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: cibw-*
+          name: distributions
           path: dist
-          merge-multiple: true
 
       - name: Set up Python
         uses: actions/setup-python@v4
