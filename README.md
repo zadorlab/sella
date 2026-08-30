@@ -44,11 +44,6 @@ If you are using Sella or you wish to use Sella, let me know!
 
 For more information on how to use Sella, please check the [wiki](https://github.com/zadorlab/sella/wiki).
 
-## Support
-
-If you need help using Sella, please visit our [gitter support channel](https://gitter.im/zadorlab/sella),
-or open a GitHub issue.
-
 ## How to cite
 
 If you use our code in publications, please cite the revelant work(s). (1) is recommended when Sella is used for solids or in heterogeneous catalysis, (3) is recommended for molecular systems.
