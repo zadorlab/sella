@@ -866,7 +866,7 @@ class PES:
         self._update(False)
         return self.curr['Ucons']
 
-    def diag(self, gamma=0.1, threepoint=False, maxiter=None):
+    def diag(self, gamma=0.1, threepoint=False, maxiter=None, progress=None):
         if self.curr['f'] is None:
             self._update(feval=True)
 
@@ -892,12 +892,30 @@ class PES:
         # Convert P to array
         P = np.eye(nfree) if P_is_none else P.asarray()
 
-        Hproj = NumericalHessian(self._calc_eg, self.get_x(), self.get_g(),
-                                 self.eta, threepoint, Ufree)
+        if progress is not None:
+            progress('start', 0)
+
+        Hproj = NumericalHessian(
+            self._calc_eg,
+            self.get_x(),
+            self.get_g(),
+            self.eta,
+            threepoint,
+            Ufree,
+            evaluation_callback=(
+                None if progress is None
+                else lambda count: progress('evaluation', count)
+            ),
+        )
         Hc = self.get_Hc()
-        rayleigh_ritz(Hproj - Ufree.T @ Hc @ Ufree, gamma, P, v0=v0,
-                      method=self.eigensolver,
-                      maxiter=maxiter)
+        try:
+            rayleigh_ritz(Hproj - Ufree.T @ Hc @ Ufree, gamma, P, v0=v0,
+                          method=self.eigensolver,
+                          maxiter=maxiter)
+        except Exception:
+            if progress is not None:
+                progress('failed', Hproj.evaluations)
+            raise
 
         # Extract eigensolver iterates
         Vs = Hproj.Vs
@@ -933,6 +951,8 @@ class PES:
 
         # Update the approximate Hessian
         self.H.update(Vs, AVs)
+        if progress is not None:
+            progress('done', Hproj.evaluations)
 
         self.first_diag = False
 

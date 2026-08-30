@@ -13,14 +13,17 @@ from scipy.sparse.linalg import LinearOperator
 class NumericalHessian(LinearOperator):
     dtype = np.dtype('float64')
 
-    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None):
+    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None,
+                 evaluation_callback=None):
         self.func = func
         self.x0 = x0.copy()
         self.g0 = g0.copy()
         self.eta = eta
         self.threepoint = threepoint
         self.calls = 0
+        self.evaluations = 0
         self.Uproj = Uproj
+        self.evaluation_callback = evaluation_callback
         self.requires_secant_rank_cleanup = False
 
         self.ntrue = len(self.x0)
@@ -35,6 +38,13 @@ class NumericalHessian(LinearOperator):
 
         self.Vs = np.empty((self.ntrue, 0), dtype=self.dtype)
         self.AVs = np.empty((self.ntrue, 0), dtype=self.dtype)
+
+    def _evaluate(self, x):
+        result = self.func(x)
+        self.evaluations += 1
+        if self.evaluation_callback is not None:
+            self.evaluation_callback(self.evaluations)
+        return result
 
     def _matvec(self, v):
         self.calls += 1
@@ -79,9 +89,13 @@ class NumericalHessian(LinearOperator):
                 return np.zeros(self.Uproj.shape[1])
             return np.zeros_like(v)
         vnorm *= sign
-        _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
+        _, gplus = self._evaluate(
+            self.x0 + self.eta * v.ravel() / vnorm
+        )
         if self.threepoint:
-            fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
+            _, gminus = self._evaluate(
+                self.x0 - self.eta * v.ravel() / vnorm
+            )
             Av = vnorm * (gplus - gminus) / (2 * self.eta)
         else:
             Av = vnorm * (gplus - self.g0) / self.eta
