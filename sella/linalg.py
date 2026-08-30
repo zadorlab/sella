@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 from typing import List
-from itertools import product
 import numpy as np
 
 from sella.hessian_update import update_H
@@ -22,6 +21,7 @@ class NumericalHessian(LinearOperator):
         self.threepoint = threepoint
         self.calls = 0
         self.Uproj = Uproj
+        self.requires_secant_rank_cleanup = False
 
         self.ntrue = len(self.x0)
 
@@ -148,7 +148,7 @@ class ApproximateHessian(LinearOperator):
         B0: np.ndarray = None,
         update_method: str = 'TS-BFGS',
         symm: int = 2,
-        initialized: bool = False,
+        initialized=None,
     ) -> None:
         """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
@@ -156,7 +156,7 @@ class ApproximateHessian(LinearOperator):
         super().__init__(np.float64, (dim, dim))
         self.update_method = update_method
         self.symm = symm
-        self.initialized = initialized
+        self.initialized = False
         # Lazy eigendecomposition: only compute when needed
         self._evals = None
         self._evecs = None
@@ -168,8 +168,11 @@ class ApproximateHessian(LinearOperator):
         # GPU-resident TS-BFGS update can read them without re-uploading.
         self._evals_gpu = None
         self._evecs_gpu = None
+        # True when self.B is the current Hessian.  GPU TS-BFGS can update the
+        # device copy without immediately downloading the full dense matrix.
+        self._cpu_current = True
 
-        self.set_B(B0)
+        self.set_B(B0, initialized=initialized)
 
     def _ensure_eigen_computed(self):
         """Compute eigendecomposition if not already done.
@@ -178,7 +181,9 @@ class ApproximateHessian(LinearOperator):
         on device for downstream consumers (e.g. _MS_TS_BFGS), while still
         producing the numpy copies the rest of Sella expects.
         """
-        if self._eigen_computed or self.B is None:
+        if self._eigen_computed:
+            return
+        if self.B is None and self._B_gpu is None:
             return
         B_gpu = self._get_B_gpu()
         if B_gpu is not None:
@@ -191,7 +196,7 @@ class ApproximateHessian(LinearOperator):
                 self._eigen_computed = True
                 return
         # CPU fallback (no GPU or OOM)
-        self._evals, self._evecs = gpu_eigh(self.B, A_gpu=None)
+        self._evals, self._evecs = gpu_eigh(self.asarray(), A_gpu=None)
         self._eigen_computed = True
 
     def _get_B_gpu(self):
@@ -200,11 +205,26 @@ class ApproximateHessian(LinearOperator):
         Returns None when no GPU is available, when B is below the size
         threshold, or when an upload attempt has previously OOM'd.
         """
+        if self._B_gpu is not None:
+            return self._B_gpu
         if self.B is None:
             return None
-        if self._B_gpu is None and _gpu_mod._gpu_ok(self.B.shape[0]):
-            self._B_gpu = to_gpu(self.B)
+        if _gpu_mod._gpu_ok(self.B.shape[0]):
+            self._B_gpu = to_gpu(self.asarray())
         return self._B_gpu
+
+    def _sync_B_cpu(self):
+        """Materialize a current numpy copy of B when it is GPU-resident."""
+        if self._cpu_current:
+            return
+        if self._B_gpu is None:
+            raise RuntimeError("Hessian CPU copy is stale and no GPU copy exists")
+        try:
+            self.B = self._B_gpu.cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _gpu_mod._record_oom(self._B_gpu.shape[0])
+            raise
+        self._cpu_current = True
 
     @property
     def evals(self):
@@ -230,7 +250,7 @@ class ApproximateHessian(LinearOperator):
         if value is None:
             self._eigen_computed = False
 
-    def set_B(self, target):
+    def set_B(self, target, initialized=None):
         if target is None:
             self.B = None
             self._evals = None
@@ -239,14 +259,18 @@ class ApproximateHessian(LinearOperator):
             self._B_gpu = None
             self._evals_gpu = None
             self._evecs_gpu = None
+            self._cpu_current = True
             self.initialized = False
             return
         elif np.isscalar(target):
             target = target * np.eye(self.dim)
+            if initialized is not None:
+                self.initialized = initialized
         else:
-            self.initialized = True
+            self.initialized = True if initialized is None else initialized
         assert target.shape == self.shape
         self.B = target
+        self._cpu_current = True
         # Mark eigendecomposition as stale - will recompute on next access
         self._eigen_computed = False
         # B has changed, so the GPU copies are stale. Don't re-upload eagerly:
@@ -261,8 +285,14 @@ class ApproximateHessian(LinearOperator):
         Used by `update()` to avoid the round-trip when the GPU TS-BFGS path
         produced both a numpy result and the same tensor on device.
         """
-        assert B_numpy.shape == self.shape
-        self.B = B_numpy
+        if B_numpy is not None:
+            assert B_numpy.shape == self.shape
+            self.B = B_numpy
+            self._cpu_current = True
+        else:
+            assert B_gpu is not None and tuple(B_gpu.shape) == self.shape
+            self.B = None
+            self._cpu_current = False
         self.initialized = True
         self._B_gpu = B_gpu
         self._eigen_computed = False
@@ -273,30 +303,55 @@ class ApproximateHessian(LinearOperator):
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
-        if self.B is None:
-            B = np.zeros(self.shape, dtype=self.dtype)
-        else:
-            B = self.B.copy()
         if not self.initialized:
-            self.initialized = True
-            dx_cart = dx[:self.ncart]
-            dg_cart = dg[:self.ncart]
-            B[:self.ncart, :self.ncart] = update_H(
-                None, dx_cart, dg_cart, method=self.update_method,
-                symm=self.symm, lams=None, vecs=None
-            )
-            self.set_B(B)
-            return
+            if self.B is None and self._B_gpu is None:
+                B = np.zeros(self.shape, dtype=self.dtype)
+                self.initialized = True
+                dx_cart = dx[:self.ncart]
+                dg_cart = dg[:self.ncart]
+                B[:self.ncart, :self.ncart] = update_H(
+                    None, dx_cart, dg_cart, method=self.update_method,
+                    symm=self.symm, lams=None, vecs=None
+                )
+                self.set_B(B)
+                return
+            else:
+                # A caller supplied an explicit initial Hessian but asked to
+                # keep the "not yet updated" flag.  Use that Hessian as the
+                # baseline for the first update; do not discard it and
+                # bootstrap from a single secant pair.
+                self.initialized = True
 
-        # Force GPU eig cache to populate alongside numpy lams/vecs (if a
-        # GPU is available); keeps update_H's GPU path eligible.
-        lams, vecs = self.evals, self.evecs
+        # Keep the large eigensystem on GPU when the GPU TS-BFGS path is
+        # available.  Downloading the full eigenvector matrix just to pass it
+        # through update_H is pure transfer overhead unless the GPU update
+        # falls back.
+        lams = None
+        vecs = None
+        B = None
+        B_gpu = self._get_B_gpu()
+        if B_gpu is not None:
+            if self._evals_gpu is None or self._evecs_gpu is None:
+                evals_t, evecs_t = gpu_eigh_t(B_gpu)
+                if evals_t is not None:
+                    self._evals_gpu = evals_t
+                    self._evecs_gpu = evecs_t
+            if not (
+                self.update_method == 'TS-BFGS'
+                and self._evals_gpu is not None
+                and self._evecs_gpu is not None
+            ):
+                B = self.asarray().copy()
+        if B_gpu is None:
+            B = self.asarray().copy()
+            lams, vecs = self.evals, self.evecs
 
         result = update_H(B, dx, dg, method=self.update_method,
                           symm=self.symm, lams=lams, vecs=vecs,
                           B_gpu=self._B_gpu,
                           evals_gpu=self._evals_gpu,
-                          evecs_gpu=self._evecs_gpu)
+                          evecs_gpu=self._evecs_gpu,
+                          download_numpy=False)
         if isinstance(result, tuple):
             Bplus_numpy, Bplus_gpu = result
             self._set_from_gpu(Bplus_numpy, Bplus_gpu)
@@ -308,31 +363,49 @@ class ApproximateHessian(LinearOperator):
         m, n = U.shape
         assert m == self.dim
 
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             Bproj = None
         else:
-            Bproj = U.T @ self.B @ U
+            Bproj = U.T @ self.asarray() @ U
 
         return ApproximateHessian(n, 0, Bproj, self.update_method,
                                   self.symm)
 
     def asarray(self):
         if self.B is not None:
+            self._sync_B_cpu()
+            return self.B
+        if self._B_gpu is not None:
+            self._sync_B_cpu()
             return self.B
         return np.eye(self.dim)
 
     def _matvec(self, v):
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             return v
-        return self.B @ v
+        if not self._cpu_current and self._B_gpu is not None:
+            vt = to_gpu(v)
+            if vt is not None:
+                try:
+                    return (self._B_gpu @ vt).cpu().numpy()
+                except (RuntimeError, MemoryError):
+                    _gpu_mod._record_oom(self._B_gpu.shape[0])
+        return self.asarray() @ v
 
     def _rmatvec(self, v):
         return self.matvec(v)
 
     def _matmat(self, X):
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             return X
-        return self.B @ X
+        if not self._cpu_current and self._B_gpu is not None:
+            Xt = to_gpu(X)
+            if Xt is not None:
+                try:
+                    return (self._B_gpu @ Xt).cpu().numpy()
+                except (RuntimeError, MemoryError):
+                    _gpu_mod._record_oom(self._B_gpu.shape[0])
+        return self.asarray() @ X
 
     def _rmatmat(self, X):
         return self.matmat(X)
@@ -341,25 +414,29 @@ class ApproximateHessian(LinearOperator):
         initialized = self.initialized
         if isinstance(other, ApproximateHessian):
             initialized = initialized and other.initialized
-            other = other.B
+            if other.B is None and other._B_gpu is None:
+                other = None
+            else:
+                other = other.asarray()
         if not self.initialized or other is None:
             tot = None
             initialized = False
         else:
-            tot = self.B + other
+            tot = self.asarray() + other
         return ApproximateHessian(
             self.dim, self.ncart, tot, self.update_method, self.symm,
             initialized=initialized,
         )
 
 
-# =============================================================================
-# Performance optimization: Replace nested Python loops with vectorized
-# numpy operations using np.add.at for scatter and np.sum for reduction.
-# This provides significant speedup for Jacobian assembly operations.
-# =============================================================================
-
 class SparseInternalJacobian(LinearOperator):
+    """Sparse internal-coordinate Jacobian as a LinearOperator.
+
+    Assembles/applies the ``(nints, 3*natoms)`` Jacobian from per-coordinate
+    atom ``indices`` and ``vals`` using vectorized numpy scatter/reduce
+    (``np.add.at`` / ``np.sum``) rather than Python loops.
+    """
+
     dtype = np.float64
 
     def __init__(
@@ -401,13 +478,14 @@ class SparseInternalJacobian(LinearOperator):
         return w.ravel()
 
 
-# =============================================================================
-# Performance optimization: Use np.einsum for batched matrix-vector products
-# instead of nested Python loops with explicit indexing. This provides
-# ~7% speedup on Hessian computations.
-# =============================================================================
-
 class SparseInternalHessian(LinearOperator):
+    """Sparse ``(3*natoms, 3*natoms)`` Hessian of a single internal coordinate.
+
+    Stored as per-coordinate atom ``indices`` plus a dense ``vals`` block and
+    applied via ``np.einsum`` batched matrix-vector products rather than Python
+    loops over atom pairs.
+    """
+
     dtype = np.float64
 
     def __init__(
@@ -459,13 +537,6 @@ class SparseInternalHessian(LinearOperator):
     def _rmatvec(self, v: np.ndarray) -> np.ndarray:
         return self._matvec(v)
 
-
-# =============================================================================
-# Performance optimization: Pre-compute batched index arrays and use
-# vectorized numpy operations for ldot (~14x faster) and rdot (~7.5x faster).
-# Hessians are grouped by size (number of atoms involved) to enable batching.
-# Uses np.einsum for batched matrix-vector products and np.add.at for scatter.
-# =============================================================================
 
 class SparseInternalHessiansSkeleton:
     """Index-only data for SparseInternalHessians.
