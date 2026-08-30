@@ -32,8 +32,6 @@ for offsets in product(*((0, 1),) * 3):
                           (False, 1),
                           ])
 def test_water_dimer(internal, order):
-    internal = True
-    order = 0
     rng = np.random.RandomState(1)
 
     atoms = atoms_ref.copy()
