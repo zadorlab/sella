@@ -64,23 +64,34 @@ def test_water_dimer(internal, order):
         delta0=1e-2,
     )
     if internal:
-        sella_kwargs['internal'] = Internals(
-            atoms, cons=cons, allow_fragments=True
-        )
+        ints = Internals(atoms, cons=cons, allow_fragments=True)
+        # Passing an Internals *object* sets auto_find_internals=False, so Sella
+        # will not populate it for us. We must add the bonds/angles/dihedrals
+        # and (via allow_fragments) the per-fragment translation/rotation TRICs
+        # ourselves, otherwise only the constraint-seeded coordinates exist, the
+        # free subspace is empty, and the optimization (and the assertions
+        # below) would be a vacuous no-op.
+        ints.find_all_bonds()
+        ints.find_all_angles()
+        ints.find_all_dihedrals()
+        sella_kwargs['internal'] = ints
     else:
         sella_kwargs['constraints'] = cons
     opt = Sella(atoms, **sella_kwargs)
 
     opt.delta = 0.05
     opt.run(fmax=1e-3)
-    print("First run done")
 
     atoms.rattle()
     opt.run(fmax=1e-3)
 
     Ufree = opt.pes.get_Ufree()
+    # Guard against a vacuous pass: there must be free DOF for the checks below
+    # to mean anything.
+    assert Ufree.shape[1] > 0, "expected a non-trivial free subspace"
     g = opt.pes.get_g() @ Ufree
     np.testing.assert_allclose(g, 0, atol=1e-3)
     opt.pes.diag(gamma=1e-16)
     H = opt.pes.get_HL().project(Ufree)
     assert np.sum(H.evals < 0) == order, H.evals
+    opt.close()

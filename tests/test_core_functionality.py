@@ -10,18 +10,62 @@ These tests exercise key functionality including:
 import pytest
 import numpy as np
 
+from ase import Atoms
 from ase.build import molecule
 from ase.calculators.emt import EMT
 
 from sella import Sella
 from sella.linalg import ApproximateHessian, NumericalHessian, SparseInternalHessians
-from sella.internal import Internals
+from sella.internal import Constraints, Dihedral, Internals
 from sella.peswrapper import PES, InternalPES
 from sella.eigensolvers import exact, rayleigh_ritz
+from sella.optimize import stepper as stepper_module
 
 
 class TestApproximateHessian:
     """Test ApproximateHessian operations."""
+
+    def test_dense_initialized_false_is_respected(self):
+        H0 = 2.0 * np.eye(2)
+        H = ApproximateHessian(2, 2, H0, initialized=False)
+
+        assert H.initialized is False
+        np.testing.assert_allclose(H.asarray(), H0)
+
+        H.update(np.zeros(2), np.ones(2))
+        assert H.initialized is True
+        np.testing.assert_allclose(H.asarray(), H0)
+
+        H.set_B(np.eye(2))
+        assert H.initialized is True
+
+    def test_tiny_uninitialized_update_is_finite_identity(self):
+        H = ApproximateHessian(3, 3)
+
+        H.update(np.zeros(3), np.ones(3))
+
+        assert H.initialized
+        np.testing.assert_allclose(H.asarray(), np.eye(3))
+        assert np.isfinite(H.asarray()).all()
+
+    def test_tiny_gpu_resident_update_is_noop(self):
+        class FakeGpuArray:
+            shape = (3, 3)
+
+        H = ApproximateHessian(3, 3, np.eye(3), initialized=True)
+        fake_gpu = FakeGpuArray()
+        H.B = None
+        H._cpu_current = False
+        H._B_gpu = fake_gpu
+        H._evals_gpu = object()
+        H._evecs_gpu = object()
+
+        H.update(np.zeros(3), np.ones(3))
+
+        assert H.initialized
+        assert H.B is None
+        assert H._B_gpu is fake_gpu
+        assert H._cpu_current is False
 
     def test_hessian_arithmetic(self):
         """Test that ApproximateHessian supports addition with arrays."""
@@ -92,6 +136,35 @@ class TestApproximateHessian:
         reconstructed = evecs @ np.diag(evals) @ evecs.T
         np.testing.assert_allclose(H.B, reconstructed, atol=1e-10)
 
+    def test_stepper_eigh_falls_back_after_lapack_error(self, monkeypatch):
+        """PRFO should retry a robust LAPACK driver after dsyevr failures."""
+        real_eigh = stepper_module.eigh
+        calls = []
+
+        def flaky_eigh(A, *args, **kwargs):
+            calls.append(kwargs.get('driver'))
+            if kwargs.get('driver') is None:
+                raise np.linalg.LinAlgError("Internal Error.")
+            return real_eigh(A, *args, **kwargs)
+
+        monkeypatch.setattr(stepper_module, 'eigh', flaky_eigh)
+        A = np.array([[2.0, 0.1], [0.1, -1.0]])
+
+        vals, vecs = stepper_module._eigh_symmetric(A)
+
+        assert calls[:2] == [None, 'evd']
+        np.testing.assert_allclose(
+            vecs @ np.diag(vals) @ vecs.T,
+            A,
+            atol=1e-12,
+        )
+
+    def test_stepper_eigh_rejects_asymmetric_matrix(self):
+        A = np.array([[1.0, 1e-4], [0.0, 2.0]])
+
+        with pytest.raises(ValueError, match="non-symmetric"):
+            stepper_module._eigh_symmetric(A)
+
 
 class TestSparseInternalHessians:
     """Test SparseInternalHessians functionality."""
@@ -156,6 +229,64 @@ class TestInternals:
         # Values should be finite
         assert np.all(np.isfinite(q))
         assert np.all(np.isfinite(jac))
+
+    def test_hessian_rdot_mat_matches_matrix_product(self):
+        """Direct HVP contractions should match hessian_rdot(v) @ mat."""
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water2.positions += [5.0, 0.0, 0.0]
+        atoms = water1 + water2
+
+        internal = Internals(atoms, allow_fragments=True)
+        internal.find_all_bonds()
+        internal.find_all_angles()
+        internal.find_all_dihedrals()
+
+        rng = np.random.RandomState(7)
+        v = rng.normal(size=internal.ndof)
+        mat = rng.normal(size=(internal.ndof, 3))
+
+        expected = np.asarray(internal.hessian_rdot(v) @ mat)
+        actual = internal.hessian_rdot_mat(v, mat)
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+        w = rng.normal(size=internal.ndof)
+        expected_vec = np.asarray(internal.hessian_rdot(v) @ w).ravel()
+        actual_vec = internal.hessian_rdot_mat(v, w)
+        np.testing.assert_allclose(actual_vec, expected_vec, atol=1e-12)
+
+        internal._active['angles'][0] = False
+        expected_inactive = np.asarray(internal.hessian_rdot(v) @ mat)
+        actual_inactive = internal.hessian_rdot_mat(v, mat)
+        np.testing.assert_allclose(actual_inactive, expected_inactive,
+                                   atol=1e-12)
+
+    def test_constraint_wrap_respects_inactive_inequality_offsets(self):
+        """Inactive constraints before a dihedral must not shift wrap offsets."""
+        atoms = Atoms(
+            'CCCC',
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [2.0, 1.0, 0.2],
+            ],
+        )
+        current = Dihedral((0, 1, 2, 3)).calc(atoms)
+        cons = Constraints(atoms)
+        cons.fix_bond((0, 1), target=10.0, comparator='lt')
+        cons.fix_dihedral((0, 1, 2, 3),
+                          target=np.degrees(current) + 350.0)
+
+        cons.disable_satisfied_inequalities()
+
+        residual = cons.residual()
+        expected = (
+            (current - (current + np.deg2rad(350.0)) + np.pi)
+            % (2 * np.pi) - np.pi
+        )
+        assert cons._active_mask == [False, True]
+        np.testing.assert_allclose(residual, [expected], atol=1e-12)
 
 
 class TestPES:
@@ -279,6 +410,42 @@ class TestNumericalHessian:
 
         # Check symmetry
         np.testing.assert_allclose(H12, H21, rtol=1e-5)
+
+
+def test_sella_reuses_matching_restricted_step_spectrum():
+    basis = np.eye(3)
+
+    class FakeHessian:
+        B = np.eye(3)
+        _B_gpu = None
+        evals = np.array([-0.5, 1.0, 2.0])
+
+    class FakePES:
+        H = FakeHessian()
+
+        def get_Unred(self):
+            return basis
+
+        def get_HL_projected(self, _):
+            raise AssertionError("matching PRFO spectrum should be reused")
+
+    opt = object.__new__(Sella)
+    opt.pes = FakePES()
+    opt.eig = True
+    opt.ord = 1
+    opt.nsteps_since_diag = 3
+    opt.nsteps_per_diag = 3
+    opt.diag_every_n = np.inf
+    opt._last_step_basis = basis
+    opt._last_step_eigenvalues = np.array([-0.5, 1.0, 2.0])
+
+    assert not opt._should_diagonalize()
+    opt._last_step_eigenvalues[0] = 0.5
+    assert opt._should_diagonalize()
+
+    opt._last_step_basis = basis.copy()
+    with pytest.raises(AssertionError, match="should be reused"):
+        opt._should_diagonalize()
 
 
 class TestLinearMolecule:

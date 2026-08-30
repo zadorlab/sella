@@ -6,6 +6,31 @@ import inspect
 from sella.peswrapper import PES, InternalPES
 from .stepper import get_stepper, BaseStepper, NaiveStepper
 
+from sella._constants import _LSTSQ_RCOND
+
+
+class _CoordinateSelectionTranspose:
+    def __init__(self, selection):
+        self.selection = selection
+        self.shape = (selection.shape[1], selection.shape[0])
+
+    def __matmul__(self, values):
+        values = np.asarray(values)
+        out = np.zeros((self.shape[0],) + values.shape[1:], dtype=values.dtype)
+        out[self.selection.indices] = values
+        return out
+
+
+class _CoordinateSelection:
+    """Matrix-like selector used by the exact dummy-coordinate fast path."""
+    def __init__(self, indices, dim):
+        self.indices = np.asarray(indices, dtype=int)
+        self.shape = (len(self.indices), dim)
+        self.T = _CoordinateSelectionTranspose(self)
+
+    def __matmul__(self, values):
+        return np.asarray(values)[self.indices]
+
 
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)
 class BaseRestrictedStep:
@@ -25,6 +50,8 @@ class BaseRestrictedStep:
         self.pes = pes
         self.delta = delta
         self.d1 = d1
+        self.projection_basis = None
+        self.projected_eigenvalues = None
         g0 = self.pes.get_g()
 
         # W defaults to the identity, in which case Ufree.T @ W == Ufree.T.
@@ -47,18 +74,42 @@ class BaseRestrictedStep:
             self.stepper = NaiveStepper(dx)
             self.scons[:] *= 0
         else:
-            if self._W_is_identity:
-                self.P = self.pes.get_Ufree().T
+            fast_data = None
+            dummies = getattr(self.pes, 'dummies', None)
+            if (self.d1 is None and dummies is not None
+                    and len(dummies) > 0):
+                fast_data = self.pes.get_fast_restricted_step_data(
+                    g, order, stepper, self._W_is_identity
+                )
+            if fast_data is not None:
+                projection, g_step, H_step = fast_data
+                if isinstance(projection, np.ndarray):
+                    self.P = _CoordinateSelection(projection, self.pes.dim)
+                else:
+                    self.P = projection
+                self.stepper = stepper(g_step, H_step, order, d1=None)
             else:
-                self.P = self.pes.get_Ufree().T @ W
-            d1 = self.d1
-            if d1 is not None:
-                d1 = np.linalg.lstsq(self.P.T, d1, rcond=None)[0]
-            self.stepper = stepper(
-                self.P @ g,
-                self.pes.get_HL_projected(self.P.T),
-                order,
-                d1=d1,
+                Ufree = self.pes.get_Ufree()
+                if self._W_is_identity:
+                    self.P = Ufree.T
+                    self.projection_basis = Ufree
+                else:
+                    self.P = Ufree.T @ W
+                d1 = self.d1
+                if d1 is not None:
+                    d1 = np.linalg.lstsq(
+                        self.P.T, d1, rcond=_LSTSQ_RCOND
+                    )[0]
+                self.stepper = stepper(
+                    self.P @ g,
+                    self.pes.get_HL_projected(self.P.T),
+                    order,
+                    d1=d1,
+                )
+
+        if self.projection_basis is not None:
+            self.projected_eigenvalues = getattr(
+                self.stepper, 'projected_eigenvalues', None
             )
 
         if tol is None:
@@ -80,7 +131,7 @@ class BaseRestrictedStep:
 
         s, val, dval = self.eval(alpha)
         if val < self.delta:
-            assert val > 0.
+            assert val >= 0.
             return s, val
         err = val - self.delta
 
@@ -99,10 +150,18 @@ class BaseRestrictedStep:
             else:
                 lower = alpha
 
-            a1 = alpha - err / dval
-            if np.isnan(a1) or a1 <= lower or a1 >= upper or (
-                niter > 4 and not self.stepper.newton_safe
-            ):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                a1 = alpha - err / dval
+            # Newton-safe paths still contract the sign-changing bracket
+            # periodically. This keeps convergence independent of global
+            # monotonicity, active-coordinate switches, and inaccurate local
+            # derivatives while leaving ordinary fast convergence untouched.
+            force_bisection = (
+                (niter > 4 and not self.stepper.newton_safe)
+                or (self.stepper.newton_safe and niter % 12 == 11)
+            )
+            if (not np.isfinite(a1) or a1 <= lower or a1 >= upper
+                    or force_bisection):
                 a2 = (lower + upper) / 2.
                 if np.isinf(a2):
                     alpha = alpha + max(1, 0.5 * alpha) * np.sign(a2)
@@ -161,44 +220,70 @@ class IRCTrustRegion(TrustRegion):
 class RestrictedAtomicStep(BaseRestrictedStep):
     synonyms = ['ras', 'restricted atomic step']
 
-    def __init__(self, pes, *args, **kwargs):
+    def __init__(self, pes, *args, wc=1., **kwargs):
         if pes.int is not None:
             raise ValueError(
                 "Internal coordinates are not compatible with "
                 f"the {self.__class__.__name__} trust region method."
             )
+        self.wc = wc  # weight for cell DOF (only used when optimizing the cell)
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
-        s_mat = s.reshape((-1, 3))
+        # With cell optimization the step vector is [atomic (3*natoms) | cell
+        # (n_cell_dof)]. Only the atomic block is a stack of 3-vectors; the
+        # cell DOF are scalars (and n_cell_dof need not be a multiple of 3, so
+        # reshaping the whole vector into (-1, 3) would crash). Split the two
+        # blocks and take the max over atomic 3-vector norms and weighted cell
+        # DOF. When n_cell_dof == 0 this reduces to the original behavior.
+        n_cell = getattr(self.pes, 'n_cell_dof', 0)
+        if n_cell:
+            s_atomic = s[:-n_cell]
+            s_cell = s[-n_cell:]
+        else:
+            s_atomic = s
+            s_cell = None
+
+        s_mat = s_atomic.reshape((-1, 3))
         s_norms = np.linalg.norm(s_mat, axis=1)
-        index = np.argmax(s_norms)
-        val = s_norms[index]
+        atomic_index = int(np.argmax(s_norms))
+        val = s_norms[atomic_index]
+        cell_index = -1
+        if s_cell is not None and n_cell:
+            cell_mags = np.abs(s_cell) * self.wc
+            c_idx = int(np.argmax(cell_mags))
+            if cell_mags[c_idx] > val:
+                val = cell_mags[c_idx]
+                cell_index = c_idx
 
         if dsda is None:
             return val
 
-        dsda_mat = dsda.reshape((-1, 3))
-        dval = dsda_mat[index] @ s_mat[index] / max(val, 1e-12)
+        if cell_index >= 0:
+            # The active DOF is a cell parameter: its magnitude is
+            # wc * |s_cell[c]|, so d(val)/da = wc * sign(s_cell[c]) * dsda_cell.
+            flat = s_cell[cell_index]
+            dsda_cell = dsda[-n_cell:][cell_index]
+            dval = self.wc * np.sign(flat) * dsda_cell
+            return val, dval
+
+        dsda_mat = dsda[:len(s_atomic)].reshape((-1, 3))
+        dval = dsda_mat[atomic_index] @ s_mat[atomic_index] / max(val, 1e-12)
         return val, dval
 
 
 class MaxInternalStep(BaseRestrictedStep):
     synonyms = ['mis', 'max internal step']
 
-    def __init__(
-        self, pes, *args, wx=1., wb=1., wa=1., wd=1., wo=1., wc=1., **kwargs
-    ):
+    def __init__(self, pes, *args, wc=1., **kwargs):
         if pes.int is None:
             raise ValueError(
                 f"Internal coordinates are required for the "
                 f"{self.__class__.__name__} trust region method"
             )
-        self.wx = wx
-        self.wb = wb
-        self.wa = wa
-        self.wd = wd
-        self.wo = wo
+        # The per-family weights (translations/bonds/angles/dihedrals/other/
+        # rotations) were all fixed at 1.0 and never set by any caller, so only
+        # the cell-DOF weight remains configurable.
         self.wc = wc  # Weight for cell DOF
         self._weights_cache = None
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
@@ -229,14 +314,12 @@ class MaxInternalStep(BaseRestrictedStep):
         )
         if cached is not None and cached[0] == key:
             return cached[1]
-        w = np.array(
-            [self.wx] * self.pes.int.ntrans
-            + [self.wb] * self.pes.int.nbonds
-            + [self.wa] * self.pes.int.nangles
-            + [self.wd] * self.pes.int.ndihedrals
-            + [self.wo] * self.pes.int.nother
-            + [self.wx] * self.pes.int.nrotations
+        n_coord = (
+            self.pes.int.ntrans + self.pes.int.nbonds
+            + self.pes.int.nangles + self.pes.int.ndihedrals
+            + self.pes.int.nother + self.pes.int.nrotations
         )
+        w = np.ones(n_coord)
         if n_cell_dof > 0:
             w = np.concatenate([w, [self.wc] * n_cell_dof])
         self._weights_cache = (key, w)
