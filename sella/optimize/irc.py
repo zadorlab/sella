@@ -8,6 +8,7 @@ from ase import Atoms
 from ase.io.trajectory import Trajectory, TrajectoryWriter
 from ase.optimize.optimize import Optimizer
 
+from sella._ase_compat import disable_logfile_if_none
 from sella.peswrapper import PES
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
@@ -41,11 +42,14 @@ class IRC(Optimizer):
             trajectory=trajectory,
             master=master,
         )
+        disable_logfile_if_none(self, logfile)
         self.ninner_iter = ninner_iter
         self.irctol = irctol
         self.dx = dx
         if peskwargs is None:
             self.peskwargs = dict(gamma=gamma)
+        else:
+            self.peskwargs = peskwargs
 
         if 'masses' not in self.atoms.arrays:
             try:
@@ -148,7 +152,6 @@ class IRC(Optimizer):
                 (g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1
             ).max()
 
-            g1m /= np.linalg.norm(g1m)
             if bound_clip and fmax < self.fmax_inner:
                 break
             elif self.converged():
