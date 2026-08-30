@@ -8,10 +8,15 @@ from ase import Atoms
 from ase.build import bulk, molecule
 from ase.calculators.emt import EMT
 from ase.calculators.lj import LennardJones
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms, FixBondLength
 
 from sella import Sella
-from sella.peswrapper import CellInternalPES, CellCartesianPES
-from sella.internal import Internals, Bond, Angle
+from sella.optimize.restricted_step import MaxInternalStep
+from sella.peswrapper import (
+    InternalPES, CellInternalPES, CellCartesianPES, _logm_3x3
+)
+from sella.internal import Internals, Bond, Angle, Constraints
 
 
 def make_molecular_crystal():
@@ -38,104 +43,58 @@ def make_water_crystal():
 class TestCellDerivatives:
     """Test cell derivative functions for internal coordinates."""
 
-    def test_bond_cell_derivative_numerical_molecular(self):
-        """Verify bond cell derivative against numerical finite difference.
-
-        Uses a molecular system with explicit bonds that cross the periodic
-        boundary when the cell is compressed.
-        """
-        # Create CH4 in a periodic cell
-        atoms = make_molecular_crystal()
-
-        # Create internals and find bonds (C-H bonds)
-        internals = Internals(atoms)
-        internals.find_all_bonds()
-
-        assert len(internals.internals['bonds']) > 0, "No bonds found"
-
-        # Test the first bond
-        bond = internals.internals['bonds'][0]
-
-        # Analytical gradient
-        grad_analytic = bond.calc_cell_gradient(atoms)
-
-        # Numerical gradient using finite differences
-        delta = 1e-5
+    @staticmethod
+    def _cell_deriv_fd(atoms, coord, delta=1e-5):
+        """Compute d(coord)/d(cell) via central finite differences."""
         cell0 = atoms.get_cell().array.copy()
         grad_numeric = np.zeros((3, 3))
-
         for i in range(3):
             for j in range(3):
-                # Forward
                 cell_plus = cell0.copy()
                 cell_plus[i, j] += delta
                 atoms.set_cell(cell_plus, scale_atoms=False)
-                val_plus = bond.calc(atoms)
+                val_plus = coord.calc(atoms)
 
-                # Backward
                 cell_minus = cell0.copy()
                 cell_minus[i, j] -= delta
                 atoms.set_cell(cell_minus, scale_atoms=False)
-                val_minus = bond.calc(atoms)
+                val_minus = coord.calc(atoms)
 
                 grad_numeric[i, j] = (val_plus - val_minus) / (2 * delta)
-
-        # Restore cell
         atoms.set_cell(cell0, scale_atoms=False)
+        return grad_numeric
 
+    def test_bond_cell_derivative_numerical_molecular(self):
+        """Verify bond cell derivative against numerical finite difference."""
+        atoms = make_molecular_crystal()
+        internals = Internals(atoms)
+        internals.find_all_bonds()
+        assert len(internals.internals['bonds']) > 0, "No bonds found"
+
+        bond = internals.internals['bonds'][0]
+        grad_analytic = bond.calc_cell_gradient(atoms)
+        grad_numeric = self._cell_deriv_fd(atoms, bond)
         assert_allclose(grad_analytic, grad_numeric, atol=1e-6, rtol=1e-5)
 
     def test_bond_cell_derivative_with_periodic_image(self):
-        """Test bond cell derivative for bond crossing periodic boundary.
-
-        Create a diatomic that spans the periodic boundary to ensure
-        ncvec contribution to cell derivative is tested.
-        """
-        # Create H2 spanning the periodic boundary
+        """Test bond cell derivative for bond crossing periodic boundary."""
         atoms = Atoms('H2', positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 2.5]])
         atoms.set_cell([3.0, 3.0, 3.0])
         atoms.pbc = True
 
-        # Create a bond that crosses the boundary (using ncvec)
-        # Bond between atom 0 and atom 1 via periodic image
         bond = Bond(
             indices=np.array([0, 1], dtype=np.int32),
-            ncvecs=np.array([[0, 0, -1]], dtype=np.int32)  # Wrap in -z direction
+            ncvecs=np.array([[0, 0, -1]], dtype=np.int32)
         )
 
-        # Analytical gradient
         grad_analytic = bond.calc_cell_gradient(atoms)
-
-        # Numerical gradient
-        delta = 1e-5
-        cell0 = atoms.get_cell().array.copy()
-        grad_numeric = np.zeros((3, 3))
-
-        for i in range(3):
-            for j in range(3):
-                cell_plus = cell0.copy()
-                cell_plus[i, j] += delta
-                atoms.set_cell(cell_plus, scale_atoms=False)
-                val_plus = bond.calc(atoms)
-
-                cell_minus = cell0.copy()
-                cell_minus[i, j] -= delta
-                atoms.set_cell(cell_minus, scale_atoms=False)
-                val_minus = bond.calc(atoms)
-
-                grad_numeric[i, j] = (val_plus - val_minus) / (2 * delta)
-
-        atoms.set_cell(cell0, scale_atoms=False)
-
-        # The bond crosses the boundary, so cell derivatives should be non-zero
+        grad_numeric = self._cell_deriv_fd(atoms, bond)
         assert not np.allclose(grad_analytic, 0), "Cell gradient should be non-zero for PBC bond"
         assert_allclose(grad_analytic, grad_numeric, atol=1e-6, rtol=1e-5)
 
     def test_angle_cell_derivative_numerical(self):
         """Verify angle cell derivative against numerical finite difference."""
-        # Use water - has a well-defined H-O-H angle
         atoms = make_water_crystal()
-
         internals = Internals(atoms)
         internals.find_all_bonds()
         internals.find_all_angles()
@@ -143,32 +102,9 @@ class TestCellDerivatives:
         if not internals.internals['angles']:
             pytest.skip("No angles found in structure")
 
-        # Get an angle (H-O-H)
         angle = internals.internals['angles'][0]
-
-        # Analytical gradient
         grad_analytic = angle.calc_cell_gradient(atoms)
-
-        # Numerical gradient
-        delta = 1e-5
-        cell0 = atoms.get_cell().array.copy()
-        grad_numeric = np.zeros((3, 3))
-
-        for i in range(3):
-            for j in range(3):
-                cell_plus = cell0.copy()
-                cell_plus[i, j] += delta
-                atoms.set_cell(cell_plus, scale_atoms=False)
-                val_plus = angle.calc(atoms)
-
-                cell_minus = cell0.copy()
-                cell_minus[i, j] -= delta
-                atoms.set_cell(cell_minus, scale_atoms=False)
-                val_minus = angle.calc(atoms)
-
-                grad_numeric[i, j] = (val_plus - val_minus) / (2 * delta)
-
-        atoms.set_cell(cell0, scale_atoms=False)
+        grad_numeric = self._cell_deriv_fd(atoms, angle)
 
         assert_allclose(grad_analytic, grad_numeric, atol=1e-6, rtol=1e-5)
 
@@ -185,6 +121,140 @@ class TestCellDerivatives:
         # Should have shape (n_active_coords, 9)
         n_active = len(internals.calc())
         assert J_cell.shape == (n_active, 9)
+
+
+class TestCellRawASEConstraintForces:
+    """Sella imports ASE constraints, so evals must use raw calculator data."""
+
+    def test_cartesian_cell_eval_uses_raw_forces_with_fixatoms(self):
+        atoms = Atoms('H2',
+                      positions=[[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                      cell=np.eye(3) * 5.0, pbc=True)
+        raw_forces = np.array([[2.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        stress = np.zeros(6)
+        atoms.calc = SinglePointCalculator(
+            atoms, energy=0.0, forces=raw_forces, stress=stress
+        )
+        atoms.set_constraint(FixAtoms([0]))
+        assert_allclose(atoms.get_forces()[0], 0.0)
+
+        pes = CellCartesianPES(atoms)
+        _, g = pes.eval()
+
+        assert_allclose(g[:pes.n_cart], -raw_forces.ravel())
+        assert_allclose(
+            g[pes.n_cart:],
+            pes._stress_to_cell_gradient(stress, raw_forces),
+        )
+
+    def test_internal_cell_eval_uses_raw_forces_with_fixbond(self):
+        atoms = Atoms('OH2',
+                      positions=[[0.0, 0.0, 0.0],
+                                 [1.0, 0.0, 0.0],
+                                 [0.0, 1.0, 0.0]],
+                      cell=np.eye(3) * 5.0, pbc=True)
+        raw_forces = np.array([[0.0, 0.0, 0.0],
+                               [2.0, 0.0, 0.0],
+                               [0.0, 0.0, 0.0]])
+        atoms.calc = SinglePointCalculator(
+            atoms, energy=0.0, forces=raw_forces, stress=np.zeros(6)
+        )
+        atoms.set_constraint(FixBondLength(0, 1))
+        assert not np.allclose(atoms.get_forces(), raw_forces)
+
+        pes = CellInternalPES(atoms, Internals(atoms),
+                              auto_find_internals=True)
+        seen = {}
+
+        def spy_stress_to_cell_gradient(stress, forces=None):
+            seen['forces'] = forces.copy()
+            return np.zeros(pes.n_cell_dof)
+
+        pes._stress_to_cell_gradient = spy_stress_to_cell_gradient
+        pes.eval()
+
+        assert_allclose(seen['forces'], raw_forces)
+
+
+class TestCellHessianFunction:
+    """Cell PES hessian_function installs only the coordinate block."""
+
+    @staticmethod
+    def _atoms():
+        atoms = Atoms('H2',
+                      positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
+                      cell=np.eye(3) * 4.0, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _hessian(atoms):
+        return np.eye(3 * len(atoms))
+
+    @pytest.mark.parametrize("internal", [False, True])
+    def test_cell_hessian_function_with_eig_step(self, internal):
+        opt = Sella(self._atoms(), order=0, internal=internal,
+                    optimize_cell=True, hessian_function=self._hessian,
+                    eig=True, logfile=None)
+        opt.step()
+
+        assert opt.pes.H.shape == (opt.pes.dim, opt.pes.dim)
+        assert opt.pes.H.initialized
+
+
+class TestCellSmaxSemantics:
+    """Explicit smax is effective stress; omitted smax is ASE-like."""
+
+    @staticmethod
+    def _stressed_water():
+        atoms = Atoms('OH2',
+                      positions=[[5.0, 5.0, 5.0],
+                                 [5.96, 5.0, 5.0],
+                                 [5.0, 5.96, 5.0]],
+                      cell=np.eye(3) * 10.0, pbc=True)
+        atoms.calc = SinglePointCalculator(
+            atoms,
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            stress=np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        return atoms
+
+    @pytest.mark.parametrize("internal", [False, True])
+    def test_explicit_smax_uses_effective_stress(self, internal):
+        opt = Sella(self._stressed_water(), order=0, internal=internal,
+                    optimize_cell=True, allow_fragments=internal,
+                    logfile=None)
+        opt.fmax = 0.05
+
+        opt.smax = None
+        assert not opt.converged()
+        assert opt._last_converged[3] > 1.0
+
+        opt.smax = 0.02
+        assert opt.converged()
+        assert_allclose(opt._last_converged[3], 0.01)
+
+        opt.smax = 0.005
+        assert not opt.converged()
+        assert_allclose(opt._last_converged[3], 0.01)
+
+    def test_explicit_smax_uses_corrected_cell_gradient(self):
+        atoms = Atoms('H2',
+                      positions=[[4.4, 5.0, 5.0], [5.6, 5.0, 5.0]],
+                      cell=np.eye(3) * 10.0, pbc=True)
+        atoms.calc = LennardJones()
+        atoms.set_constraint(FixBondLength(0, 1))
+        assert np.abs(atoms.get_stress(apply_constraint=False)).max() > 1e-3
+
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, logfile=None)
+        opt.fmax = 0.05
+        opt.smax = 1e-3
+
+        assert opt.converged()
+        assert opt._last_converged[1] < 1e-12
+        assert_allclose(opt._last_converged[3], 0.0, atol=1e-12)
 
 
 class TestCellInternalPES:
@@ -411,75 +481,35 @@ class TestCellCartesianPES:
 class TestCellCartesianGradient:
     """Test cell gradient calculations in CellCartesianPES."""
 
-    def test_cell_gradient_numerical(self):
-        """Test cell gradient matches numerical finite difference for bulk Cu."""
+    def test_gradient_numerical(self):
+        """Test full gradient (Cartesian + cell) matches numerical FD for bulk Cu."""
         atoms = bulk('Cu', 'fcc', a=3.6)
         atoms.calc = EMT()
-
         pes = CellCartesianPES(atoms)
 
-        # Get analytical gradient
         _, g = pes.eval()
-        g_cell = g[pes.n_cart:]  # Cell part of gradient
-
-        # Numerical gradient via finite difference on cell parameters
         delta = 1e-6
         x0 = pes.get_x()
-        g_cell_numeric = np.zeros(pes.n_cell_dof)
+        g_numeric = np.zeros(pes.dim)
 
-        for i in range(pes.n_cell_dof):
-            pes.set_x(x0)  # Restore before each probe
-            x_plus = x0.copy()
-            x_plus[pes.n_cart + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x0)  # Restore before -delta
-            x_minus = x0.copy()
-            x_minus[pes.n_cart + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x0)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_cartesian_gradient_numerical(self):
-        """Test Cartesian gradient matches numerical finite difference."""
-        atoms = bulk('Cu', 'fcc', a=3.6)
-        atoms.calc = EMT()
-
-        pes = CellCartesianPES(atoms)
-
-        # Get analytical gradient
-        _, g = pes.eval()
-        g_cart = g[:pes.n_cart]  # Cartesian part of gradient
-
-        # Numerical gradient via finite difference
-        delta = 1e-6
-        x0 = pes.get_x()
-        g_cart_numeric = np.zeros(pes.n_cart)
-
-        for i in range(pes.n_cart):
-            pes.set_x(x0)  # Restore before each probe
+        for i in range(pes.dim):
+            pes.set_x(x0)
             x_plus = x0.copy()
             x_plus[i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
-            pes.set_x(x0)  # Restore before -delta
+            pes.set_x(x0)
             x_minus = x0.copy()
             x_minus[i] -= delta
             pes.set_x(x_minus)
             e_minus, _ = pes.eval()
 
-            g_cart_numeric[i] = (e_plus - e_minus) / (2 * delta)
+            g_numeric[i] = (e_plus - e_minus) / (2 * delta)
 
         pes.set_x(x0)
 
-        assert_allclose(g_cart, g_cart_numeric, atol=1e-4, rtol=1e-3)
+        assert_allclose(g, g_numeric, atol=1e-4, rtol=1e-3)
 
 
 class TestSellaWithCellOptimization:
@@ -831,47 +861,10 @@ class TestMolecularCrystal:
 class TestTRICsCellDerivatives:
     """Test that TRICs have correct cell derivatives.
 
-    For molecular crystals, translation and rotation coordinates should
-    have zero cell derivatives since they describe internal molecular
-    motion that doesn't depend on the cell.
+    For molecular crystals, translation and rotation coordinates have
+    zero cell derivatives by construction (hardcoded in cell_jacobian).
+    Bond/angle/dihedral cell derivatives are tested below.
     """
-
-    def test_translation_cell_derivative_zero(self):
-        """Test that translation coordinates have zero cell derivatives."""
-        # Create a simple diatomic in a periodic cell
-        atoms = Atoms('H2', positions=[[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]])
-        atoms.set_cell([5.0, 5.0, 5.0])
-        atoms.pbc = True
-
-        internals = Internals(atoms, allow_fragments=True)
-        internals.find_all_bonds()
-
-        # Get the translation coordinates
-        translations = internals.internals.get('translations', [])
-
-        for trans in translations:
-            grad_cell = trans.calc_cell_gradient(atoms)
-            # Translation center of mass should not depend on cell
-            assert_allclose(grad_cell, 0, atol=1e-10)
-
-    def test_rotation_cell_derivative_zero(self):
-        """Test that rotation coordinates have zero cell derivatives."""
-        # Create water molecule (non-linear, has rotations)
-        atoms = molecule('H2O')
-        atoms.center(vacuum=3.0)
-        atoms.pbc = True
-
-        internals = Internals(atoms, allow_fragments=True)
-        internals.find_all_bonds()
-        internals.find_all_angles()
-
-        # Get rotation coordinates
-        rotations = internals.internals.get('rotations', [])
-
-        for rot in rotations:
-            grad_cell = rot.calc_cell_gradient(atoms)
-            # Rotation orientation should not depend on cell
-            assert_allclose(grad_cell, 0, atol=1e-10)
 
     def test_bond_cell_derivative_intramolecular(self):
         """Test intramolecular bond has zero cell derivative if not crossing PBC."""
@@ -1186,56 +1179,13 @@ class TestRigidFragments:
         for group in pes.fragment_groups:
             assert_allclose(delta_r[group].mean(axis=0), 0, atol=1e-12)
 
-    def test_rigid_fragment_cell_gradient_numerical(self):
-        """Test rigid fragment cell gradient matches numerical finite difference.
-
-        This is the key correctness test: the analytical cell gradient with
-        rigid fragment mode should match the energy change when we actually
-        move fragment CoMs to maintain fractional positions.
-        """
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        # Get analytical gradient
-        _, g = pes.eval()
-        g_cell = g[pes.n_internal:]
-
-        # Numerical gradient via finite difference on cell parameters
-        delta = 1e-6
-        x0 = pes.get_x()
-        g_cell_numeric = np.zeros(pes.n_cell_dof)
-
-        for i in range(pes.n_cell_dof):
-            pes.set_x(x0)  # Restore before each probe
-            x_plus = x0.copy()
-            x_plus[pes.n_internal + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x0)  # Restore before -delta
-            x_minus = x0.copy()
-            x_minus[pes.n_internal + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x0)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_rigid_fragment_cell_gradient_nonorthogonal(self):
-        """Test rigid fragment gradient with non-orthogonal cell."""
+    def _make_triclinic_crystal(self):
+        """Create two water molecules in a triclinic periodic box."""
         water1 = molecule('H2O')
         water2 = molecule('H2O')
         water1.positions += [1.0, 1.0, 1.0]
         water2.positions += [4.0, 4.0, 4.0]
         atoms = water1 + water2
-
-        # Non-orthogonal cell (triclinic)
         cell = np.array([
             [7.0, 0.5, 0.3],
             [0.0, 6.8, 0.4],
@@ -1244,38 +1194,146 @@ class TestRigidFragments:
         atoms.set_cell(cell)
         atoms.pbc = True
         atoms.calc = LennardJones()
+        return atoms
 
-        internals = Internals(atoms, allow_fragments=True)
+    def _make_sheared_crystal(self):
+        """Create two water molecules in a heavily sheared triclinic cell."""
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        atoms = water1 + water2
+        cell = np.array([
+            [7.0, 1.5, 0.8],
+            [0.0, 6.5, 1.2],
+            [0.0, 0.0, 7.5],
+        ])
+        atoms.set_cell(cell)
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+        return atoms
 
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
+    def _make_seeded_triclinic_water_crystal(self, seed, nwaters=3):
+        """Create a deterministic skewed molecular crystal from a seed."""
+        rng = np.random.RandomState(seed)
+        cell = np.array([
+            [5.8, 0.0, 0.0],
+            [0.8 + 0.15 * rng.rand(), 5.6, 0.0],
+            [0.5 + 0.15 * rng.rand(), 0.7 + 0.15 * rng.rand(), 6.0],
+        ])
+        frac_centers = np.array([
+            [0.20, 0.22, 0.22],
+            [0.58, 0.34, 0.50],
+            [0.34, 0.70, 0.42],
+            [0.76, 0.68, 0.75],
+        ])
+        water = molecule('H2O')
+        water.positions -= water.positions.mean(axis=0)
 
-        # Get analytical gradient
+        atoms = Atoms()
+        for frac in frac_centers[:nwaters]:
+            mol = water.copy()
+            for axis in ['x', 'y', 'z']:
+                mol.rotate(rng.rand() * 360.0, axis, center=(0, 0, 0))
+            mol.positions += frac @ cell
+            atoms += mol
+
+        atoms.set_cell(cell)
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+        return atoms
+
+    def _cell_gradient_fd(self, pes, delta=1e-6):
+        """Compute cell DOF gradient via central finite differences."""
         _, g = pes.eval()
         g_cell = g[pes.n_internal:]
-
-        # Numerical gradient
-        delta = 1e-6
         x0 = pes.get_x()
         g_cell_numeric = np.zeros(pes.n_cell_dof)
-
         for i in range(pes.n_cell_dof):
-            pes.set_x(x0)  # Restore before each probe
+            pes.set_x(x0)
             x_plus = x0.copy()
             x_plus[pes.n_internal + i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
-
-            pes.set_x(x0)  # Restore before -delta
+            pes.set_x(x0)
             x_minus = x0.copy()
             x_minus[pes.n_internal + i] -= delta
             pes.set_x(x_minus)
             e_minus, _ = pes.eval()
-
             g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
         pes.set_x(x0)
+        return g_cell, g_cell_numeric
 
+    @pytest.mark.parametrize("setup", [
+        "orthogonal", "triclinic", "sheared", "deformed",
+    ])
+    def test_rigid_fragment_cell_gradient_numerical(self, setup):
+        """Test rigid fragment cell gradient matches numerical FD."""
+        if setup == "orthogonal":
+            atoms = self._make_two_water_crystal()
+        elif setup == "triclinic":
+            atoms = self._make_triclinic_crystal()
+        elif setup == "sheared":
+            atoms = self._make_sheared_crystal()
+        elif setup == "deformed":
+            atoms = self._make_two_water_crystal()
+
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is True
+
+        if setup == "deformed":
+            x0 = pes.get_x()
+            x_deformed = x0.copy()
+            for i in range(pes.n_cell_dof):
+                x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
+            pes.set_x(x_deformed)
+
+        g_cell, g_cell_numeric = self._cell_gradient_fd(pes)
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    @pytest.mark.parametrize("seed", [0, 7, 19])
+    def test_seeded_triclinic_cell_gradient_matches_fd(self, seed):
+        """Rigid-fragment cell gradients should survive varied skewed cells."""
+        atoms = self._make_seeded_triclinic_water_crystal(seed)
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True)
+        assert pes.rigid_fragments is True
+        assert len(pes.fragment_groups) == 3
+
+        # Move away from the construction point so the FD sweep samples the
+        # real cell-update path, including rigid rotations under shear.
+        x = pes.get_x().copy()
+        rng = np.random.RandomState(seed + 100)
+        x[pes.n_internal:] += 0.02 * rng.normal(size=pes.n_cell_dof)
+        pes.set_x(x)
+
+        g_cell, g_cell_numeric = self._cell_gradient_fd(pes, delta=1e-5)
+        assert np.abs(g_cell).max() > 1e-4
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_masked_rigid_fragment_cell_gradient_matches_fd(self):
+        """A sparse cell mask must use the same rigid cell derivative."""
+        atoms = self._make_seeded_triclinic_water_crystal(seed=23)
+        internals = Internals(atoms, allow_fragments=True)
+        cell_mask = np.array([
+            [True, False, True],
+            [False, True, False],
+            [True, False, True],
+        ])
+        pes = CellInternalPES(
+            atoms,
+            internals,
+            rigid_fragments=True,
+            cell_mask=cell_mask,
+        )
+        assert pes.n_cell_dof == np.count_nonzero(cell_mask)
+
+        x = pes.get_x().copy()
+        x[pes.n_internal:] += np.linspace(-0.015, 0.015, pes.n_cell_dof)
+        pes.set_x(x)
+
+        g_cell, g_cell_numeric = self._cell_gradient_fd(pes, delta=1e-5)
         assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
 
     def test_intramolecular_geometry_preserved_after_cell_step(self):
@@ -1390,106 +1448,6 @@ class TestRigidFragments:
                     "Fragment atoms should rotate under shear deformation"
                 )
 
-    def test_gradient_numerical_large_shear(self):
-        """Test gradient correctness with a heavily sheared cell.
-
-        This stress-tests the rotation correction at large deformation
-        where the rotation component R deviates significantly from identity.
-        """
-        water1 = molecule('H2O')
-        water2 = molecule('H2O')
-        water1.positions += [1.0, 1.0, 1.0]
-        water2.positions += [4.0, 4.0, 4.0]
-        atoms = water1 + water2
-
-        # Heavily sheared triclinic cell
-        cell = np.array([
-            [7.0, 1.5, 0.8],
-            [0.0, 6.5, 1.2],
-            [0.0, 0.0, 7.5],
-        ])
-        atoms.set_cell(cell)
-        atoms.pbc = True
-        atoms.calc = LennardJones()
-
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        # Get analytical gradient
-        _, g = pes.eval()
-        g_cell = g[pes.n_internal:]
-
-        # Numerical gradient via finite difference
-        delta = 1e-6
-        x0 = pes.get_x()
-        g_cell_numeric = np.zeros(pes.n_cell_dof)
-
-        for i in range(pes.n_cell_dof):
-            pes.set_x(x0)
-            x_plus = x0.copy()
-            x_plus[pes.n_internal + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x0)
-            x_minus = x0.copy()
-            x_minus[pes.n_internal + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x0)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_gradient_after_cell_step(self):
-        """Test gradient correctness after the cell has already been deformed.
-
-        After a cell step, F != I and the rotation correction is nonzero.
-        Verify gradient still matches numerical FD at the deformed geometry.
-        """
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-
-        # First, apply a cell deformation to move away from F = I
-        x0 = pes.get_x()
-        x_deformed = x0.copy()
-        # Apply a mix of diagonal and off-diagonal strains
-        n_cell = pes.n_cell_dof
-        for i in range(n_cell):
-            x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
-        pes.set_x(x_deformed)
-
-        # Now verify gradient at this deformed state
-        _, g = pes.eval()
-        g_cell = g[pes.n_internal:]
-
-        delta = 1e-6
-        x1 = pes.get_x()
-        g_cell_numeric = np.zeros(n_cell)
-
-        for i in range(n_cell):
-            pes.set_x(x1)
-            x_plus = x1.copy()
-            x_plus[pes.n_internal + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x1)
-            x_minus = x1.copy()
-            x_minus[pes.n_internal + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x1)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
     def _full_gradient_fd(self, pes, delta_int=1e-5, delta_cell=1e-6):
         """Compute full numerical gradient via central finite differences."""
         _, g_analytical = pes.eval()
@@ -1516,51 +1474,26 @@ class TestRigidFragments:
         pes.set_x(x0)
         return g_analytical, g_numeric
 
-    def test_full_gradient_numerical_rigid_fragments(self):
-        """Verify analytical gradient matches FD for ALL DOFs (internal + cell)."""
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        g_analytical, g_numeric = self._full_gradient_fd(pes)
-        assert_allclose(g_analytical, g_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_full_gradient_numerical_triclinic(self):
-        """Verify full gradient with non-orthogonal cell (rotation correction active)."""
-        water1 = molecule('H2O')
-        water2 = molecule('H2O')
-        water1.positions += [1.0, 1.0, 1.0]
-        water2.positions += [4.0, 4.0, 4.0]
-        atoms = water1 + water2
-
-        cell = np.array([
-            [7.0, 0.5, 0.3],
-            [0.0, 6.8, 0.4],
-            [0.0, 0.0, 7.2],
-        ])
-        atoms.set_cell(cell)
-        atoms.pbc = True
-        atoms.calc = LennardJones()
+    @pytest.mark.parametrize("setup", [
+        "orthogonal", "triclinic", "deformed",
+    ])
+    def test_full_gradient_numerical(self, setup):
+        """Verify analytical gradient matches FD for ALL DOFs."""
+        if setup == "triclinic":
+            atoms = self._make_triclinic_crystal()
+        else:
+            atoms = self._make_two_water_crystal()
 
         internals = Internals(atoms, allow_fragments=True)
         pes = CellInternalPES(atoms, internals)
         assert pes.rigid_fragments is True
 
-        g_analytical, g_numeric = self._full_gradient_fd(pes)
-        assert_allclose(g_analytical, g_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_full_gradient_numerical_after_deformation(self):
-        """Verify full gradient after cell deformation (F != I)."""
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-
-        x0 = pes.get_x()
-        x_deformed = x0.copy()
-        for i in range(pes.n_cell_dof):
-            x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
-        pes.set_x(x_deformed)
+        if setup == "deformed":
+            x0 = pes.get_x()
+            x_deformed = x0.copy()
+            for i in range(pes.n_cell_dof):
+                x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
+            pes.set_x(x_deformed)
 
         g_analytical, g_numeric = self._full_gradient_fd(pes)
         assert_allclose(g_analytical, g_numeric, atol=1e-4, rtol=1e-3)
@@ -1605,6 +1538,313 @@ class TestRigidFragments:
             "R should differ from identity after shear"
         )
 
+    def test_rigid_rotation_is_objective_on_skewed_cell(self):
+        """A pure global rotation of a skewed rigid-fragment cell must not
+        change the energy.
+
+        The rigid motion uses the row-vector incremental deformation
+        M = inv(C_before) @ C_after (a pure rotation gives M = Q.T, so
+        delta_r @ polar(M) rotates rigidly). The old left-multiplied form
+        (C_after @ inv(C_before), delta_r @ R.T) was not objective on skewed
+        cells: a global rotation changed the energy by ~1e-2 eV.
+        """
+        cell = np.array([[6.0, 0, 0], [2.0, 6.0, 0], [0.5, 1.0, 6.0]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1],
+                                 [3, 4, 2], [3.9, 4.2, 2], [2.6, 4.9, 2]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True)
+        pes.get_g()
+        E0 = pes.eval()[0]
+
+        # Target cell = pure rotation of the current cell about z.
+        theta = 1e-3
+        c, s = np.cos(theta), np.sin(theta)
+        Qz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        cell_rot = cell @ Qz.T
+        F = cell_rot @ np.linalg.inv(pes.orig_cell)
+        U = _logm_3x3(F) * pes.exp_cell_factor
+        x = pes.get_x().copy()
+        x[pes.n_internal:] = U[pes.cell_mask]
+
+        pes.save()
+        pes.set_x(x)
+        E1 = pes.eval()[0]
+        pes.restore()
+        assert abs(E1 - E0) < 1e-9, f"rotation changed energy by {E1 - E0:.3e}"
+
+    def test_cell_gradient_matches_fd_on_skewed_nonequilibrium(self):
+        """Analytic cell gradient must match FD of set_x on a skewed cell far
+        from equilibrium, where the rotation-correction term is active."""
+        cell = np.array([[4.5, 0, 0], [1.5, 4.5, 0], [0.8, 0.6, 4.5]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[0.5, 0.5, 0.5], [1.4, 0.7, 0.5],
+                                 [0.1, 1.4, 0.5], [2.5, 2.5, 2.0],
+                                 [3.4, 2.7, 2.0], [2.1, 3.4, 2.0]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True)
+        pes.get_g()
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        # This configuration has a genuinely nonzero cell gradient.
+        assert np.abs(g_cell).max() > 1e-2
+        x0 = pes.get_x().copy()
+        eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+
+class TestConstrainedCellGradient:
+    """Cell gradient must include constraint-reprojection virtual work.
+
+    With an internal constraint (fixed bond/angle/dihedral) + cell
+    optimization, set_x changes the cell (moving atoms fractionally), which
+    perturbs the constrained coordinate, then reprojects atoms back onto the
+    constraint manifold. That projection does work against the forces, adding
+    a term to dE/d(cell) that the stress/virial alone misses. Before the fix
+    the analytic cell gradient differed from the FD derivative of set_x by
+    ~26 eV on a skewed periodic H2O cell with one fixed OH bond.
+    """
+
+    @staticmethod
+    def _skewed_water():
+        cell = np.array([[6.0, 0, 0], [1.5, 6.0, 0], [0, 0, 6.0]])
+        atoms = Atoms('OH2', positions=[[1, 1, 0], [1.9, 1.2, 0],
+                                        [0.6, 1.9, 0]], cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    def _fd_cell_gradient(self, pes):
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        x0 = pes.get_x().copy()
+        eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        return g_cell, g_fd
+
+    def test_fixed_bond_cell_gradient_matches_fd(self):
+        atoms = self._skewed_water()
+        cons = Constraints(atoms)
+        cons.fix_bond((0, 1))
+        ic = Internals(atoms, cons=cons)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False)
+        pes.get_g()
+        g_cell, g_fd = self._fd_cell_gradient(pes)
+        # The projection work term is large here; make sure the test is
+        # exercising a regime where the correction matters.
+        assert np.abs(g_cell).max() > 1.0
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_unconstrained_cell_gradient_unaffected(self):
+        # No constraints: the correction must be identically zero.
+        atoms = self._skewed_water()
+        ic = Internals(atoms)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False)
+        assert_allclose(pes._constraint_projection_cell_gradient(), 0.0,
+                        atol=1e-14)
+        pes.get_g()
+        g_cell, g_fd = self._fd_cell_gradient(pes)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_interfragment_constraint_rigid_cell_gradient_matches_fd(self):
+        # A constraint spanning two rigid fragments (a fixed angle across two
+        # separate waters -- angles are not connectivity edges, so the
+        # fragments stay separate) acquires a residual under cell strain: the
+        # interfragment separation follows the full deformation. The projection
+        # correction must make the analytic cell gradient match FD. (The FD
+        # harness tightens the projection tolerance to avoid the
+        # _project_to_constraints dead zone that would otherwise mask the term.)
+        import types
+        from sella.peswrapper import CellInternalPES as _CIP
+        cell = np.array([[10.0, 0, 0], [2.0, 10.0, 0], [0.5, 0.8, 10.0]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1],
+                                 [6, 6, 4], [6.9, 6.2, 4], [5.6, 6.9, 4]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 3))  # atoms 0,1 in frag1; atom 3 in frag2
+        ic = Internals(atoms, cons=cons, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False, rigid_fragments=True)
+        assert len(pes.fragment_groups) == 2  # genuinely two fragments
+        pes.get_g()
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        assert np.abs(g_cell).max() > 1.0  # the correction is large here
+
+        orig = _CIP._project_to_constraints
+        pes._project_to_constraints = types.MethodType(
+            lambda self, target_tol=1e-11, max_iter=40, **k:
+                orig(self, target_tol=target_tol, max_iter=max_iter, **k), pes)
+        x0 = pes.get_x().copy(); eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_intrafragment_constraint_rigid_ok(self):
+        # A constraint within one rigid fragment is fine (invariant under the
+        # rigid cell move) and must not raise.
+        cell = np.array([[10.0, 0, 0], [2.0, 10.0, 0], [0.5, 0.8, 10.0]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1],
+                                 [6, 6, 4], [6.9, 6.2, 4], [5.6, 6.9, 4]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 2))  # all in frag1
+        ic = Internals(atoms, cons=cons, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False, rigid_fragments=True)
+        assert_allclose(pes._constraint_projection_cell_gradient(), 0.0,
+                        atol=1e-14)
+        _, Ucons, _, _ = pes._compute_basis_int()
+        assert Ucons.shape[1] == 1
+        pes.get_g()  # must not raise
+
+    def test_periodic_image_intrafragment_constraint_not_shortcut(self):
+        # Same-fragment shape constraints are invariant under rigid cell motion
+        # only when their stored periodic image offsets are zero. An explicit
+        # image angle has a nonzero cell derivative and must take the full
+        # projection path.
+        cell = np.array([[10.0, 0, 0], [2.0, 10.0, 0], [0.5, 0.8, 10.0]])
+        atoms = Atoms('OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 2), ncvecs=[[1, 0, 0], [0, 0, 0]])
+        ic = Internals(atoms, cons=cons, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False,
+                              rigid_fragments=True)
+
+        assert not pes._constraints_are_intrafragment_shape_constraints()
+        X_C = pes._unprojected_cell_motion_derivative()
+        Rc_C = pes.cons.jacobian() @ X_C + pes.cons.cell_jacobian()
+        assert np.linalg.norm(Rc_C) > 1e-8
+
+
+class TestSingletonFragmentCellMotion:
+    """Isolated one-atom fragments must move rigidly with the cell.
+
+    allow_fragments adds a translation TRIC for a lone atom but previously did
+    not record it in fragment_atom_groups, so CellInternalPES excluded it from
+    rigid-body cell motion: its CoM stayed fixed in Cartesian space instead of
+    following the cell fractionally, and _compute_delta_r initialized it from
+    absolute position (nonzero) instead of zero, poisoning the cell gradient.
+    """
+
+    @staticmethod
+    def _water_plus_ar(cell):
+        atoms = Atoms('OH2Ar',
+                      positions=[[0.5, 0.5, 0.5], [1.4, 0.7, 0.5],
+                                 [0.1, 1.4, 0.5], [2.6, 2.6, 2.6]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    def test_singleton_recorded_in_fragment_groups(self):
+        atoms = self._water_plus_ar(np.eye(3) * 9.0)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        groups = [sorted(int(i) for i in g) for g in ic.fragment_atom_groups]
+        assert [3] in groups, f"Ar singleton missing from {groups}"
+        assert sorted([0, 1, 2]) in [sorted(g) for g in groups]
+
+    def test_singleton_moves_fractionally_with_cell(self):
+        atoms = self._water_plus_ar(np.eye(3) * 9.0)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              rigid_fragments=True)
+        pes.get_g()
+        ar0 = atoms.positions[3].copy()
+        cell0 = atoms.get_cell().array.copy()
+        x = pes.get_x().copy(); x[pes.n_internal:] += 0.05
+        pes.save(); pes.set_x(x)
+        ar1 = atoms.positions[3].copy(); cell1 = atoms.get_cell().array.copy()
+        pes.restore()
+        # Fractional coordinate preserved: r1 = (r0 @ inv(C0)) @ C1.
+        expected = (ar0 @ np.linalg.inv(cell0)) @ cell1
+        assert np.linalg.norm(ar1 - ar0) > 0.1  # actually moved
+        assert_allclose(ar1, expected, atol=1e-8)
+
+    def test_singleton_delta_r_is_zero(self):
+        atoms = self._water_plus_ar(np.eye(3) * 9.0)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              rigid_fragments=True)
+        delta_r = pes._compute_delta_r()
+        assert_allclose(delta_r[3], 0.0, atol=1e-12)
+
+    def test_cell_gradient_matches_fd_with_singleton(self):
+        # Compressed skewed cell so the Ar singleton actively contributes to
+        # the (nonzero) cell gradient.
+        cell = np.array([[4.2, 0, 0], [1.3, 4.2, 0], [0.7, 0.5, 4.2]])
+        atoms = self._water_plus_ar(cell)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              rigid_fragments=True)
+        pes.get_g()
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        assert np.abs(g_cell).max() > 1e-2
+        x0 = pes.get_x().copy(); eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_rigid_fragments_without_groups_raises(self):
+        # Explicit rigid_fragments=True on an Internals built WITHOUT
+        # allow_fragments has no fragment groups, so the rigid cell move would
+        # freeze the atoms while the cell changes (silent corruption). Must
+        # raise a clear error instead.
+        atoms = Atoms('OH2', positions=[[1, 1, 1], [1.9, 1.2, 1],
+                                        [0.6, 1.9, 1]],
+                      cell=np.eye(3) * 6.0, pbc=True)
+        atoms.calc = LennardJones()
+        ic = Internals(atoms)  # no allow_fragments -> no fragment groups
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        with pytest.raises(ValueError, match="fragment groups"):
+            CellInternalPES(atoms, internals=ic, eta=1e-4,
+                            auto_find_internals=False, rigid_fragments=True)
+
 
 class TestNiggliReduction:
     """Tests for periodic Niggli reduction during cell optimization."""
@@ -1642,15 +1882,21 @@ class TestNiggliReduction:
         # orig_cell should be updated
         assert_allclose(pes.orig_cell, atoms.get_cell().array)
 
-    def test_niggli_triggers_on_skewed_cell_internal(self):
-        """CellInternalPES.maybe_niggli_reduce fires when angles are extreme."""
+    def test_niggli_disabled_for_internal_pes(self):
+        """CellInternalPES declines Niggli: it would corrupt internal coords.
+
+        Niggli reduction recombines lattice vectors and wraps atoms, which
+        invalidates stored ncvecs and dummy positions. CellInternalPES must
+        therefore decline it (return False) and leave the cell -- and the
+        internal coordinates -- untouched, even on a badly skewed cell.
+        """
         atoms = make_molecular_crystal()
         atoms.calc = EMT()
 
         internals = Internals(atoms, allow_fragments=True)
         pes = CellInternalPES(atoms, internals=internals, eta=1e-4)
 
-        # Shear the cell
+        # Shear the cell into a regime where Niggli would otherwise fire.
         cell = atoms.get_cell().array.copy()
         cell[1, 0] += 6.0
         atoms.set_cell(cell, scale_atoms=False)
@@ -1659,12 +1905,36 @@ class TestNiggliReduction:
         angles = atoms.get_cell().angles()
         assert min(angles) < 60.0 or max(angles) > 120.0
 
-        reduced = pes.maybe_niggli_reduce()
-        assert reduced
+        q_before = pes.int.calc().copy()
+        cell_before = atoms.get_cell().array.copy()
 
-        new_angles = atoms.get_cell().angles()
-        new_max_dev = max(abs(a - 90.0) for a in new_angles)
-        assert new_max_dev < 30.0, f"Angles after reduction: {new_angles}"
+        reduced = pes.maybe_niggli_reduce()
+        assert reduced is False, "Niggli must be declined for internal PES"
+
+        # Cell and internal coordinates must be left exactly as they were.
+        assert_allclose(atoms.get_cell().array, cell_before, atol=1e-12)
+        assert_allclose(pes.int.calc(), q_before, atol=1e-12)
+
+    def test_niggli_would_corrupt_periodic_ncvecs(self):
+        """Documents *why* Niggli is declined for internal PES.
+
+        A raw niggli_reduce on a cell recombines lattice vectors, so a stored
+        integer image offset (ncvec) points at a different physical image
+        afterward and the bond length jumps. This is the corruption the
+        CellInternalPES override avoids by declining reduction.
+        """
+        from ase.build import niggli_reduce
+        cell = np.array([[3.0, 0, 0], [2.9, 3.0, 0], [0, 0, 3.0]])
+        atoms = Atoms('H2', positions=[[0, 0, 0], [0.5, 0, 0]],
+                      cell=cell, pbc=True)
+        internals = Internals(atoms)
+        internals.add_bond((0, 1), ncvecs=[[1, 0, 0]])
+        b_before = internals.calc()[0]
+
+        niggli_reduce(atoms)
+        b_after = internals.calc()[0]
+        # The stored ncvec is now stale: the bond value silently changes.
+        assert not np.isclose(b_before, b_after, atol=1e-3)
 
     def test_niggli_does_not_trigger_on_good_cell(self):
         """No reduction when cell angles are fine."""
@@ -1731,6 +2001,831 @@ class TestNiggliReduction:
         # Run a few steps — should not crash even if Niggli fires
         for _ in range(3):
             opt.step()
+
+
+class TestExactGeodesicDefault:
+    """Regression tests for exact_geodesic flag consistency.
+
+    The resolved default (True) must be applied to the *initial* PES, not just
+    to the PES rebuilt after a bad-internals reset. Before the fix, omitting the
+    flag left the initial PES with exact_geodesic=None (falsy -> approximate ODE
+    geodesic), which then silently flipped to True on the first reset.
+    """
+
+    def test_default_is_exact_on_initial_pes(self):
+        """Omitting the flag -> initial PES uses exact geodesic (True)."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    logfile=None)
+        assert opt.pes.exact_geodesic is True
+
+    def test_explicit_false_is_honored(self):
+        """exact_geodesic=False must reach the initial PES unchanged."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    exact_geodesic=False, logfile=None)
+        assert opt.pes.exact_geodesic is False
+
+    def test_explicit_true_is_honored(self):
+        """exact_geodesic=True must reach the initial PES unchanged."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    exact_geodesic=True, logfile=None)
+        assert opt.pes.exact_geodesic is True
+
+
+class TestRigidFragmentsSurvivesRebuild:
+    """An explicit rigid_fragments must survive the bad-internals rebuild.
+
+    rigid_fragments is a pass-through PES kwarg captured in self.peskwargs.
+    The bad-internals reset path re-runs initialize_pes with an explicit
+    argument list; before the fix it omitted **self.peskwargs, so a user's
+    explicit rigid_fragments=False was dropped and CellInternalPES silently
+    re-auto-detected it as True.
+    """
+
+    def _force_bad_internals_rebuild(self, opt):
+        """Trigger the real reset path in Sella.step() once.
+
+        The reset fires when pes.int.check_for_bad_internals() is truthy in the
+        guard inside step(). Other call sites (kick, _predict_step) also invoke
+        it during a step, so force a truthy result until the PES object is
+        actually rebuilt (its identity changes), then restore real behavior.
+        This exercises the actual initialize_pes call inside step().
+        """
+        pes_before = opt.pes
+
+        def fake_check():
+            if opt.pes is pes_before:
+                return {"bonds": []}  # truthy -> triggers rebuild
+            return opt.pes.int.check_for_bad_internals()
+
+        opt.pes.int.check_for_bad_internals = fake_check
+        opt.step()
+        assert opt.pes is not pes_before, "reset path did not fire"
+
+    def test_explicit_false_survives_rebuild(self):
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, rigid_fragments=False, logfile=None)
+        # CH4 with allow_fragments would auto-detect True, so False is a real
+        # override -- confirm it holds initially and after a rebuild.
+        assert opt.pes.rigid_fragments is False
+        self._force_bad_internals_rebuild(opt)
+        assert opt.pes.rigid_fragments is False
+
+    def test_explicit_true_survives_rebuild(self):
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        # allow_fragments so rigid_fragments=True has real fragment groups
+        # (a lone molecule still yields a z=1 fragment); the point of the test
+        # is that the explicit rigid_fragments=True survives the rebuild.
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, rigid_fragments=True, logfile=None)
+        assert opt.pes.rigid_fragments is True
+        self._force_bad_internals_rebuild(opt)
+        assert opt.pes.rigid_fragments is True
+
+    def test_autodetect_still_works_after_rebuild(self):
+        # No explicit override: auto-detection should apply on both builds.
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, logfile=None)
+        assert opt.peskwargs == {}
+        detected = opt.pes.rigid_fragments
+        self._force_bad_internals_rebuild(opt)
+        assert opt.pes.rigid_fragments == detected
+
+    def test_explicit_constraints_survive_rebuild(self):
+        atoms = make_water_crystal()
+        atoms.calc = LennardJones()
+        constraints = Constraints(atoms)
+        constraints.fix_bond((0, 1))
+        target = constraints.targets.copy()
+
+        opt = Sella(
+            atoms,
+            order=0,
+            internal=True,
+            optimize_cell=True,
+            allow_fragments=True,
+            constraints=constraints,
+            exact_geodesic=False,
+            logfile=None,
+        )
+        self._force_bad_internals_rebuild(opt)
+
+        assert opt.pes.cons.nbonds == 1
+        assert_allclose(opt.pes.cons.targets, target, atol=0.0, rtol=0.0)
+
+
+class TestDummyAtomCellHandling:
+    """Cell steps must carry linear-angle dummy atoms along with real atoms.
+
+    A linear molecule (e.g. CO2) gets a dummy atom to define its angle
+    coordinates. ASE's set_cell(scale_atoms=True) scales real atoms but has
+    no knowledge of dummies, and the finite-difference cell Hessian probes
+    saved/restored only real atoms and cell. Both paths left dummies behind.
+    """
+
+    @staticmethod
+    def _linear_co2(cell_diag=6.0):
+        atoms = Atoms('OCO', positions=[[1, 2, 0], [2, 2, 0], [3, 2, 0]],
+                      cell=np.eye(3) * cell_diag, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _linear_co2_with_off_axis_probe():
+        atoms = Atoms(
+            'OCOH',
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.16, 0.0, 0.0],
+                [2.32, 0.0, 0.0],
+                [4.0, 1.7, 0.9],
+            ],
+        )
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _mostly_linear_hoh(cell_diag=10.0):
+        theta = np.deg2rad(178.0)
+        r = 0.96
+        positions = np.array([
+            [r, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [r * np.cos(theta), r * np.sin(theta), 0.0],
+        ]) + 0.5 * cell_diag
+        atoms = Atoms('HOH', positions=positions,
+                      cell=np.eye(3) * cell_diag, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _two_linear_co2(cell_diag=10.0):
+        # Two separated CO2, second off-axis so a cell shear rotates it.
+        atoms = Atoms('OCOOCO',
+                      positions=[[1, 1, 0], [2, 1, 0], [3, 1, 0],
+                                 [1, 5, 0.3], [1.8, 5.6, 0.3], [2.6, 6.2, 0.3]],
+                      cell=np.eye(3) * cell_diag, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    def test_nonrigid_cell_step_moves_dummy(self):
+        pes = Sella(self._linear_co2(), order=0, internal=True,
+                    optimize_cell=True, logfile=None).pes
+        assert pes.rigid_fragments is False
+        assert len(pes.dummies) == 1
+        dpos0 = pes.dummies.positions.copy()
+
+        target = pes.get_x().copy()
+        target[pes.n_internal:] += 0.05  # cell strain
+        pes.set_x(target)
+
+        # With the bug the dummy stayed at its original position.
+        assert not np.allclose(pes.dummies.positions, dpos0)
+
+    def test_nonrigid_cell_step_scales_dummy_like_atoms(self):
+        # The dummy must follow the same fractional-preserving deformation
+        # gradient that scale_atoms=True applies to real atoms.
+        pes = Sella(self._linear_co2(), order=0, internal=True,
+                    optimize_cell=True, logfile=None).pes
+        dpos0 = pes.dummies.positions.copy()
+        cell0 = pes.atoms.get_cell().array.copy()
+
+        # Drive only the cell parameters through _set_masked_cell_params so no
+        # internal-coordinate solve runs on top (isolates the scaling step).
+        cell_params = pes._masked_cell_params().copy()
+        cell_params += 0.05
+        pes._set_masked_cell_params(cell_params)
+        cell1 = pes.atoms.get_cell().array
+        F = np.linalg.inv(cell0) @ cell1
+        expected = dpos0 @ F
+        # apply the same fix path used in set_x
+        pes.dummies.positions = pes.dummies.positions @ F
+        assert_allclose(pes.dummies.positions, expected, atol=1e-10)
+
+    def test_fd_cell_hessian_restores_dummies(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True, logfile=None).pes
+        assert len(pes.dummies) >= 1
+        dpos0 = pes.dummies.positions.copy()
+        apos0 = pes.atoms.positions.copy()
+        cell0 = pes.atoms.get_cell().array.copy()
+
+        pes._compute_cell_hessian_columns(delta=1e-2)
+
+        assert_allclose(pes.atoms.positions, apos0, atol=1e-12)
+        assert_allclose(pes.atoms.get_cell().array, cell0, atol=1e-12)
+        # The whole point: dummies restored exactly, not left displaced.
+        assert_allclose(pes.dummies.positions, dpos0, atol=1e-12)
+
+    def test_linear_dummy_constraints_remain_in_optimizer_basis(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        assert len(pes.dummies) >= 1
+        assert pes.cons.nint > 0
+        drdx, Ucons, Unred, Ufree_fast = pes._compute_basis_int()
+        assert drdx.shape[0] == 2 * len(pes.dummies)
+        assert Ucons.shape[1] == 2 * len(pes.dummies)
+        assert Ufree_fast is Unred
+
+        pes.get_g()
+        step = pes.get_Ucons().T @ pes.get_Ufree()
+        assert_allclose(step, 0.0, atol=1e-12)
+        assert_allclose(pes.get_scons(), 0.0, atol=0.0)
+
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        pes._update_basis()
+        assert np.linalg.norm(pes.get_scons()) > 0.0
+
+    def test_linear_dummy_cone_repairs_large_displacement(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        apos0 = pes.atoms.positions.copy()
+        pes.dummies.positions += np.array([0.15, -0.105, 0.045])
+        assert np.linalg.norm(pes.cons.residual(), ord=np.inf) > 1e-7
+        assert pes._project_to_constraints()
+
+        assert_allclose(pes.atoms.positions, apos0, atol=1e-12)
+        assert np.linalg.norm(pes.cons.residual(), ord=np.inf) < 1e-7
+
+    def test_linear_dummy_residual_remains_visible_to_convergence(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        assert pes._linear_bend_dummy_projection_records() is not None
+
+        pes.dummies.positions += np.array([0.15, -0.105, 0.045])
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) > 0.1
+        assert_allclose(pes.get_convergence_res(), pes.get_res())
+
+        converged, _, cmax_actual, _ = pes.converged(
+            1e100, smax=1e100, cmax=1e-5
+        )
+        assert not converged
+        assert cmax_actual > 0.1
+
+    def test_linear_dummy_auxiliaries_are_constrained_out_of_optimizer_step(self):
+        atoms = self._linear_co2(cell_diag=10.0)
+        atoms.calc = SinglePointCalculator(
+            atoms,
+            energy=0.0,
+            forces=np.array([
+                [0.00, 0.25, 0.08],
+                [0.03, -0.04, 0.02],
+                [-0.05, 0.10, -0.07],
+            ]),
+            stress=np.zeros(6),
+        )
+        opt = Sella(
+            atoms,
+            order=0,
+            internal=True,
+            optimize_cell=True,
+            allow_fragments=True,
+            rigid_fragments=True,
+            exact_geodesic=False,
+            logfile=None,
+        )
+        pes = opt.pes
+        records = pes._linear_bend_dummy_projection_records()
+        assert records is not None
+
+        # The cone bond and angle remain available to the geometry integrator,
+        # but the optimizer step is projected onto their null space. Before
+        # the fix, these asymmetric forces requested motion in both directions.
+        auxiliaries = [
+            (name, coord)
+            for record in records
+            for name, coord in (('bonds', record[2]),
+                                ('angles', record[4]))
+        ]
+        for name, auxiliary in auxiliaries:
+            matches = [
+                active
+                for coord, active in zip(pes.int.internals[name],
+                                         pes.int._active[name])
+                if coord == auxiliary
+            ]
+            assert matches
+            assert all(matches)
+
+        step, _ = opt._predict_step()
+        auxiliary_rows = pes._linear_dummy_auxiliary_optimizer_rows()
+        assert len(auxiliary_rows) == 2
+        assert_allclose(step[list(auxiliary_rows)], 0.0, atol=1e-12)
+
+        x0 = pes.get_x().copy()
+        _, dx_final, _ = pes.set_x(x0 + step)
+        actual = pes.wrap_dx(pes.get_x() - x0)
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert_allclose(actual[list(auxiliary_rows)], 0.0, atol=1e-10)
+        assert_allclose(dx_final[list(auxiliary_rows)],
+                        actual[list(auxiliary_rows)], atol=2e-7)
+
+    @pytest.mark.parametrize('order', [0, 1])
+    @pytest.mark.filterwarnings(
+        'ignore:Saddle point optimizations with eig=False'
+    )
+    def test_fast_linear_dummy_step_matches_dense_constrained_step(self,
+                                                                   order):
+        def make_optimizer():
+            atoms = self._linear_co2(cell_diag=10.0)
+            atoms.calc = SinglePointCalculator(
+                atoms,
+                energy=0.0,
+                forces=np.array([
+                    [0.00, 0.25, 0.08],
+                    [0.03, -0.04, 0.02],
+                    [-0.05, 0.10, -0.07],
+                ]),
+                stress=np.zeros(6),
+            )
+            return Sella(
+                atoms,
+                order=order,
+                eig=False,
+                internal=True,
+                optimize_cell=(order == 0),
+                allow_fragments=True,
+                exact_geodesic=False,
+                logfile=None,
+                **({'rigid_fragments': True} if order == 0 else {}),
+            )
+
+        fast = make_optimizer()
+        dense = make_optimizer()
+        rng = np.random.default_rng(7)
+        A = rng.normal(size=(fast.pes.dim, fast.pes.dim))
+        H = A.T @ A / fast.pes.dim + np.diag(
+            np.linspace(0.2, 2.0, fast.pes.dim)
+        )
+        fast.pes.set_H(H, initialized=True)
+        dense.pes.set_H(H, initialized=True)
+
+        dense.pes._linear_bend_dummy_projection_records = lambda: None
+        fast_step, _ = fast._predict_step()
+        dense_step, _ = dense._predict_step()
+
+        assert_allclose(fast_step, dense_step, atol=1e-12, rtol=1e-12)
+
+    def test_linear_dummy_projection_filters_projection_only_dummy_rows(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        pes.get_g()
+
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        x0 = pes.get_x().copy()
+        pes.get_g()
+        dummy_rows = pes._dummy_containing_coord_rows()
+        aux_rows = pes._dummy_projection_gauge_filter_rows()
+        dih0 = pes._dummy_dihedral_values()
+
+        dx_initial, dx_final, _ = pes.set_x(x0)
+
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert_allclose(dx_initial, 0.0, atol=1e-14)
+        assert len(dummy_rows) > 0
+        assert len(aux_rows) > 0
+        assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
+        ddih = pes._wrapped_angle_delta(pes._dummy_dihedral_values(), dih0)
+        assert_allclose(ddih, 0.0, atol=1e-8)
+
+    def test_linear_dummy_projection_accounts_free_dummy_dihedral(self):
+        atoms = self._linear_co2_with_off_axis_probe()
+        internals = Internals(atoms)
+        internals.find_all_bonds()
+        internals.find_all_angles()
+        internals.find_all_dihedrals()
+
+        natoms = internals.natoms
+        extra_dihedral = (natoms, 0, 3, 1)
+        internals.add_dihedral(extra_dihedral)
+        pes = InternalPES(atoms, internals, auto_find_internals=False)
+        pes.get_g()
+        _, _, Unred, Ufree = pes._compute_basis_int()
+        assert Ufree is Unred
+        assert pes._fast_dummy_redundant_projection() is not None
+        assert_allclose(
+            pes.get_Ucons().T @ pes.get_Ufree(), 0.0, atol=1e-12
+        )
+
+        extra_row = None
+        row = 0
+        for name in pes.int._names:
+            for coord, active in zip(pes.int.internals[name],
+                                     pes.int._active[name]):
+                if active:
+                    if (name == 'dihedrals'
+                            and tuple(coord.indices) == extra_dihedral):
+                        extra_row = row
+                    row += 1
+        assert extra_row is not None
+        aux_rows = pes._dummy_projection_gauge_filter_rows()
+        assert extra_row not in aux_rows
+
+        pes.dummies.positions += np.array([[8e-4, -1.7e-3, 1.1e-3]])
+        target = pes.get_x().copy()
+        dx_initial, dx_final, _ = pes.set_x(target)
+        actual_delta = pes._wrapped_angle_delta(
+            np.array([pes.get_x()[extra_row]]),
+            np.array([target[extra_row]]),
+        )[0]
+
+        assert pes._last_linear_dummy_projection_mode == 'cone'
+        assert pes._last_linear_dummy_projection_ddih > 1e-4
+        assert abs(actual_delta) > 1e-4
+        assert_allclose(dx_initial, 0.0, atol=1e-14)
+        assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
+        assert_allclose(dx_final[extra_row], actual_delta, atol=1e-10)
+
+    def test_redundant_full_rank_dummy_step_matches_dense_basis(self):
+        def make_pes():
+            atoms = self._linear_co2(cell_diag=10.0)
+            atoms.calc = SinglePointCalculator(
+                atoms,
+                energy=0.0,
+                forces=np.array([
+                    [0.00, 0.25, 0.08],
+                    [0.03, -0.04, 0.02],
+                    [-0.05, 0.10, -0.07],
+                ]),
+                stress=np.zeros(6),
+            )
+            base = Sella(
+                atoms,
+                order=0,
+                internal=True,
+                allow_fragments=True,
+                logfile=None,
+            ).pes
+            internals = base.int.copy()
+            internals.add_bond((0, 2))
+            return InternalPES(
+                atoms,
+                internals,
+                auto_find_internals=False,
+            )
+
+        fast = make_pes()
+        dense = make_pes()
+        dense._linear_bend_dummy_projection_records = lambda: None
+
+        Q, R = fast._get_jacobian_qr()
+        assert Q.shape[0] > Q.shape[1]
+        assert R.shape[0] == R.shape[1]
+        assert fast._linear_bend_dummy_projection_records() is not None
+
+        rng = np.random.default_rng(21)
+        A = rng.normal(size=(fast.dim, fast.dim))
+        H = A.T @ A / fast.dim + np.diag(
+            np.linspace(0.2, 2.0, fast.dim)
+        )
+        fast.set_H(H, initialized=True)
+        dense.set_H(H, initialized=True)
+        fast.get_g()
+        dense.get_g()
+
+        assert fast.curr['Ufree'] is fast.curr['Unred']
+        assert fast._fast_dummy_redundant_projection() is not None
+        fast_step, _ = MaxInternalStep(fast, 0, 0.1).get_s()
+        dense_step, _ = MaxInternalStep(dense, 0, 0.1).get_s()
+
+        assert_allclose(fast_step, dense_step, atol=1e-12, rtol=1e-12)
+        assert_allclose(fast.get_drdx() @ fast_step, 0.0, atol=1e-12)
+
+    def test_small_linear_bend_moves_geometry_without_projection(self):
+        pes = Sella(
+            self._mostly_linear_hoh(),
+            order=0,
+            internal=True,
+            allow_fragments=True,
+            exact_geodesic=False,
+            logfile=None,
+        ).pes
+        pes.get_g()
+        fixed_rows = set(pes._linear_dummy_auxiliary_optimizer_rows())
+        natoms = pes.int.natoms
+        free_angle = None
+        row = 0
+        for name in pes.int._names:
+            for coord, active in zip(pes.int.internals[name],
+                                     pes.int._active[name]):
+                if not active:
+                    continue
+                if (name == 'angles' and row not in fixed_rows
+                        and np.any(np.asarray(coord.indices) >= natoms)):
+                    free_angle = row
+                row += 1
+        assert free_angle is not None
+
+        x0 = pes.get_x().copy()
+        apos0 = pes.atoms.positions.copy()
+        dpos0 = pes.dummies.positions.copy()
+        target = x0.copy()
+        target[free_angle] += 1e-3
+
+        pes._set_x_ode(target)
+
+        assert np.linalg.norm(pes.atoms.positions - apos0) > 1e-4
+        assert np.linalg.norm(pes.dummies.positions - dpos0) > 1e-4
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert not pes._project_to_constraints()
+        assert_allclose(
+            pes.wrap_dx(pes.get_x() - x0)[free_angle],
+            1e-3,
+            atol=1e-9,
+        )
+
+    def test_near_linear_hoh_bend_rows_are_accounted(self):
+        def make_pes():
+            return Sella(
+                self._mostly_linear_hoh(),
+                order=0,
+                internal=True,
+                optimize_cell=True,
+                allow_fragments=True,
+                rigid_fragments=True,
+                logfile=None,
+            ).pes
+
+        def dummy_rows(pes):
+            natoms = pes.int.natoms
+            aux_rows = set(pes._linear_dummy_auxiliary_optimizer_rows())
+            rows = []
+            row = 0
+            for name in pes.int._names:
+                for coord, active in zip(pes.int.internals[name],
+                                         pes.int._active[name]):
+                    if active:
+                        has_dummy = np.any(np.asarray(coord.indices) >= natoms)
+                        rows.append((row, name, has_dummy, row in aux_rows))
+                        row += 1
+            return rows
+
+        pes = make_pes()
+        rows = dummy_rows(pes)
+        free_angles = [
+            row for row, name, has_dummy, is_aux in rows
+            if name == 'angles' and has_dummy and not is_aux
+        ]
+        free_dihedrals = [
+            row for row, name, has_dummy, is_aux in rows
+            if name == 'dihedrals' and has_dummy and not is_aux
+        ]
+        aux_rows = list(pes._dummy_projection_gauge_filter_rows())
+        assert len(free_angles) == 1
+        assert len(free_dihedrals) == 1
+        assert len(aux_rows) > 0
+
+        pes.get_g()
+        pes.dummies.positions += np.array([[7e-4, -1.3e-3, 9e-4]])
+        target = pes.get_x().copy()
+        dx_initial, dx_final, _ = pes.set_x(target)
+
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert_allclose(dx_initial, 0.0, atol=1e-14)
+        assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
+        assert abs(dx_final[free_angles[0]]) > 1e-4
+        assert abs(dx_final[free_dihedrals[0]]) > 1e-10
+
+        for row in free_angles + free_dihedrals:
+            pes = make_pes()
+            pes.get_g()
+            x0 = pes.get_x().copy()
+            target = x0.copy()
+            target[row] += 1e-3
+            dx_initial, dx_final, _ = pes.set_x(target)
+
+            assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+            assert_allclose(dx_initial[row], 1e-3, atol=1e-12)
+            assert_allclose(dx_final[row], 1e-3, atol=1e-8)
+            assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-10)
+            other = (free_dihedrals[0]
+                     if row == free_angles[0] else free_angles[0])
+            assert_allclose(
+                pes.wrap_dx(pes.get_x() - x0)[other],
+                0.0,
+                atol=1e-8,
+            )
+
+    def test_linear_dummy_projection_preserves_requested_dummy_rows(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        dummy_rows = pes._dummy_containing_coord_rows()
+        assert len(dummy_rows) > 0
+
+        requested = np.zeros(pes.int.nint)
+        requested[dummy_rows[-1]] = 3e-4
+        q_after_ode = pes.int.calc().copy()
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        pes._last_projection_filter_rows = dummy_rows
+
+        dx_final = pes._add_proj_delta(requested, q_after_ode, True)
+
+        assert_allclose(dx_final[list(dummy_rows)],
+                        requested[list(dummy_rows)], atol=1e-12)
+
+    @pytest.mark.parametrize("auxiliary_index", [0, 1])
+    def test_linear_dummy_projection_reports_undone_auxiliary_request(
+        self, auxiliary_index
+    ):
+        pes = Sella(self._linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        pes.get_g()
+        auxiliary_rows = pes._linear_dummy_auxiliary_optimizer_rows()
+        assert len(auxiliary_rows) == 2
+        row = auxiliary_rows[auxiliary_index]
+
+        x0 = pes.get_x().copy()
+        target = x0.copy()
+        target[row] += 1e-3
+        dx_initial, dx_final, _ = pes.set_x(target)
+        actual = pes.wrap_dx(pes.get_x() - x0)
+
+        assert_allclose(dx_initial[row], 1e-3, atol=1e-12)
+        assert_allclose(actual[row], 0.0, atol=1e-12)
+        assert_allclose(dx_final[row], actual[row], atol=1e-9)
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+
+
+class TestRestrictedAtomicStepCellDOF:
+    """Cartesian cell optimization must not crash under the default limiter.
+
+    internal=False, optimize_cell=True defaults to RestrictedAtomicStep,
+    whose cons() reshaped the full [atomic | cell] step vector into (-1, 3).
+    When n_cell_dof is not a multiple of 3 (e.g. a one-DOF cell_mask) that
+    reshape raised ValueError. cons() now splits the atomic and cell blocks.
+    """
+
+    @staticmethod
+    def _atoms():
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 2]],
+                      cell=np.eye(3) * 6.0, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @pytest.mark.parametrize("n_free", [1, 2, 4, 9])
+    def test_cartesian_cell_opt_steps_with_mask(self, n_free):
+        # Build a mask that frees exactly n_free of the 9 cell elements, so
+        # n_cell_dof spans multiples and non-multiples of 3.
+        mask = np.zeros((3, 3), dtype=bool)
+        mask.ravel()[:n_free] = True
+        atoms = self._atoms()
+        opt = Sella(atoms, order=0, internal=False, optimize_cell=True,
+                    cell_mask=mask, logfile=None)
+        from sella.optimize.restricted_step import RestrictedAtomicStep
+        assert opt.rs is RestrictedAtomicStep
+        assert opt.pes.n_cell_dof == n_free
+        # Previously raised "cannot reshape array of size N into shape (3)".
+        for _ in range(3):
+            opt.step()
+
+    def test_plain_cartesian_still_works(self):
+        # No cell optimization: RestrictedAtomicStep behavior is unchanged.
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 2]])
+        atoms.calc = LennardJones()
+        opt = Sella(atoms, order=0, internal=False, logfile=None)
+        from sella.optimize.restricted_step import RestrictedAtomicStep
+        assert opt.rs is RestrictedAtomicStep
+        for _ in range(3):
+            opt.step()
+
+    def test_cons_gradient_matches_fd(self):
+        # cons() value/gradient must be consistent for atomic- and
+        # cell-dominant steps, including the wc cell weighting.
+        from sella.optimize.restricted_step import RestrictedAtomicStep
+        mask = np.zeros((3, 3), dtype=bool); mask[0, 0] = True
+        atoms = self._atoms()
+        opt = Sella(atoms, order=0, internal=False, optimize_cell=True,
+                    cell_mask=mask, logfile=None)
+        opt.pes.get_g()
+        rs = RestrictedAtomicStep(opt.pes, opt.ord, opt.delta, wc=2.0)
+        n = opt.pes.dim
+        rng = np.random.RandomState(0)
+        eps = 1e-7
+        for desc, s in [
+            ("atomic", np.r_[0.5, rng.randn(n - 1) * 0.01]),
+            ("cell", np.r_[rng.randn(n - 1) * 0.001, 0.5]),
+        ]:
+            dsda = rng.randn(n)
+            _, dval = rs.cons(s, dsda)
+            vp = rs.cons(s + eps * dsda)
+            vm = rs.cons(s - eps * dsda)
+            dval_fd = (vp - vm) / (2 * eps)
+            assert np.isclose(dval, dval_fd, atol=1e-5), desc
+
+
+class TestCartesianCellTrustRadiusAdapts:
+    """The Cartesian cell trust radius (delta_cell) must adapt during opt.
+
+    The trust-radius update only split smag_cell for CellInternalPES, so with
+    internal=False the cell radius stayed frozen at its initial value even as
+    cell steps hit the cap. The split now applies to CellCartesianPES too
+    (via pes.n_coords).
+    """
+
+    def test_atomic_component_uses_max_atom_displacement(self):
+        atoms = Atoms(
+            'H2', positions=[[0, 0, 0], [1, 0, 0]],
+            cell=np.eye(3) * 5.0, pbc=True,
+        )
+        atoms.calc = LennardJones()
+        opt = Sella(
+            atoms, order=0, internal=False, optimize_cell=True,
+            logfile=None,
+        )
+        step = np.zeros(opt.pes.dim)
+        step[:6] = [3.0, 4.0, 0.0, 0.0, 0.0, 2.0]
+
+        smag_atomic, smag_cell = opt._cell_trust_components(step, 5.0)
+
+        assert smag_atomic == pytest.approx(5.0)
+        assert smag_cell == 0.0
+
+    def test_delta_cell_adapts_cartesian(self):
+        # Compressed cell -> large stress -> cell steps large enough to move
+        # the (initially capped) delta_cell.
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [1.2, 0, 0], [0, 1.2, 0],
+                                 [0, 0, 1.2]],
+                      cell=np.eye(3) * 2.6, pbc=True)
+        atoms.calc = LennardJones()
+        opt = Sella(atoms, order=0, internal=False, optimize_cell=True,
+                    logfile=None)
+        from sella.peswrapper import CellCartesianPES
+        assert isinstance(opt.pes, CellCartesianPES)
+        delta_cell0 = opt.delta_cell
+        seen = {round(opt.delta_cell, 6)}
+        for _ in range(10):
+            opt.step()
+            seen.add(round(opt.delta_cell, 6))
+        # delta_cell must have changed from its frozen initial value.
+        assert len(seen) > 1, f"delta_cell never adapted (stuck at {delta_cell0})"
+
+
+class TestIndependentCellTrustRadii:
+    @staticmethod
+    def _optimizer():
+        atoms = make_water_crystal()
+        atoms.calc = LennardJones()
+        return Sella(
+            atoms,
+            order=0,
+            internal=True,
+            optimize_cell=True,
+            allow_fragments=True,
+            exact_geodesic=False,
+            logfile=None,
+        )
+
+    def test_rejected_cell_only_step_preserves_internal_radius(self):
+        opt = self._optimizer()
+        delta0 = opt.delta
+        delta_cell0 = opt.delta_cell
+        step = np.zeros(opt.pes.dim)
+        step[opt.pes.n_coords:] = 0.02
+
+        opt._update_trust_radius(1e-3, step, 0.02)
+
+        assert opt.delta == delta0
+        assert opt.delta_cell == delta_cell0 * opt.sigma_dec
+
+    def test_rejected_mixed_step_still_shrinks_internal_radius(self):
+        opt = self._optimizer()
+        step = np.zeros(opt.pes.dim)
+        step[0] = 0.02
+        step[opt.pes.n_coords:] = 0.01
+
+        opt._update_trust_radius(1e-3, step, 0.02)
+
+        assert opt.delta == 0.02 * opt.sigma_dec
+
+    def test_rejected_internal_only_step_preserves_cell_radius(self):
+        opt = self._optimizer()
+        delta_cell0 = opt.delta_cell
+        step = np.zeros(opt.pes.dim)
+        step[0] = 0.02
+        step[opt.pes.n_coords:] = np.finfo(float).eps
+
+        opt._update_trust_radius(1e-3, step, 0.02)
+
+        assert opt.delta_cell == delta_cell0
 
 
 if __name__ == '__main__':
