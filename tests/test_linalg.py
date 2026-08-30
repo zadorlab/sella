@@ -56,3 +56,25 @@ def test_NumericalHessian(dim, subdim, order, threepoint, eta=1e-6, atol=1e-4):
     M1[:, 1] -= g1proj * (M1[:, 1] @ g1proj) / (g1proj @ g1proj)
 
     np.testing.assert_allclose(H2.T.dot(M1), H3.T @ M1, **tol)
+
+
+@pytest.mark.parametrize('threepoint, expected', [(False, [1]),
+                                                   (True, [1, 2])])
+def test_numerical_hessian_reports_force_evaluations(threepoint, expected):
+    evaluations = []
+
+    def quadratic(x):
+        return 0.5 * x @ x, x
+
+    H = NumericalHessian(
+        quadratic,
+        x0=np.ones(3),
+        g0=np.ones(3),
+        eta=1e-4,
+        threepoint=threepoint,
+        evaluation_callback=evaluations.append,
+    )
+    H.dot(np.array([1.0, 0.0, 0.0]))
+
+    assert evaluations == expected
+    assert H.evaluations == len(expected)

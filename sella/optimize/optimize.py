@@ -69,6 +69,7 @@ class Sella(Optimizer):
         rs: str = None,
         nsteps_per_diag: int = 3,
         diag_every_n: Optional[int] = None,
+        hessian_progress: bool = False,
         hessian_function: Optional[Callable[[Atoms], np.ndarray]] = None,
         optimize_cell: bool = False,
         cell_mask: np.ndarray = None,
@@ -147,6 +148,10 @@ class Sella(Optimizer):
             object, call ``sella.configure_compute(max_cpu_threads=...)``
             directly. GPU sharing is not handled here (CUDA exposes no runtime
             GPU-thread cap); use CUDA MPS or the launcher.
+        hessian_progress : bool, optional
+            If True, write timestamped progress messages for numerical Hessian
+            force evaluations to ``logfile``. Default is False, which leaves
+            the standard optimization table unchanged.
         """
         # Cap CPU threads first, before any heavy BLAS work (Hessian
         # refinement, internal-coordinate setup) runs in initialize_pes.
@@ -239,7 +244,12 @@ class Sella(Optimizer):
         self.eta = eta
         self.delta_min = self.eta
         self.constraints_tol = constraints_tol
-        self.diagkwargs = dict(gamma=gamma, threepoint=threepoint)
+        self.diagkwargs = dict(
+            gamma=gamma,
+            threepoint=threepoint,
+            progress=(self._log_hessian_progress
+                      if hessian_progress else None),
+        )
         self.rho = 1.
 
         if self.ord != 0 and not self.eig:
@@ -258,6 +268,35 @@ class Sella(Optimizer):
         self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
         self._last_step_basis = None
         self._last_step_eigenvalues = None
+
+    def _log_hessian_progress(self, event, evaluations):
+        if self.logfile is None:
+            return
+        prefix = f'# Sella {strftime("%H:%M:%S", localtime())}:'
+        evaluation_word = (
+            'evaluation' if evaluations == 1 else 'evaluations'
+        )
+        if event == 'start':
+            message = f'{prefix} starting Hessian diagonalization'
+        elif event == 'evaluation':
+            message = (
+                f'{prefix} Hessian force evaluation '
+                f'{evaluations} completed'
+            )
+        elif event == 'done':
+            message = (
+                f'{prefix} Hessian diagonalization completed after '
+                f'{evaluations} force {evaluation_word}'
+            )
+        elif event == 'failed':
+            message = (
+                f'{prefix} Hessian diagonalization failed after '
+                f'{evaluations} force {evaluation_word}'
+            )
+        else:  # pragma: no cover
+            raise ValueError(f'Unknown Hessian progress event: {event}')
+        self.logfile.write(message + '\n')
+        flush_logfile(self.logfile)
 
     def initialize_pes(
         self,
