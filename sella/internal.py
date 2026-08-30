@@ -1,11 +1,8 @@
 from typing import (
-    Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type
+    Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type,
+    NamedTuple,
 )
-from itertools import (
-    product,
-    combinations,
-    combinations_with_replacement as cwr
-)
+from itertools import product, combinations, permutations
 from functools import partialmethod
 import warnings
 
@@ -45,6 +42,30 @@ class LightAtoms:
     def __init__(self, positions: np.ndarray, cell: np.ndarray) -> None:
         self.positions = positions
         self.cell = cell
+
+
+class _DisjointSet:
+    __slots__ = ('parent', 'n_active')
+
+    def __init__(self, size: int, n_active: int = None) -> None:
+        self.parent = list(range(size))
+        self.n_active = size if n_active is None else n_active
+
+    def find(self, item: int) -> int:
+        parent = self.parent
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(self, a: int, b: int) -> bool:
+        root_a = self.find(a)
+        root_b = self.find(b)
+        if root_a == root_b:
+            return False
+        self.parent[root_a] = root_b
+        self.n_active -= 1
+        return True
 
 
 # =============================================================================
@@ -194,6 +215,71 @@ _dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0
 # =============================================================================
 BLOCK_SIZE = 64
 
+# Maximum working set for one periodic pair-image distance chunk. The full
+# all-pairs table scales as n_pairs * n_images * 3 and can collide with MLIP
+# memory on smaller GPUs; chunking bounds that temporary without changing the
+# selected bonds.
+PERIODIC_PAIR_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+class _BatchedCoordFamily(NamedTuple):
+    key: str
+    n_atoms: int
+    n_tvecs: int
+    width: int
+    value_fn: Callable
+    grad_fn: Callable
+    hess_fn: Callable
+    hvp_fn: Callable
+    cell_grad_fn: Callable
+
+
+class _BatchedCoordArrays(NamedTuple):
+    indices: np.ndarray
+    ncvecs: np.ndarray
+    indices_padded: np.ndarray
+    ncvecs_padded: np.ndarray
+    n_actual: int
+    flat_cols: np.ndarray
+    csr_offset: int = 0
+
+
+_BATCHED_COORD_FAMILIES: Tuple[_BatchedCoordFamily, ...] = (
+    _BatchedCoordFamily(
+        key='bonds',
+        n_atoms=2,
+        n_tvecs=1,
+        width=6,
+        value_fn=_bond_value_batched,
+        grad_fn=_bond_grad_batched,
+        hess_fn=_bond_hess_batched,
+        hvp_fn=_bond_hvp_batched,
+        cell_grad_fn=_bond_cell_grad_batched,
+    ),
+    _BatchedCoordFamily(
+        key='angles',
+        n_atoms=3,
+        n_tvecs=2,
+        width=9,
+        value_fn=_angle_value_batched,
+        grad_fn=_angle_grad_batched,
+        hess_fn=_angle_hess_batched,
+        hvp_fn=_angle_hvp_batched,
+        cell_grad_fn=_angle_cell_grad_batched,
+    ),
+    _BatchedCoordFamily(
+        key='dihedrals',
+        n_atoms=4,
+        n_tvecs=3,
+        width=12,
+        value_fn=_dihedral_value_batched,
+        grad_fn=_dihedral_grad_batched,
+        hess_fn=_dihedral_hess_batched,
+        hvp_fn=_dihedral_hvp_batched,
+        cell_grad_fn=_dihedral_cell_grad_batched,
+    ),
+)
+
 
 IVec = Tuple[int, int, int]
 
@@ -259,6 +345,18 @@ class Coordinate:
         str_out = ', '.join(out)
         return f'{self.__class__.__name__}({str_out})'
 
+    def copy(self) -> 'Coordinate':
+        new = self.__class__.__new__(self.__class__)
+        new.indices = self.indices.copy()
+        new.kwargs = {
+            key: val.copy() if hasattr(val, 'copy') else val
+            for key, val in self.kwargs.items()
+        }
+        if hasattr(self, 'q_prev'):
+            q_prev = self.q_prev
+            new.q_prev = None if q_prev is None else q_prev.copy()
+        return new
+
     @staticmethod
     def _eval0(pos: jnp.ndarray, **kwargs) -> float:
         raise NotImplementedError
@@ -289,6 +387,12 @@ class Coordinate:
     def _check_derivative(
         self, atoms: Atoms, delta: float, atol: float, order: int
     ) -> bool:
+        """Compare an analytic derivative against central finite differences.
+
+        ``order=1`` checks the gradient against differences of the value;
+        ``order=2`` checks the Hessian against differences of the gradient.
+        Warns and returns False if the max abs mismatch exceeds ``atol``.
+        """
         if order == 1:
             derivative = 'Gradient'
             f0 = self.calc
@@ -320,11 +424,13 @@ class Coordinate:
     def check_gradient(
         self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
+        """Finite-difference check of this coordinate's analytic gradient."""
         return self._check_derivative(atoms, delta, atol, order=1)
 
     def check_hessian(
         self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
+        """Finite-difference check of this coordinate's analytic Hessian."""
         return self._check_derivative(atoms, delta, atol, order=2)
 
 
@@ -357,14 +463,23 @@ class Internal(Coordinate):
         return self.__class__(self.indices[::-1], -self.kwargs['ncvecs'][::-1])
 
     def __eq__(self, other: object) -> bool:
-        if not Coordinate.__eq__(self, other):
-            return False
-        srev = self.reverse()
-        if not Coordinate.__eq__(srev, other):
-            return False
-        if np.all(self.kwargs['ncvecs'] == other.kwargs['ncvecs']):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        # Coordinates are direction-agnostic: equal when indices+ncvecs match
+        # in the given order, OR when the reversed coordinate matches. Each
+        # branch must pair an index match with the corresponding ncvecs match
+        # (a forward index match with forward ncvecs, reverse with reverse) --
+        # mixing them across branches lets distinct coordinates compare equal.
+        if (
+            Coordinate.__eq__(self, other)
+            and np.all(self.kwargs['ncvecs'] == other.kwargs['ncvecs'])
+        ):
             return True
-        if np.all(srev.kwargs['ncvecs'] == other.kwargs['ncvecs']):
+        srev = self.reverse()
+        if (
+            Coordinate.__eq__(srev, other)
+            and np.all(srev.kwargs['ncvecs'] == other.kwargs['ncvecs'])
+        ):
             return True
         return False
 
@@ -504,6 +619,21 @@ class Translation(Coordinate):
 # possibility of there being other degenerate eigenvalues).
 
 
+# Numerical tolerances for the quaternion / F-matrix rotation coordinates.
+# Eigenvalue-gap floor: when an F-matrix eigenvalue is within this of the top
+# eigenvalue (a degenerate top eigenspace, e.g. 2-atom / linear fragments), the
+# gap is treated as zero so the 1/gap term in the eigenvector-derivative
+# pseudoinverse is dropped rather than blowing up.
+_ROT_EIG_GAP_TOL = 1e-10
+# Cartesian displacement used only for finite-difference second derivatives
+# in a genuinely degenerate quaternion eigenspace (normally a diatomic).
+_ROT_DEGENERATE_FD_STEP = 2e-6
+# |q0 - 1| below which the rotation is treated as ~identity: asinc =
+# arccos(x)/sqrt(1-x^2) and its derivatives switch to their Taylor expansion
+# instead of the (removable) singularity at x = 1.
+_ROT_NEAR_IDENTITY_TOL = 1e-8
+
+
 def _rotation_hessian_np(pos, axis, refpos, q_stable=None):
     """Closed-form Hessian of the rotation coordinate w.r.t. positions.
 
@@ -549,6 +679,27 @@ def _build_F_matrix_np(dx, refpos):
     return F
 
 
+def _build_F_matrices_np(pos_group, ref_group):
+    """Build batched 4x4 quaternion F-matrices for same-sized fragments."""
+    dx = pos_group - pos_group.mean(axis=1, keepdims=True)
+    R = np.matmul(dx.swapaxes(1, 2), ref_group)
+    Rtr = np.trace(R, axis1=1, axis2=2)
+    Ftop = np.stack([
+        R[:, 1, 2] - R[:, 2, 1],
+        R[:, 2, 0] - R[:, 0, 2],
+        R[:, 0, 1] - R[:, 1, 0],
+    ], axis=1)
+    n_batch = len(pos_group)
+    F = np.zeros((n_batch, 4, 4))
+    F[:, 0, 0] = Rtr
+    F[:, 0, 1:] = Ftop
+    F[:, 1:, 0] = Ftop
+    for axis in range(3):
+        F[:, 1 + axis, 1 + axis] = -Rtr
+    F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
+    return F
+
+
 def _stabilize_quaternion(F, q_prev):
     """Compute branch-stable quaternion from F-matrix eigendecomposition.
 
@@ -567,7 +718,7 @@ def _stabilize_quaternion_from_eigh(ws, vecs, q_prev):
     """Compute branch-stable quaternion from pre-computed eigendecomposition."""
     if q_prev is None:
         q_prev = np.array([1.0, 0.0, 0.0, 0.0])
-    top_mask = (ws[-1] - ws) < 1e-10
+    top_mask = (ws[-1] - ws) < _ROT_EIG_GAP_TOL
     top_vecs = vecs[:, top_mask]
     coeffs = top_vecs.T @ q_prev
     q = top_vecs @ coeffs
@@ -598,7 +749,7 @@ def _expmap_np(q):
     return 2.0 * q[1:4] * a
 
 
-def _rotation_3axis_jacobian_np(pos, refpos, q):
+def _rotation_3axis_jacobian_np(pos, refpos, q, ws=None, vecs=None):
     """Jacobian of all 3 rotation values w.r.t. positions, using quaternion q.
 
     Parameters
@@ -606,20 +757,22 @@ def _rotation_3axis_jacobian_np(pos, refpos, q):
     pos    : (N, 3)
     refpos : (N, 3), already centered
     q      : (4,), stabilized quaternion
+    ws/vecs: optional eigendecomposition of the current F matrix
 
     Returns
     -------
     jac : (3, N, 3) — Jacobian[axis, atom, xyz]
     """
     N = len(pos)
-    dx = pos - pos.mean(0)
-    F = _build_F_matrix_np(dx, refpos)
-    ws, vecs = np.linalg.eigh(F)
+    if ws is None or vecs is None:
+        dx = pos - pos.mean(0)
+        F = _build_F_matrix_np(dx, refpos)
+        ws, vecs = np.linalg.eigh(F)
 
     c = q
     gaps = ws - ws[-1]
-    safe_inv = np.where(np.abs(gaps) > 1e-14,
-                        1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
+    safe_inv = np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL,
+                        1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0),
                         0.0)
 
     Prefpos = refpos  # refpos is already centered at construction
@@ -629,7 +782,7 @@ def _rotation_3axis_jacobian_np(pos, refpos, q):
 
     q0 = c[0]
     asinc_val = _asinc_np(q0)
-    if abs(q0 - 1.0) < 1e-8:
+    if abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL:
         y = q0 - 1.0
         dasinc = -1.0 / 3 + 4 * y / 15
     elif abs(q0) < 1.0 - 1e-12:
@@ -684,13 +837,13 @@ def _apply_dF(Prefpos, vec, N):
         # dFtop[d] = 0 (already)
 
         # result[:, :, d, 0] = dRtr * v0 + dFtop @ v3
-        result[:, :, d, 0] = dRtr * v0 + np.einsum('bni,bi->bn', dFtop, v3)
+        result[:, :, d, 0] = (
+            dRtr * v0[:, None]
+            + np.einsum('bni,bi->bn', dFtop, v3)
+        )
 
         # result[:, :, d, 1:] = dFtop * v0 + (-dRtr*I + dR + dR.T) @ v3
         for i_ax in range(3):
-            val = -dRtr * v3[:, i_ax, None]  # (B, N) — broadcast
-            val = val.squeeze(-1) if val.ndim > 2 else val
-            # Correction: val shape should be (B, N)
             val = -dRtr * v3[:, i_ax:i_ax+1]  # (B, 1) broadcast with (B, N) -> (B, N)
             if i_ax == d:
                 val = val + Pv3  # (B, N)
@@ -702,8 +855,178 @@ def _apply_dF(Prefpos, vec, N):
     return result
 
 
+def _rotation_expmap_jacobian_from_dq(q, dq):
+    """Map quaternion derivatives to three rotation-vector derivatives."""
+    q0 = q[:, 0]
+    asinc_val = np.empty_like(q0)
+    regular = q0 < 0.97
+    if np.any(regular):
+        q0r = q0[regular]
+        asinc_val[regular] = (
+            np.arccos(q0r) / np.sqrt(np.maximum(1.0 - q0r**2, 1e-30))
+        )
+    if np.any(~regular):
+        y = q0[~regular] - 1.0
+        asinc_val[~regular] = (
+            1.0 - y / 3 + 2 * y**2 / 15 - 2 * y**3 / 35
+            + 8 * y**4 / 315 - 8 * y**5 / 693
+            + 16 * y**6 / 3003 - 16 * y**7 / 6435
+            + 128 * y**8 / 109395 - 128 * y**9 / 230945
+        )
 
-def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
+    dasinc = np.zeros_like(q0)
+    near_identity = np.abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL
+    ynear = q0[near_identity] - 1.0
+    dasinc[near_identity] = -1.0 / 3 + 4 * ynear / 15
+    regular_deriv = (~near_identity) & (np.abs(q0) < 1.0 - 1e-12)
+    if np.any(regular_deriv):
+        q0r = q0[regular_deriv]
+        s2 = 1.0 - q0r**2
+        s = np.sqrt(s2)
+        ac = np.arccos(q0r)
+        dasinc[regular_deriv] = -1.0 / s2 + q0r * ac / (s * s2)
+
+    jac = np.empty((len(q), 3, dq.shape[1]))
+    for axis in range(3):
+        jac[:, axis] = 2 * (
+            dq[:, :, axis + 1] * asinc_val[:, None]
+            + q[:, axis + 1, None] * dasinc[:, None] * dq[:, :, 0]
+        )
+    return jac
+
+
+def _rotation_jacobian_fixed_gauge_batched(
+    pos, refpos, q_reference, top_count,
+):
+    """Jacobian of the fixed-gauge top-eigenspace projection.
+
+    The usual simple-eigenvector derivative is insufficient in a degenerate
+    top eigenspace: away from the base point, the fixed reference quaternion
+    need not lie in the new eigenspace. Differentiating the spectral projector
+    first keeps the value, Jacobian, and Hessian on one local gauge chart.
+    """
+    pos = np.asarray(pos, dtype=np.float64)
+    refpos = np.asarray(refpos, dtype=np.float64)
+    q_reference = np.asarray(q_reference, dtype=np.float64)
+    n_batch, n, _ = pos.shape
+    ws, vecs = np.linalg.eigh(_build_F_matrices_np(pos, refpos))
+    top = np.arange(4 - top_count, 4)
+    bottom = np.arange(0, 4 - top_count)
+
+    top_vecs = vecs[:, :, top]
+    projected = np.squeeze(
+        top_vecs @ (top_vecs.swapaxes(1, 2) @ q_reference[:, :, None]), -1
+    )
+    projected_norm = np.linalg.norm(projected, axis=1)
+    q = projected / projected_norm[:, None]
+
+    pref = refpos - refpos.mean(axis=1, keepdims=True)
+    dz = np.zeros((n_batch, 3 * n, 4))
+    for a in top:
+        ua = vecs[:, :, a]
+        dFua = _apply_dF(pref, ua, n).reshape(n_batch, 3 * n, 4)
+        ua_ref = np.sum(ua * q_reference, axis=1)
+        for b in bottom:
+            ub = vecs[:, :, b]
+            coefficient = (
+                np.einsum('bmi,bi->bm', dFua, ub)
+                / (ws[:, a] - ws[:, b])[:, None]
+            )
+            direction = (
+                ub * ua_ref[:, None]
+                + ua * np.sum(ub * q_reference, axis=1)[:, None]
+            )
+            dz += coefficient[:, :, None] * direction[:, None, :]
+
+    dq = dz - np.sum(dz * q[:, None, :], axis=2)[:, :, None] * q[:, None, :]
+    dq /= projected_norm[:, None, None]
+    jac = _rotation_expmap_jacobian_from_dq(q, dq)
+    return jac.reshape(n_batch, 3, n, 3)
+
+
+def _rotation_jacobian_with_fixed_gauge(
+    pos, refpos, q_reference, top_count,
+):
+    return _rotation_jacobian_fixed_gauge_batched(
+        pos[None], refpos[None], q_reference[None], top_count,
+    )[0]
+
+
+def _rotation_hvp_degenerate_fd_batched(
+    pos, refpos, tangent, q_reference, top_count,
+):
+    """Fixed-gauge degenerate HVP, batched over equal-sized fragments."""
+    tangent_norm = np.linalg.norm(tangent.reshape(len(tangent), -1), axis=1)
+    out = np.zeros((len(pos), 3) + pos.shape[1:])
+    moving = tangent_norm > 0
+    if not np.any(moving):
+        return out
+
+    pos_m = pos[moving]
+    ref_m = refpos[moving]
+    tangent_m = tangent[moving]
+    q_m = q_reference[moving]
+    norm_m = tangent_norm[moving]
+    scale = np.maximum(
+        np.sqrt(np.mean(ref_m * ref_m, axis=(1, 2))), 1.0
+    )
+    delta_t = _ROT_DEGENERATE_FD_STEP * scale / norm_m
+    displacement = delta_t[:, None, None] * tangent_m
+    jac_plus = _rotation_jacobian_fixed_gauge_batched(
+        pos_m + displacement, ref_m, q_m, top_count,
+    )
+    jac_minus = _rotation_jacobian_fixed_gauge_batched(
+        pos_m - displacement, ref_m, q_m, top_count,
+    )
+    out[moving] = (
+        (jac_plus - jac_minus) / (2 * delta_t[:, None, None, None])
+    )
+    return out
+
+
+def _rotation_hvp_degenerate_fd(
+    pos, refpos, tangent, q_reference, top_count,
+):
+    return _rotation_hvp_degenerate_fd_batched(
+        pos[None], refpos[None], tangent[None], q_reference[None], top_count,
+    )[0]
+
+
+def _rotation_3axis_hessian_degenerate_fd(
+    pos, refpos, q_reference, top_count,
+):
+    """Symmetric fixed-gauge Hessians for all three rotation components."""
+    n = len(pos)
+    ncart = 3 * n
+    scale = max(np.sqrt(np.mean(refpos * refpos)), 1.0)
+    delta = _ROT_DEGENERATE_FD_STEP * scale
+    pos_batch = np.repeat(pos[None], 2 * ncart, axis=0)
+    flat = pos_batch.reshape(2 * ncart, ncart)
+    columns = np.arange(ncart)
+    flat[columns, columns] += delta
+    flat[ncart + columns, columns] -= delta
+    ref_batch = np.repeat(refpos[None], 2 * ncart, axis=0)
+    q_batch = np.repeat(q_reference[None], 2 * ncart, axis=0)
+    jac = _rotation_jacobian_fixed_gauge_batched(
+        pos_batch, ref_batch, q_batch, top_count,
+    )
+    column_derivatives = (jac[:ncart] - jac[ncart:]) / (2 * delta)
+    hessian = column_derivatives.reshape(ncart, 3, ncart).transpose(1, 2, 0)
+    hessian = 0.5 * (hessian + hessian.swapaxes(1, 2))
+    return hessian.reshape(3, n, 3, n, 3)
+
+
+def _rotation_hessian_degenerate_fd(
+    pos, axis, refpos, q_reference, top_count,
+):
+    return _rotation_3axis_hessian_degenerate_fd(
+        pos, refpos, q_reference, top_count,
+    )[axis]
+
+
+
+def _rotation_hessian_single(pos, axis, refpos, q_stable=None,
+                             ws=None, vecs=None):
     """Closed-form Hessian for a single rotation on a single fragment.
 
     pos    : (N, 3)
@@ -716,20 +1039,25 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
     N = len(pos)
     a = axis + 1
 
-    # F-matrix
-    dx = pos - pos.mean(0)
-    F = _build_F_matrix_np(dx, refpos)
-
-    # Eigendecomposition + safe pseudoinverse
-    ws, vecs = np.linalg.eigh(F)
+    # Eigendecomposition + safe pseudoinverse.  Batched callers already
+    # compute this while stabilizing the quaternion; reuse it when available.
+    if ws is None or vecs is None:
+        dx = pos - pos.mean(0)
+        F = _build_F_matrix_np(dx, refpos)
+        ws, vecs = np.linalg.eigh(F)
     if q_stable is not None:
         c = q_stable
     else:
         c = vecs[:, -1]
         if c[0] < 0:
             c = -c
+    if ws[-1] - ws[-2] <= _ROT_EIG_GAP_TOL:
+        top_count = int(np.sum(ws[-1] - ws <= _ROT_EIG_GAP_TOL))
+        return _rotation_hessian_degenerate_fd(
+            pos, axis, refpos, c, top_count
+        )
     gaps = ws - ws[-1]
-    safe_inv = np.where(np.abs(gaps) > 1e-14, 1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0), 0.0)
+    safe_inv = np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, 1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0), 0.0)
 
     def M_inv_mat(mat):
         return vecs @ (safe_inv[:, None] * (vecs.T @ mat))
@@ -746,7 +1074,7 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
     # asinc derivatives
     q0 = c[0]
     qa = c[a]
-    if abs(q0 - 1.0) < 1e-8:
+    if abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL:
         y = q0 - 1.0
         asinc_val = 1 - y / 3 + 2 * y**2 / 15
         dasinc = -1.0 / 3 + 4 * y / 15
@@ -800,7 +1128,18 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
 
 def _rotation_hvp_closed(pos, axis, refpos, tangent, q_stable=None):
     """HVP for a single rotation using the closed-form Hessian."""
-    hess = _rotation_hessian_single(pos, axis, refpos, q_stable=q_stable)
+    dx = pos - pos.mean(0)
+    ws, vecs = np.linalg.eigh(_build_F_matrix_np(dx, refpos))
+    if q_stable is None:
+        q_stable = _stabilize_quaternion_from_eigh(ws, vecs, None)
+    if ws[-1] - ws[-2] <= _ROT_EIG_GAP_TOL:
+        top_count = int(np.sum(ws[-1] - ws <= _ROT_EIG_GAP_TOL))
+        return _rotation_hvp_degenerate_fd(
+            pos, refpos, tangent, q_stable, top_count
+        )[axis]
+    hess = _rotation_hessian_single(
+        pos, axis, refpos, q_stable=q_stable, ws=ws, vecs=vecs
+    )
     return np.einsum('aibj,bj->ai', hess, tangent)
 
 
@@ -852,6 +1191,134 @@ def _build_dF_vec_batched(Pref, vec, n_batch, nr):
     return result.reshape(n_batch, nr * 3, 4)
 
 
+def _build_dF_vec_batched_many(Pref, vec, n_batch, nr):
+    """Compute dF_{k,d} @ vec for several quaternion-space vectors."""
+    n_vec = vec.shape[1]
+    v0 = vec[:, :, 0]
+    v3 = vec[:, :, 1:]
+    Pv3 = (Pref[:, None, :, 0] * v3[:, :, None, 0]
+           + Pref[:, None, :, 1] * v3[:, :, None, 1]
+           + Pref[:, None, :, 2] * v3[:, :, None, 2])
+
+    result = np.empty((n_batch, n_vec, nr, 3, 4))
+    for d in range(3):
+        d1 = (d + 1) % 3
+        d2 = (d + 2) % 3
+        dRtr = Pref[:, :, d]
+
+        dFtop_d1 = -Pref[:, :, d2]
+        dFtop_d2 = Pref[:, :, d1]
+
+        result[:, :, :, d, 0] = (
+            dRtr[:, None, :] * v0[:, :, None]
+            + dFtop_d1[:, None, :] * v3[:, :, d1, None]
+            + dFtop_d2[:, None, :] * v3[:, :, d2, None]
+        )
+
+        vd = v3[:, :, d]
+        for i_ax in range(3):
+            val = -dRtr[:, None, :] * v3[:, :, i_ax, None]
+            if i_ax == d:
+                val = val + Pv3
+            val = val + Pref[:, None, :, i_ax] * vd[:, :, None]
+            if i_ax == d1:
+                dFtop_iax = dFtop_d1[:, None, :]
+            elif i_ax == d2:
+                dFtop_iax = dFtop_d2[:, None, :]
+            else:
+                dFtop_iax = 0.0
+            result[:, :, :, d, 1 + i_ax] = dFtop_iax * v0[:, :, None] + val
+
+    return result.reshape(n_batch, n_vec, nr * 3, 4)
+
+
+def _rotation_3axis_jacobian_batched_np(pos_pad, ref_pad, mask,
+                                        q_stable_all=None,
+                                        ws_all=None, vecs_all=None):
+    """Batched Jacobian of all 3 rotation values for multiple fragments."""
+    n_frag, n_max, _ = pos_pad.shape
+    n_real = np.sum(mask, axis=1).astype(int)
+    jac = np.zeros((n_frag, 3, n_max, 3))
+
+    size_groups = {}
+    for fi, nr in enumerate(n_real):
+        size_groups.setdefault(int(nr), []).append(fi)
+
+    for nr, frag_indices in size_groups.items():
+        n_batch = len(frag_indices)
+        idx = np.array(frag_indices)
+        pos_group = pos_pad[idx, :nr]
+        ref_group = ref_pad[idx, :nr]
+
+        if ws_all is not None and vecs_all is not None:
+            ws = ws_all[idx]
+            vecs = vecs_all[idx]
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
+        else:
+            ws, vecs = np.linalg.eigh(
+                _build_F_matrices_np(pos_group, ref_group)
+            )
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
+
+        gaps = ws - ws[:, -1:]
+        large_gap = np.abs(gaps) > _ROT_EIG_GAP_TOL
+        safe_inv = np.zeros_like(gaps)
+        safe_inv[large_gap] = 1.0 / gaps[large_gap]
+
+        dFc_flat = _build_dF_vec_batched(ref_group, c, n_batch, nr)
+        proj = np.matmul(dFc_flat, vecs)
+        dc_flat = -np.matmul(proj * safe_inv[:, None, :],
+                             vecs.swapaxes(1, 2))
+
+        q0 = c[:, 0]
+        asinc_val = np.empty_like(q0)
+        regular_asinc = q0 < 0.97
+        s2 = 1.0 - q0 * q0
+        asinc_val[regular_asinc] = (
+            np.arccos(q0[regular_asinc])
+            / np.sqrt(s2[regular_asinc])
+        )
+        y = q0[~regular_asinc] - 1.0
+        asinc_val[~regular_asinc] = (
+            1.0 - y / 3 + 2 * y**2 / 15 - 2 * y**3 / 35
+            + 8 * y**4 / 315 - 8 * y**5 / 693 + 16 * y**6 / 3003
+            - 16 * y**7 / 6435 + 128 * y**8 / 109395
+            - 128 * y**9 / 230945
+        )
+
+        dasinc = np.zeros_like(q0)
+        near_identity = np.abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL
+        ynear = q0[near_identity] - 1.0
+        dasinc[near_identity] = -1.0 / 3 + 4 * ynear / 15
+        regular_deriv = (~near_identity) & (np.abs(q0) < 1.0 - 1e-12)
+        if np.any(regular_deriv):
+            q0r = q0[regular_deriv]
+            s2r = 1.0 - q0r**2
+            sr = np.sqrt(s2r)
+            acr = np.arccos(q0r)
+            dasinc[regular_deriv] = -1.0 / s2r + q0r * acr / (sr * s2r)
+
+        for axis in range(3):
+            a = axis + 1
+            jac_flat = 2 * (
+                dc_flat[:, :, a] * asinc_val[:, None]
+                + c[:, a:a + 1] * dasinc[:, None] * dc_flat[:, :, 0]
+            )
+            jac[idx, axis, :nr, :] = jac_flat.reshape(n_batch, nr, 3)
+
+    return jac
+
+
 def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
                                        q_stable_all=None,
                                        ws_all=None, vecs_all=None):
@@ -898,22 +1365,9 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
                 sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
                 c *= sign[:, None]
         else:
-            dx = pos_group - pos_group.mean(axis=1, keepdims=True)
-            R = np.matmul(dx.swapaxes(1, 2), ref_group)  # (n_batch, 3, 3)
-            Rtr = np.trace(R, axis1=1, axis2=2)
-            Ftop = np.stack([
-                R[:, 1, 2] - R[:, 2, 1],
-                R[:, 2, 0] - R[:, 0, 2],
-                R[:, 0, 1] - R[:, 1, 0],
-            ], axis=1)
-            F = np.zeros((n_batch, 4, 4))
-            F[:, 0, 0] = Rtr
-            F[:, 0, 1:] = Ftop
-            F[:, 1:, 0] = Ftop
-            for i in range(3):
-                F[:, 1+i, 1+i] = -Rtr
-            F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
-            ws, vecs = np.linalg.eigh(F)
+            ws, vecs = np.linalg.eigh(
+                _build_F_matrices_np(pos_group, ref_group)
+            )
             if q_stable_all is not None:
                 c = q_stable_all[idx]
             else:
@@ -921,10 +1375,42 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
                 sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
                 c *= sign[:, None]
 
+        degenerate = ws[:, -1] - ws[:, -2] <= _ROT_EIG_GAP_TOL
+        if np.any(degenerate):
+            top_counts = np.ones(n_batch, dtype=int)
+            top_counts[degenerate] = np.sum(
+                ws[degenerate, -1, None] - ws[degenerate]
+                <= _ROT_EIG_GAP_TOL,
+                axis=1,
+            )
+            for top_count in np.unique(top_counts[degenerate]):
+                local = np.flatnonzero(
+                    degenerate & (top_counts == top_count)
+                )
+                fragment_indices = idx[local]
+                hvp[fragment_indices, :, :nr, :] = (
+                    _rotation_hvp_degenerate_fd_batched(
+                        pos_group[local], ref_group[local], v_group[local],
+                        c[local], int(top_count),
+                    )
+                )
+
+            nondegenerate = np.flatnonzero(~degenerate)
+            if len(nondegenerate) == 0:
+                continue
+            idx = idx[nondegenerate]
+            pos_group = pos_group[nondegenerate]
+            ref_group = ref_group[nondegenerate]
+            v_group = v_group[nondegenerate]
+            ws = ws[nondegenerate]
+            vecs = vecs[nondegenerate]
+            c = c[nondegenerate]
+            n_batch = len(nondegenerate)
+
         gaps = ws - ws[:, -1:]
         safe_inv = np.where(
-            np.abs(gaps) > 1e-14,
-            1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
+            np.abs(gaps) > _ROT_EIG_GAP_TOL,
+            1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0),
             0.0,
         )
 
@@ -951,13 +1437,15 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
         s2 = np.maximum(1 - q0**2, 1e-30)
         s = np.sqrt(s2)
         ac = np.arccos(np.clip(q0, -1+1e-15, 1-1e-15))
-        near_one = np.abs(q0 - 1.0) < 1e-8
+        near_one = np.abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL
         y = q0 - 1.0
         asinc_val = np.where(near_one, 1 - y/3 + 2*y**2/15, ac/s)
         dasinc = np.where(near_one, -1.0/3 + 4*y/15, -1.0/s2 + q0*ac/(s*s2))
         d2asinc = np.where(near_one, 4.0/15,
                            (3*q0/s2 - (1+2*q0**2)*ac/(s*s2)) * (-1.0/s2))
 
+        axis_terms = []
+        w_all = np.empty((n_batch, 3, 4))
         for axis in range(3):
             a = axis + 1
             qa = c[:, a]
@@ -983,10 +1471,16 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
             w_dc = np.squeeze(dc_flat @ w[:, :, None], -1)  # (n_batch, M)
             fdq_c = (df_dq * c).sum(axis=1)  # (n_batch,)
 
-            # dFw: dF @ w for all (k,d)
-            dFw_flat = _build_dF_vec_batched(Pref, w, n_batch, nr)  # (n_batch, M, 4)
-
             w_dc_v = (w_dc * v_flat).sum(axis=1)  # (n_batch,)
+
+            w_all[:, axis] = w
+            axis_terms.append((t1_hvp, wc, w_dc, fdq_c, w_dc_v))
+
+        # dFw: dF @ w for all axes and all (k,d)
+        dFw_all = _build_dF_vec_batched_many(Pref, w_all, n_batch, nr)
+
+        for axis, (t1_hvp, wc, w_dc, fdq_c, w_dc_v) in enumerate(axis_terms):
+            dFw_flat = dFw_all[:, axis]  # (n_batch, M, 4)
 
             # wdFdc @ v = dFw_flat @ dc_v
             wdFdc_v = np.squeeze(dFw_flat @ dc_v[:, :, None], -1)
@@ -1005,26 +1499,6 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
             hvp[idx, axis, :nr, :] = hvp_axis
 
     return hvp
-
-
-def _rotation_3axis_hvp(pos, refpos, mask, v):
-    """HVP for one fragment, all 3 axes at once.
-
-    Returns shape (3, N, 3) — the directional derivative of the
-    Jacobian (3, N, 3) along v (N, 3).
-    """
-    primals = (pos,)
-    tangents = (v,)
-    _, hvp = jvp(
-        lambda p: jacfwd(_rotation_3axis_masked, argnums=0)(p, refpos, mask),
-        primals, tangents
-    )
-    return hvp
-
-
-_rotation_3axis_hvp_batched_jit = jit(
-    vmap(_rotation_3axis_hvp, in_axes=(0, 0, 0, 0))
-)
 
 
 class Rotation(Coordinate):
@@ -1053,28 +1527,35 @@ class Rotation(Coordinate):
             return False
         return True
 
-    def calc(self, atoms: Atoms) -> float:
-        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+    def _stabilized_quaternion(self, pos: np.ndarray) -> np.ndarray:
         dx = pos - pos.mean(0)
         refpos = self.kwargs['refpos']
         F = _build_F_matrix_np(dx, refpos)
         q = _stabilize_quaternion(F, self.q_prev)
         self.q_prev = q
+        return q
+
+    def calc(self, atoms: Atoms) -> float:
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        q = self._stabilized_quaternion(pos)
         axis = self.kwargs['axis']
         return float(2.0 * q[axis + 1] * _asinc_np(q[0]))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
         pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
         refpos = self.kwargs['refpos']
-        jac = _rotation_3axis_jacobian_np(pos, refpos, self.q_prev)
+        q = self._stabilized_quaternion(pos)
+        jac = _rotation_3axis_jacobian_np(pos, refpos, q)
         return jac[self.kwargs['axis']]
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        q = self._stabilized_quaternion(pos)
         return _rotation_hessian_np(
-            atoms.positions[self.indices],
+            pos,
             self.kwargs['axis'],
             self.kwargs['refpos'],
-            q_stable=self.q_prev,
+            q_stable=q,
         )
 
 
@@ -1099,9 +1580,15 @@ class Displacement(Coordinate):
         self.kwargs['W'] = W.copy()
 
     def __eq__(self, other: Coordinate) -> bool:
+        if not isinstance(other, self.__class__):
+            return NotImplemented
         if not Coordinate.__eq__(self, other):
             return False
-        return np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
+        return (
+            np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
+            and np.array_equal(self.kwargs['W'].shape, other.kwargs['W'].shape)
+            and np.allclose(self.kwargs['W'], other.kwargs['W'])
+        )
 
     _eval0 = staticmethod(jit(_displacement))
     _eval1 = staticmethod(jit(_gradient(_displacement)))
@@ -1197,12 +1684,18 @@ def make_internal(
         jac = jit(jac)
         hess = jit(hess)
 
+    def __init__(self, indices):
+        # Coordinate.__init__ resets self.kwargs to {}, so install the fixed
+        # eval kwargs afterwards. Copy per-instance to avoid a shared dict.
+        Coordinate.__init__(self, indices)
+        self.kwargs = dict(kwargs)
+
     return type(name, (Coordinate,), dict(
         nindices=nindices,
-        kwargs=kwargs,
+        __init__=__init__,
         _eval0=staticmethod(fun),
         _eval1=staticmethod(jac),
-        _eval2=staticmethod(hess)
+        _eval2=staticmethod(hess),
     ))
 
 
@@ -1220,8 +1713,9 @@ class BaseInternals:
         self.atoms = atoms
 
         self._lastpos = None
+        self._lastcell = None
+        self._lastactive = None
         self._cache = dict()
-        self._cache_version = 0
 
         if dummies is None:
             if dinds is not None:
@@ -1231,12 +1725,24 @@ class BaseInternals:
         else:
             if dinds is None:
                 raise ValueError('"dummies" provided, but no "dinds"!')
+            dinds = np.asarray(dinds, dtype=np.int32)
             ndum = len(dummies)
             ndind = np.sum(dinds >= 0)
             if ndum != ndind:
                 raise ValueError(
                     '{} dummy atoms were provided, but only {} dummy indices!'
                     .format(ndum, ndind)
+                )
+            dummy_indices = np.sort(dinds[dinds >= 0])
+            expected = np.arange(
+                len(self.atoms),
+                len(self.atoms) + ndum,
+                dtype=np.int32,
+            )
+            if not np.array_equal(dummy_indices, expected):
+                raise ValueError(
+                    'Dummy indices must refer to the appended dummy block '
+                    'natoms:natoms+ndummies.'
                 )
         self.dummies = dummies
         self.dinds = dinds
@@ -1255,10 +1761,20 @@ class BaseInternals:
 
         # Batched arrays for vectorized computation (built lazily)
         self._batched_arrays_valid = False
+        self._batched_family_arrays: Dict[str, _BatchedCoordArrays] = {}
 
         # Lazy caches.
         self._tvecs_cache = None  # set to {'cell_hash': ..., 'tvecs': ...} on first build
         self._hvp_buf = None  # reusable buffer for hessian_rdot output
+
+    @staticmethod
+    def _ignore_duplicate(adder, *args, **kwargs) -> bool:
+        """Call an internal/constraint adder and ignore duplicate coordinates."""
+        try:
+            adder(*args, **kwargs)
+        except DuplicateInternalError:
+            return False
+        return True
 
     @property
     def natoms(self) -> int:
@@ -1307,6 +1823,23 @@ class BaseInternals:
     def _active_indices(self) -> List[int]:
         return [idx for idx, active in enumerate(self._active_mask) if active]
 
+    def _split_active_mask(self, n_trans, n_bonds, n_angles,
+                           n_dihedrals, n_other, n_rot):
+        """Slice ``_active_mask`` into the six per-family sub-masks.
+
+        Families are returned in canonical ``_names`` order (translations,
+        bonds, angles, dihedrals, other, rotations). Callers pass their own
+        per-family counts so the split stays in lockstep with however they
+        enumerated the coordinates.
+        """
+        active_mask = self._active_mask
+        masks = []
+        start = 0
+        for n in (n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot):
+            masks.append(active_mask[start:start + n])
+            start += n
+        return masks
+
     @property
     def nint(self) -> int:
         return len(self._active_indices)
@@ -1347,186 +1880,161 @@ class BaseInternals:
             current_pos = self.atoms.positions
         else:
             current_pos = np.vstack([self.atoms.positions, self.dummies.positions])
+        current_cell = self.atoms.cell.array
+        # Cached calc()/jacobian()/cell_jacobian()/hessian() outputs depend on
+        # the cell (bonds/angles/dihedrals fold in ncvecs @ cell), so a cell
+        # change with fixed positions must invalidate them too.
+        cell_changed = (
+            self._lastcell is None
+            or np.any(current_cell != self._lastcell)
+        )
+        # jacobian_B and hessian_result are cached *after* active-mask
+        # filtering, so toggling an inequality constraint (which flips
+        # self._active) must invalidate them as well.
+        current_active = tuple(self._active_mask)
+        active_changed = current_active != self._lastactive
         if (
             self._lastpos is None
             or np.any(current_pos != self._lastpos)
+            or cell_changed
+            or active_changed
         ):
             self._cache = dict()
             self._lastpos = current_pos.copy()
-            self._cache_version += 1
+            self._lastcell = current_cell.copy()
+            self._lastactive = current_active
         # Park the freshly-merged positions in the cache so the next
         # all_positions access doesn't redo the vstack.
         if self.ndummies > 0:
             self._cache.setdefault('all_positions', self._lastpos)
 
-    def _build_batched_arrays(self) -> None:
-        """Build batched index arrays for vectorized computation.
+    @staticmethod
+    def _pad_to_block(n: int) -> int:
+        """Round up to a BLOCK_SIZE multiple for stable JAX/GPU batch shapes."""
+        return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
-        Arrays are padded to multiples of BLOCK_SIZE for GPU/SIMD efficiency.
-        Masks are stored to filter results back to actual sizes.
+    @staticmethod
+    def _flat_cols(indices: np.ndarray, n_atoms: int, width: int) -> np.ndarray:
+        """Flat Cartesian columns touched by each sparse coordinate Hessian.
+
+        For a bond (a, b), the non-zero columns in the (ndof,) output are
+        [3a, 3a+1, 3a+2, 3b, 3b+1, 3b+2]. Angles and dihedrals follow the same
+        pattern with 9 and 12 columns. These columns depend only on topology and
+        are invalidated with the rest of the batched arrays.
         """
-        if self._batched_arrays_valid:
-            return
-
-        def pad_to_block(n: int) -> int:
-            """Round up to nearest multiple of BLOCK_SIZE."""
-            return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-
-        # Build arrays for bonds
-        bonds = self.internals['bonds']
-        n_bonds = len(bonds)
-        if n_bonds > 0:
-            n_bonds_padded = pad_to_block(n_bonds)
-            # Original (unpadded) arrays for indexing
-            self._bond_indices = np.array([b.indices for b in bonds], dtype=np.int32)
-            self._bond_ncvecs = np.array(
-                [b.kwargs['ncvecs'] for b in bonds], dtype=np.int32
-            )
-            # Padded arrays for batch computation
-            self._bond_indices_padded = np.zeros((n_bonds_padded, 2), dtype=np.int32)
-            self._bond_ncvecs_padded = np.zeros((n_bonds_padded, 1, 3), dtype=np.int32)
-            self._bond_indices_padded[:n_bonds] = self._bond_indices
-            self._bond_ncvecs_padded[:n_bonds] = self._bond_ncvecs
-            self._bond_mask = np.zeros(n_bonds_padded, dtype=np.float64)
-            self._bond_mask[:n_bonds] = 1.0
-            self._n_bonds_actual = n_bonds
-        else:
-            self._bond_indices = np.empty((0, 2), dtype=np.int32)
-            self._bond_ncvecs = np.empty((0, 1, 3), dtype=np.int32)
-            self._bond_indices_padded = np.empty((0, 2), dtype=np.int32)
-            self._bond_ncvecs_padded = np.empty((0, 1, 3), dtype=np.int32)
-            self._bond_mask = np.empty(0, dtype=np.float64)
-            self._n_bonds_actual = 0
-
-        # Build arrays for angles
-        angles = self.internals['angles']
-        n_angles = len(angles)
-        if n_angles > 0:
-            n_angles_padded = pad_to_block(n_angles)
-            self._angle_indices = np.array([a.indices for a in angles], dtype=np.int32)
-            self._angle_ncvecs = np.array(
-                [a.kwargs['ncvecs'] for a in angles], dtype=np.int32
-            )
-            self._angle_indices_padded = np.zeros((n_angles_padded, 3), dtype=np.int32)
-            self._angle_ncvecs_padded = np.zeros((n_angles_padded, 2, 3), dtype=np.int32)
-            self._angle_indices_padded[:n_angles] = self._angle_indices
-            self._angle_ncvecs_padded[:n_angles] = self._angle_ncvecs
-            self._angle_mask = np.zeros(n_angles_padded, dtype=np.float64)
-            self._angle_mask[:n_angles] = 1.0
-            self._n_angles_actual = n_angles
-        else:
-            self._angle_indices = np.empty((0, 3), dtype=np.int32)
-            self._angle_ncvecs = np.empty((0, 2, 3), dtype=np.int32)
-            self._angle_indices_padded = np.empty((0, 3), dtype=np.int32)
-            self._angle_ncvecs_padded = np.empty((0, 2, 3), dtype=np.int32)
-            self._angle_mask = np.empty(0, dtype=np.float64)
-            self._n_angles_actual = 0
-
-        # Build arrays for dihedrals
-        dihedrals = self.internals['dihedrals']
-        n_dihedrals = len(dihedrals)
-        if n_dihedrals > 0:
-            n_dihedrals_padded = pad_to_block(n_dihedrals)
-            self._dihedral_indices = np.array(
-                [d.indices for d in dihedrals], dtype=np.int32
-            )
-            self._dihedral_ncvecs = np.array(
-                [d.kwargs['ncvecs'] for d in dihedrals], dtype=np.int32
-            )
-            self._dihedral_indices_padded = np.zeros((n_dihedrals_padded, 4), dtype=np.int32)
-            self._dihedral_ncvecs_padded = np.zeros((n_dihedrals_padded, 3, 3), dtype=np.int32)
-            self._dihedral_indices_padded[:n_dihedrals] = self._dihedral_indices
-            self._dihedral_ncvecs_padded[:n_dihedrals] = self._dihedral_ncvecs
-            self._dihedral_mask = np.zeros(n_dihedrals_padded, dtype=np.float64)
-            self._dihedral_mask[:n_dihedrals] = 1.0
-            self._n_dihedrals_actual = n_dihedrals
-        else:
-            self._dihedral_indices = np.empty((0, 4), dtype=np.int32)
-            self._dihedral_ncvecs = np.empty((0, 3, 3), dtype=np.int32)
-            self._dihedral_indices_padded = np.empty((0, 4), dtype=np.int32)
-            self._dihedral_ncvecs_padded = np.empty((0, 3, 3), dtype=np.int32)
-            self._dihedral_mask = np.empty(0, dtype=np.float64)
-            self._n_dihedrals_actual = 0
-
-        # Precompute flat column indices for direct scatter in hessian_rdot.
-        # For bond (a,b), the non-zero columns in the (ndof,) output are
-        # [3a, 3a+1, 3a+2, 3b, 3b+1, 3b+2].  Analogous for angles (9 cols)
-        # and dihedrals (12 cols).  These are topology-dependent and
-        # invalidated together with the rest of the batched arrays.
+        if len(indices) == 0:
+            return np.empty((0, width), dtype=np.intp)
         offsets = np.arange(3)
-        if self._n_bonds_actual > 0:
-            bi = self._bond_indices  # (n_bonds, 2)
-            self._bond_flat_cols = np.concatenate([
-                bi[:, k:k+1] * 3 + offsets for k in range(2)
-            ], axis=1)  # (n_bonds, 6)
-        else:
-            self._bond_flat_cols = np.empty((0, 6), dtype=np.intp)
+        return np.concatenate(
+            [indices[:, k:k + 1] * 3 + offsets for k in range(n_atoms)],
+            axis=1,
+        )
 
-        if self._n_angles_actual > 0:
-            ai = self._angle_indices  # (n_angles, 3)
-            self._angle_flat_cols = np.concatenate([
-                ai[:, k:k+1] * 3 + offsets for k in range(3)
-            ], axis=1)  # (n_angles, 9)
-        else:
-            self._angle_flat_cols = np.empty((0, 9), dtype=np.intp)
+    def _build_batched_family_arrays(
+        self, spec: _BatchedCoordFamily
+    ) -> _BatchedCoordArrays:
+        """Build padded and unpadded arrays for one vectorized coordinate family.
 
-        if self._n_dihedrals_actual > 0:
-            di = self._dihedral_indices  # (n_dihedrals, 4)
-            self._dihedral_flat_cols = np.concatenate([
-                di[:, k:k+1] * 3 + offsets for k in range(4)
-            ], axis=1)  # (n_dihedrals, 12)
-        else:
-            self._dihedral_flat_cols = np.empty((0, 12), dtype=np.intp)
+        Unpadded arrays are used for result indexing and sparse scatter. Padded
+        arrays are used for JAX batch calls so bonds, angles, and dihedrals keep
+        consistent shapes and avoid recompilation. Padding masks are not stored
+        because valid rows are always the leading ``n_actual`` prefix.
+        """
+        coords = self.internals[spec.key]
+        n_coords = len(coords)
+        n_atoms = spec.n_atoms
+        n_tvecs = spec.n_tvecs
 
-        # Build CSR structure for sparse hessian_rdot output.
-        # Bonds/angles/dihedrals have fixed nnz per row (6/9/12).
-        # Translations have zero rows. Rotations/other are dense (ndof cols).
+        if n_coords > 0:
+            n_padded = self._pad_to_block(n_coords)
+            indices = np.array([c.indices for c in coords], dtype=np.int32)
+            ncvecs = np.array(
+                [c.kwargs['ncvecs'] for c in coords], dtype=np.int32
+            )
+            indices_padded = np.zeros((n_padded, n_atoms), dtype=np.int32)
+            ncvecs_padded = np.zeros((n_padded, n_tvecs, 3), dtype=np.int32)
+            indices_padded[:n_coords] = indices
+            ncvecs_padded[:n_coords] = ncvecs
+        else:
+            indices = np.empty((0, n_atoms), dtype=np.int32)
+            ncvecs = np.empty((0, n_tvecs, 3), dtype=np.int32)
+            indices_padded = indices.copy()
+            ncvecs_padded = ncvecs.copy()
+
+        return _BatchedCoordArrays(
+            indices=indices,
+            ncvecs=ncvecs,
+            indices_padded=indices_padded,
+            ncvecs_padded=ncvecs_padded,
+            n_actual=n_coords,
+            flat_cols=self._flat_cols(indices, n_atoms, spec.width),
+        )
+
+    def _build_hvp_csr_structure(self) -> None:
+        """Build the fixed CSR layout for sparse ``hessian_rdot`` output.
+
+        Bonds, angles, and dihedrals have fixed nnz per row (6/9/12).
+        Translations have zero rows. Rotations and ``other`` coordinates are
+        dense rows over all Cartesian DOF.
+        """
         ndof = self.ndof
         n_trans = len(self.internals['translations'])
         n_other = len(self.internals['other'])
         n_rot = len(self.internals['rotations'])
-        n_active = (n_trans + self._n_bonds_actual + self._n_angles_actual
-                    + self._n_dihedrals_actual + n_other + n_rot)
+        n_active = n_trans + n_other + n_rot
+        families = self._batched_family_arrays
+        for spec in _BATCHED_COORD_FAMILIES:
+            n_active += families[spec.key].n_actual
 
         col_blocks = []
-        nnz_per_row = []
+        nnz_per_row = [0] * n_trans
+        data_offset = 0
+        for spec in _BATCHED_COORD_FAMILIES:
+            family = families[spec.key]
+            n_coords = family.n_actual
+            families[spec.key] = family._replace(csr_offset=data_offset)
+            if n_coords > 0:
+                width = spec.width
+                col_blocks.append(family.flat_cols.ravel())
+                nnz_per_row.extend([width] * n_coords)
+                data_offset += n_coords * width
 
-        # Translations: zero rows
-        for _ in range(n_trans):
-            nnz_per_row.append(0)
-
-        # Bonds: 6 nnz per row
-        if self._n_bonds_actual > 0:
-            col_blocks.append(self._bond_flat_cols.ravel())
-            nnz_per_row.extend([6] * self._n_bonds_actual)
-
-        # Angles: 9 nnz per row
-        if self._n_angles_actual > 0:
-            col_blocks.append(self._angle_flat_cols.ravel())
-            nnz_per_row.extend([9] * self._n_angles_actual)
-
-        # Dihedrals: 12 nnz per row
-        if self._n_dihedrals_actual > 0:
-            col_blocks.append(self._dihedral_flat_cols.ravel())
-            nnz_per_row.extend([12] * self._n_dihedrals_actual)
-
-        # Other/rotations: dense rows (ndof cols each)
+        self._csr_other_offset = data_offset
         for _ in range(n_other + n_rot):
             col_blocks.append(np.arange(ndof))
             nnz_per_row.append(ndof)
 
         self._csr_indptr = np.zeros(n_active + 1, dtype=np.int32)
         np.cumsum(nnz_per_row, out=self._csr_indptr[1:])
-        self._csr_indices = np.concatenate(col_blocks).astype(np.int32) if col_blocks else np.empty(0, dtype=np.int32)
+        self._csr_indices = (
+            np.concatenate(col_blocks).astype(np.int32)
+            if col_blocks else np.empty(0, dtype=np.int32)
+        )
         self._csr_data = np.zeros(len(self._csr_indices), dtype=np.float64)
         self._csr_n_active = n_active
-        # Precompute data offset for each section
-        self._csr_bond_offset = n_trans * 0  # bonds start after translations (0 nnz)
-        self._csr_angle_offset = self._csr_bond_offset + self._n_bonds_actual * 6
-        self._csr_dih_offset = self._csr_angle_offset + self._n_angles_actual * 9
-        self._csr_other_offset = self._csr_dih_offset + self._n_dihedrals_actual * 12
 
+    def _build_batched_arrays(self) -> None:
+        """Build batched index arrays for vectorized computation.
+
+        Arrays are padded to multiples of BLOCK_SIZE for GPU/SIMD efficiency.
+        """
+        if self._batched_arrays_valid:
+            return
+
+        self._batched_family_arrays = {
+            spec.key: self._build_batched_family_arrays(spec)
+            for spec in _BATCHED_COORD_FAMILIES
+        }
+        self._build_hvp_csr_structure()
         self._batched_arrays_valid = True
+
+    @staticmethod
+    def _tvec_or_empty(indices, ncvecs, cell, n_tvec):
+        """Translation vectors ``ncvecs @ cell``, or a correctly-shaped
+        ``(0, n_tvec, 3)`` empty when there are no coordinates of this type."""
+        if len(indices) > 0:
+            return ncvecs @ cell
+        return np.empty((0, n_tvec, 3), dtype=np.float64)
 
     def _get_cached_tvecs(self, cell: np.ndarray) -> Dict[str, np.ndarray]:
         """Get cached translation vectors for cell, computing if necessary.
@@ -1541,46 +2049,75 @@ class BaseInternals:
             return self._tvecs_cache['tvecs']
 
         self._build_batched_arrays()
+
         tvecs = {}
-
-        # Unpadded tvecs (for result indexing)
-        if len(self._bond_indices) > 0:
-            tvecs['bonds'] = self._bond_ncvecs @ cell
-        else:
-            tvecs['bonds'] = np.empty((0, 1, 3), dtype=np.float64)
-
-        if len(self._angle_indices) > 0:
-            tvecs['angles'] = self._angle_ncvecs @ cell
-        else:
-            tvecs['angles'] = np.empty((0, 2, 3), dtype=np.float64)
-
-        if len(self._dihedral_indices) > 0:
-            tvecs['dihedrals'] = self._dihedral_ncvecs @ cell
-        else:
-            tvecs['dihedrals'] = np.empty((0, 3, 3), dtype=np.float64)
-
-        # Padded tvecs (for GPU-efficient batch computation)
-        if len(self._bond_indices_padded) > 0:
-            tvecs['bonds_padded'] = self._bond_ncvecs_padded @ cell
-        else:
-            tvecs['bonds_padded'] = np.empty((0, 1, 3), dtype=np.float64)
-
-        if len(self._angle_indices_padded) > 0:
-            tvecs['angles_padded'] = self._angle_ncvecs_padded @ cell
-        else:
-            tvecs['angles_padded'] = np.empty((0, 2, 3), dtype=np.float64)
-
-        if len(self._dihedral_indices_padded) > 0:
-            tvecs['dihedrals_padded'] = self._dihedral_ncvecs_padded @ cell
-        else:
-            tvecs['dihedrals_padded'] = np.empty((0, 3, 3), dtype=np.float64)
+        # n_tvec = 1/2/3 for bonds/angles/dihedrals. Unpadded entries are used
+        # for result indexing; padded entries are used for GPU-friendly batch ops.
+        families = self._batched_family_arrays
+        for spec in _BATCHED_COORD_FAMILIES:
+            key = spec.key
+            family = families[key]
+            n_tvecs = spec.n_tvecs
+            tvecs[key] = self._tvec_or_empty(
+                family.indices,
+                family.ncvecs,
+                cell,
+                n_tvecs,
+            )
+            tvecs[f'{key}_padded'] = self._tvec_or_empty(
+                family.indices_padded,
+                family.ncvecs_padded,
+                cell,
+                n_tvecs,
+            )
 
         self._tvecs_cache = {'cell_hash': cell_hash, 'tvecs': tvecs}
         return tvecs
 
+    def _invalidate_structure(self) -> None:
+        """Invalidate all caches that depend on the set of internals.
+
+        Call from every path that adds/removes a coordinate, dummy atom, or
+        ncvec. Unlike ``_cache_check`` (which keys on positions/cell/active
+        mask), a topology change can leave those keys unchanged -- e.g.
+        forbidding one bond and adding another keeps the active mask and
+        positions identical -- so the position-keyed ``_cache`` must be
+        cleared explicitly alongside the batched arrays and tvecs.
+        """
+        self._batched_arrays_valid = False
+        self._batched_family_arrays = {}
+        self._tvecs_cache = None
+        self._hessian_skeleton = None
+        self._hvp_buf = None
+        self._cache = dict()
+        # Force _cache_check to treat the next evaluation as fresh.
+        self._lastpos = None
+        self._lastcell = None
+        self._lastactive = None
+
     def _invalidate_batched_arrays(self) -> None:
         """Invalidate batched arrays (call when internals change)."""
-        self._batched_arrays_valid = False
+        self._invalidate_structure()
+
+    def _compute_batched_value_family(self, spec: _BatchedCoordFamily,
+                                      family: _BatchedCoordArrays,
+                                      positions, tvecs):
+        """Compute values for one batched family, then slice off padding."""
+        if family.n_actual == 0:
+            return np.empty(0)
+        pos = positions[family.indices_padded]
+        values = spec.value_fn(pos, tvecs[f"{spec.key}_padded"])
+        return np.asarray(device_get(values))[:family.n_actual]
+
+    def _compute_batched_tensor_family(self, spec: _BatchedCoordFamily,
+                                       family: _BatchedCoordArrays,
+                                       positions, tvecs, fn, empty_tail):
+        """Compute gradient/Hessian tensors for one family with padded batches."""
+        if family.n_actual == 0:
+            return family.indices, np.empty((0,) + empty_tail)
+        pos = positions[family.indices_padded]
+        padded = fn(pos, tvecs[f"{spec.key}_padded"])
+        return family.indices, np.asarray(device_get(padded))[:family.n_actual]
 
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute all internal coordinate values using vectorized operations.
@@ -1589,33 +2126,13 @@ class BaseInternals:
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
-        result = {}
-
-        # Bonds - use padded arrays for consistent JAX shapes
-        if self._n_bonds_actual > 0:
-            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
-            values_padded = np.asarray(device_get(_bond_value_batched(bond_pos, tvecs['bonds_padded'])))
-            result['bonds'] = values_padded[:self._n_bonds_actual]
-        else:
-            result['bonds'] = np.empty(0)
-
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = positions[self._angle_indices_padded]  # (n_padded, 3, 3)
-            values_padded = np.asarray(device_get(_angle_value_batched(angle_pos, tvecs['angles_padded'])))
-            result['angles'] = values_padded[:self._n_angles_actual]
-        else:
-            result['angles'] = np.empty(0)
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = positions[self._dihedral_indices_padded]  # (n_padded, 4, 3)
-            values_padded = np.asarray(device_get(_dihedral_value_batched(dihedral_pos, tvecs['dihedrals_padded'])))
-            result['dihedrals'] = values_padded[:self._n_dihedrals_actual]
-        else:
-            result['dihedrals'] = np.empty(0)
-
-        return result
+        families = self._batched_family_arrays
+        return {
+            spec.key: self._compute_batched_value_family(
+                spec, families[spec.key], positions, tvecs
+            )
+            for spec in _BATCHED_COORD_FAMILIES
+        }
 
     def _compute_batched_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """Compute all internal coordinate gradients using vectorized operations.
@@ -1625,107 +2142,68 @@ class BaseInternals:
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
-        result = {}
-
-        # Bonds - use padded arrays
-        if self._n_bonds_actual > 0:
-            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
-            grads_padded = np.asarray(device_get(_bond_grad_batched(bond_pos, tvecs['bonds_padded'])))
-            result['bonds'] = (self._bond_indices, grads_padded[:self._n_bonds_actual])
-        else:
-            result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3)))
-
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = positions[self._angle_indices_padded]
-            grads_padded = np.asarray(device_get(_angle_grad_batched(angle_pos, tvecs['angles_padded'])))
-            result['angles'] = (self._angle_indices, grads_padded[:self._n_angles_actual])
-        else:
-            result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3)))
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = positions[self._dihedral_indices_padded]
-            grads_padded = np.asarray(device_get(_dihedral_grad_batched(dihedral_pos, tvecs['dihedrals_padded'])))
-            result['dihedrals'] = (self._dihedral_indices, grads_padded[:self._n_dihedrals_actual])
-        else:
-            result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3)))
-
-        return result
+        families = self._batched_family_arrays
+        return {
+            spec.key: self._compute_batched_tensor_family(
+                spec, families[spec.key], positions, tvecs, spec.grad_fn,
+                (spec.n_atoms, 3),
+            )
+            for spec in _BATCHED_COORD_FAMILIES
+        }
 
     def _compute_batched_hessians(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-        """Compute all internal coordinate hessians using vectorized operations.
+        """Compute all internal coordinate Hessians using vectorized operations.
 
-        Returns dict mapping coord type to (indices, hessians) tuples.
+        Returns dict mapping coord type to (indices, Hessians) tuples.
         Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
-        result = {}
-
-        # Bonds - use padded arrays
-        if self._n_bonds_actual > 0:
-            bond_pos = positions[self._bond_indices_padded]
-            hess_padded = np.asarray(device_get(_bond_hess_batched(bond_pos, tvecs['bonds_padded'])))
-            result['bonds'] = (self._bond_indices, hess_padded[:self._n_bonds_actual])
-        else:
-            result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3, 2, 3)))
-
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = positions[self._angle_indices_padded]
-            hess_padded = np.asarray(device_get(_angle_hess_batched(angle_pos, tvecs['angles_padded'])))
-            result['angles'] = (self._angle_indices, hess_padded[:self._n_angles_actual])
-        else:
-            result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3, 3, 3)))
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = positions[self._dihedral_indices_padded]
-            hess_padded = np.asarray(device_get(_dihedral_hess_batched(dihedral_pos, tvecs['dihedrals_padded'])))
-            result['dihedrals'] = (self._dihedral_indices, hess_padded[:self._n_dihedrals_actual])
-        else:
-            result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3, 4, 3)))
-
-        return result
+        families = self._batched_family_arrays
+        return {
+            spec.key: self._compute_batched_tensor_family(
+                spec, families[spec.key], positions, tvecs, spec.hess_fn,
+                (spec.n_atoms, 3, spec.n_atoms, 3),
+            )
+            for spec in _BATCHED_COORD_FAMILIES
+        }
 
     def _compute_batched_cell_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute all internal coordinate cell gradients using vectorized operations.
+        """Compute all internal coordinate cell gradients.
 
-        Returns dict mapping coord type to cell gradient arrays.
-        Each gradient has shape (n_coords, 3, 3) for d(coord)/d(cell).
-        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
+        Only periodic bond/angle/dihedral coordinates with non-zero ncvecs
+        depend on the cell. The JAX cell object is created lazily so non-periodic
+        batches stay on the fast zero-return path.
         """
         self._build_batched_arrays()
-        cell_jax = jnp.asarray(cell, dtype=np.float64)
+        cell_jax = None
         result = {}
+        families = self._batched_family_arrays
 
-        # Bonds - use padded arrays for consistent JAX shapes
-        if self._n_bonds_actual > 0:
-            bond_pos = jnp.asarray(positions[self._bond_indices_padded], dtype=np.float64)
-            bond_ncvecs = jnp.asarray(self._bond_ncvecs_padded, dtype=np.float64)
-            grads_padded = np.asarray(device_get(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax)))
-            result['bonds'] = grads_padded[:self._n_bonds_actual]
-        else:
-            result['bonds'] = np.empty((0, 3, 3))
+        for spec in _BATCHED_COORD_FAMILIES:
+            key = spec.key
+            family = families[key]
+            n_actual = family.n_actual
+            ncvecs = family.ncvecs
+            if n_actual == 0:
+                result[key] = np.empty((0, 3, 3))
+                continue
+            if not np.any(ncvecs):
+                result[key] = np.zeros((n_actual, 3, 3))
+                continue
 
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = jnp.asarray(positions[self._angle_indices_padded], dtype=np.float64)
-            angle_ncvecs = jnp.asarray(self._angle_ncvecs_padded, dtype=np.float64)
-            grads_padded = np.asarray(device_get(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax)))
-            result['angles'] = grads_padded[:self._n_angles_actual]
-        else:
-            result['angles'] = np.empty((0, 3, 3))
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = jnp.asarray(positions[self._dihedral_indices_padded], dtype=np.float64)
-            dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs_padded, dtype=np.float64)
-            grads_padded = np.asarray(device_get(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax)))
-            result['dihedrals'] = grads_padded[:self._n_dihedrals_actual]
-        else:
-            result['dihedrals'] = np.empty((0, 3, 3))
+            if cell_jax is None:
+                cell_jax = jnp.asarray(cell, dtype=np.float64)
+            pos = jnp.asarray(
+                positions[family.indices_padded],
+                dtype=np.float64,
+            )
+            ncvecs_padded = jnp.asarray(
+                family.ncvecs_padded,
+                dtype=np.float64,
+            )
+            grads = spec.cell_grad_fn(pos, ncvecs_padded, cell_jax)
+            result[key] = np.asarray(device_get(grads))[:n_actual]
 
         return result
 
@@ -1745,10 +2223,12 @@ class BaseInternals:
             # Build full coords list in order
             all_coords = []
 
-            # Translations (not batched - usually few) - use lightweight atoms
-            atoms = self.light_atoms
+            # Translations are simple coordinate means; compute them directly
+            # instead of dispatching one tiny JAX call per TRIC axis.
             for coord in self.internals['translations']:
-                all_coords.append(coord.calc(atoms))
+                idx = coord.indices
+                dim = coord.kwargs['dim']
+                all_coords.append(float(positions[idx, dim].mean()))
 
             # Bonds (batched)
             all_coords.extend(batched_vals['bonds'].tolist())
@@ -1760,6 +2240,7 @@ class BaseInternals:
             all_coords.extend(batched_vals['dihedrals'].tolist())
 
             # Other (not batched - heterogeneous)
+            atoms = self.light_atoms
             for coord in self.internals['other']:
                 all_coords.append(coord.calc(atoms))
 
@@ -1773,9 +2254,11 @@ class BaseInternals:
 
             self._cache['coords'] = np.array(all_coords)
 
-        return np.array([
-            x for x, a in zip(self._cache['coords'], self._active_mask) if a
-        ])
+        coords = self._cache['coords']
+        active_mask = self._active_mask
+        if all(active_mask):
+            return coords.copy()
+        return coords[np.asarray(active_mask, dtype=bool)]
 
     def jacobian(self) -> np.ndarray:
         """Calculates the internal coordinate Jacobian matrix using vectorized operations."""
@@ -1797,8 +2280,12 @@ class BaseInternals:
 
             # Non-batched coords use lightweight atoms
             atoms = self.light_atoms
-            trans_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
-                          for coord in self.internals['translations']]
+            trans_data = []
+            for coord in self.internals['translations']:
+                idx = coord.indices
+                jac = np.zeros((len(idx), 3))
+                jac[:, coord.kwargs['dim']] = 1.0 / len(idx)
+                trans_data.append((idx, jac))
             other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
                           for coord in self.internals['other']]
             rot_data = self._batched_rotation_gradients(positions)
@@ -1824,21 +2311,11 @@ class BaseInternals:
         n_rot = len(rot_data)
 
         # Build active masks per type
-        active_mask = self._active_mask
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = active_mask[start:start+n_bonds]
-        start += n_bonds
-        angles_active = active_mask[start:start+n_angles]
-        start += n_angles
-        dihedrals_active = active_mask[start:start+n_dihedrals]
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
 
-        n_active = sum(active_mask)
+        n_active = sum(self._active_mask)
         n_atoms = self.natoms + self.ndummies
         B = np.zeros((n_active, n_atoms, 3))
         row = 0
@@ -1849,41 +2326,14 @@ class BaseInternals:
                 np.add.at(B, (row, idx), jac)
                 row += 1
 
-        # Bonds (batched) - vectorized scatter
-        bond_indices, bond_grads = batched['bonds']
-        bonds_active_arr = np.array(bonds_active, dtype=bool)
-        n_active_bonds = bonds_active_arr.sum()
-        if n_active_bonds > 0:
-            active_bond_idx = bond_indices[bonds_active_arr]
-            active_bond_grads = bond_grads[bonds_active_arr]
-            # Vectorized scatter: replace loop with advanced indexing
-            rows_idx = np.arange(row, row + n_active_bonds)[:, None]
-            B[rows_idx, active_bond_idx] = active_bond_grads
-            row += n_active_bonds
-
-        # Angles (batched) - vectorized scatter
-        angle_indices, angle_grads = batched['angles']
-        angles_active_arr = np.array(angles_active, dtype=bool)
-        n_active_angles = angles_active_arr.sum()
-        if n_active_angles > 0:
-            active_angle_idx = angle_indices[angles_active_arr]
-            active_angle_grads = angle_grads[angles_active_arr]
-            # Vectorized scatter
-            rows_idx = np.arange(row, row + n_active_angles)[:, None]
-            B[rows_idx, active_angle_idx] = active_angle_grads
-            row += n_active_angles
-
-        # Dihedrals (batched) - vectorized scatter
-        dihedral_indices, dihedral_grads = batched['dihedrals']
-        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
-        n_active_dihedrals = dihedrals_active_arr.sum()
-        if n_active_dihedrals > 0:
-            active_dih_idx = dihedral_indices[dihedrals_active_arr]
-            active_dih_grads = dihedral_grads[dihedrals_active_arr]
-            # Vectorized scatter
-            rows_idx = np.arange(row, row + n_active_dihedrals)[:, None]
-            B[rows_idx, active_dih_idx] = active_dih_grads
-            row += n_active_dihedrals
+        for spec, active in zip(
+            _BATCHED_COORD_FAMILIES,
+            (bonds_active, angles_active, dihedrals_active),
+        ):
+            indices, grads = batched[spec.key]
+            row = self._scatter_batched_jacobian_family(
+                B, row, indices, grads, active
+            )
 
         # Other (not batched)
         for i, (idx, jac) in enumerate(other_data):
@@ -1945,47 +2395,24 @@ class BaseInternals:
         n_rot = len(self.internals['rotations'])
 
         # Build active masks per type
-        active_mask = self._active_mask
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = active_mask[start:start+n_bonds]
-        start += n_bonds
-        angles_active = active_mask[start:start+n_angles]
-        start += n_angles
-        dihedrals_active = active_mask[start:start+n_dihedrals]
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
 
-        n_active = sum(active_mask)
+        n_active = sum(self._active_mask)
         B_cell = np.zeros((n_active, 3, 3))
         row = 0
 
         # Translations have zero cell derivatives (they're CoM positions)
         row += sum(trans_active)
 
-        # Bonds
-        bonds_active_arr = np.array(bonds_active, dtype=bool)
-        n_active_bonds = bonds_active_arr.sum()
-        if n_active_bonds > 0:
-            B_cell[row:row+n_active_bonds] = cell_grads['bonds'][bonds_active_arr]
-            row += n_active_bonds
-
-        # Angles
-        angles_active_arr = np.array(angles_active, dtype=bool)
-        n_active_angles = angles_active_arr.sum()
-        if n_active_angles > 0:
-            B_cell[row:row+n_active_angles] = cell_grads['angles'][angles_active_arr]
-            row += n_active_angles
-
-        # Dihedrals
-        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
-        n_active_dihedrals = dihedrals_active_arr.sum()
-        if n_active_dihedrals > 0:
-            B_cell[row:row+n_active_dihedrals] = cell_grads['dihedrals'][dihedrals_active_arr]
-            row += n_active_dihedrals
+        for spec, active in zip(
+            _BATCHED_COORD_FAMILIES,
+            (bonds_active, angles_active, dihedrals_active),
+        ):
+            row = self._scatter_batched_cell_gradient_family(
+                B_cell, row, cell_grads[spec.key], active
+            )
 
         # Other has zero cell derivatives (custom coordinates, not periodic)
         row += sum(other_active)
@@ -2018,11 +2445,14 @@ class BaseInternals:
             self._cache['rotation_pad'] = out
             return out
         groups = {}
+        duplicate_slot = False
         for i, r in enumerate(rotations):
             key = (tuple(r.indices), r.kwargs['refpos'].tobytes())
             slot = groups.setdefault(key, [None, None, None])
+            if slot[r.kwargs['axis']] is not None:
+                duplicate_slot = True
             slot[r.kwargs['axis']] = i
-        if any(None in slot for slot in groups.values()):
+        if duplicate_slot or any(None in slot for slot in groups.values()):
             out = (None, None, None, [], [], False)
             self._cache['rotation_pad'] = out
             return out
@@ -2069,27 +2499,34 @@ class BaseInternals:
             self._cache['stabilized_q_eigh'] = (None, None)
             return None
         n_frags = len(slots)
-        ws_list = []
-        vecs_list = []
+        ws_all = np.empty((n_frags, 4))
+        vecs_all = np.empty((n_frags, 4, 4))
+
+        size_groups = {}
+        for fi, indices in enumerate(frag_indices):
+            size_groups.setdefault(len(indices), []).append(fi)
+
+        for nr, group in size_groups.items():
+            idx = np.array(group)
+            pos_group = pos_pad[idx, :nr]
+            ref_group = ref_pad[idx, :nr]
+            ws, vecs = np.linalg.eigh(
+                _build_F_matrices_np(pos_group, ref_group)
+            )
+            ws_all[idx] = ws
+            vecs_all[idx] = vecs
+
         qs = []
         for fi, slot in enumerate(slots):
-            n = len(frag_indices[fi])
-            pos_frag = pos_pad[fi, :n]
-            ref_frag = ref_pad[fi, :n]
-            dx = pos_frag - pos_frag.mean(0)
-            F = _build_F_matrix_np(dx, ref_frag)
             q_prev = rotations[slot[0]].q_prev
-            ws_i, vecs_i = np.linalg.eigh(F)
-            ws_list.append(ws_i)
-            vecs_list.append(vecs_i)
-            q = _stabilize_quaternion_from_eigh(ws_i, vecs_i, q_prev)
+            q = _stabilize_quaternion_from_eigh(
+                ws_all[fi], vecs_all[fi], q_prev
+            )
             for axis in range(3):
                 rotations[slot[axis]].q_prev = q
             qs.append(q)
         self._cache['stabilized_q'] = qs
-        self._cache['stabilized_q_eigh'] = (
-            np.array(ws_list), np.array(vecs_list)
-        )
+        self._cache['stabilized_q_eigh'] = (ws_all, vecs_all)
         return qs
 
     def _batched_rotation_values(self, positions: np.ndarray):
@@ -2124,17 +2561,19 @@ class BaseInternals:
         qs = self._get_stabilized_quaternions(positions)
         if qs is None:
             return None
-        pos_pad, ref_pad, _, frag_indices, slots, _ = (
+        pos_pad, ref_pad, mask, frag_indices, slots, _ = (
             self._rotation_padded_inputs(positions)
+        )
+        ws_all, vecs_all = self._cache.get('stabilized_q_eigh', (None, None))
+        jac_all = _rotation_3axis_jacobian_batched_np(
+            pos_pad, ref_pad, mask,
+            q_stable_all=np.array(qs), ws_all=ws_all, vecs_all=vecs_all,
         )
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
-            pos_frag = pos_pad[fi, :n]
-            ref_frag = ref_pad[fi, :n]
-            jac = _rotation_3axis_jacobian_np(pos_frag, ref_frag, qs[fi])
             for axis, rot_idx in enumerate(slot):
-                out[rot_idx] = (frag_indices[fi], jac[axis])
+                out[rot_idx] = (frag_indices[fi], jac_all[fi, axis, :n])
         return out
 
     def _batched_rotation_hessians(self, positions: np.ndarray):
@@ -2153,14 +2592,38 @@ class BaseInternals:
         pos_pad, ref_pad, _, frag_indices, slots, _ = (
             self._rotation_padded_inputs(positions)
         )
+        ws_all, vecs_all = self._cache.get('stabilized_q_eigh', (None, None))
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
             pos_frag = np.asarray(pos_pad[fi, :n], dtype=np.float64)
             ref_frag = np.asarray(ref_pad[fi, :n], dtype=np.float64)
+            if ws_all is not None and vecs_all is not None:
+                ws = ws_all[fi]
+                vecs = vecs_all[fi]
+            else:
+                ws, vecs = np.linalg.eigh(
+                    _build_F_matrix_np(
+                        pos_frag - pos_frag.mean(0), ref_frag
+                    )
+                )
+            top_count = int(np.sum(
+                ws[-1] - ws <= _ROT_EIG_GAP_TOL
+            ))
+            if top_count > 1:
+                hessians = _rotation_3axis_hessian_degenerate_fd(
+                    pos_frag, ref_frag, qs[fi], top_count,
+                )
+                for axis, rot_idx in enumerate(slot):
+                    out[rot_idx] = (
+                        frag_indices[fi], hessians[axis]
+                    )
+                continue
             for axis, rot_idx in enumerate(slot):
-                h = _rotation_hessian_single(pos_frag, axis, ref_frag,
-                                             q_stable=qs[fi])
+                h = _rotation_hessian_single(
+                    pos_frag, axis, ref_frag, q_stable=qs[fi],
+                    ws=ws, vecs=vecs,
+                )
                 out[rot_idx] = (frag_indices[fi], h)
         return out
 
@@ -2237,19 +2700,9 @@ class BaseInternals:
         n_rot = len(rot_data)
 
         # Build active masks per type
-        active_mask = self._active_mask
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = active_mask[start:start+n_bonds]
-        start += n_bonds
-        angles_active = active_mask[start:start+n_angles]
-        start += n_angles
-        dihedrals_active = active_mask[start:start+n_dihedrals]
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
 
         n_atoms = self.natoms + self.ndummies
         hessians = []
@@ -2261,33 +2714,14 @@ class BaseInternals:
             if trans_active[i]:
                 hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
-        # Bonds (batched). Fancy indexing already returns a fresh array; per-row
-        # views into it are read-only consumers, so no per-coord copy is needed.
-        bond_indices, bond_hess = batched['bonds']
-        bonds_active_arr = np.asarray(bonds_active, dtype=bool)
-        if bonds_active_arr.any():
-            active_bond_idx = bond_indices[bonds_active_arr]
-            active_bond_hess = bond_hess[bonds_active_arr]
-            for i in range(len(active_bond_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_bond_idx[i], active_bond_hess[i]))
-
-        # Angles (batched)
-        angle_indices, angle_hess = batched['angles']
-        angles_active_arr = np.asarray(angles_active, dtype=bool)
-        if angles_active_arr.any():
-            active_angle_idx = angle_indices[angles_active_arr]
-            active_angle_hess = angle_hess[angles_active_arr]
-            for i in range(len(active_angle_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_angle_idx[i], active_angle_hess[i]))
-
-        # Dihedrals (batched)
-        dihedral_indices, dihedral_hess = batched['dihedrals']
-        dihedrals_active_arr = np.asarray(dihedrals_active, dtype=bool)
-        if dihedrals_active_arr.any():
-            active_dih_idx = dihedral_indices[dihedrals_active_arr]
-            active_dih_hess = dihedral_hess[dihedrals_active_arr]
-            for i in range(len(active_dih_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_dih_idx[i], active_dih_hess[i]))
+        for spec, active in zip(
+            _BATCHED_COORD_FAMILIES,
+            (bonds_active, angles_active, dihedrals_active),
+        ):
+            indices, hess = batched[spec.key]
+            self._append_batched_hessian_family(
+                hessians, n_atoms, indices, hess, active
+            )
 
         # Other (not batched)
         for i, (idx, hess) in enumerate(other_data):
@@ -2303,6 +2737,261 @@ class BaseInternals:
                                         skeleton=self._get_hessian_skeleton(hessians))
         self._cache['hessian_result'] = result
         return result
+
+    def _scatter_batched_family(self, jax_result, active, n_actual,
+                                all_flat_cols, csr_offset, width,
+                                use_sparse, data, out, row):
+        """Scatter one batched bond/angle/dihedral HVP result into the output.
+
+        Extracted verbatim from the three per-family blocks in hessian_rdot;
+        returns the advanced output row.
+        """
+        if jax_result is None:
+            return row
+        hvp = np.asarray(device_get(jax_result))
+        if active.all():
+            hvp = hvp[:n_actual]
+            n_coords = n_actual
+            flat_cols = all_flat_cols
+        else:
+            n_coords = int(active.sum())
+            flat_cols = all_flat_cols[active]
+        if use_sparse:
+            data[csr_offset:csr_offset + n_coords * width] = hvp.reshape(-1)
+        else:
+            out[row:row + n_coords, :] = 0
+            out[np.arange(row, row + n_coords)[:, None], flat_cols] = \
+                hvp.reshape(n_coords, -1)
+        return row + n_coords
+
+    @staticmethod
+    def _active_array(active):
+        return np.asarray(active, dtype=bool)
+
+    def _launch_batched_hvp_family(self, spec: _BatchedCoordFamily,
+                                   family: _BatchedCoordArrays,
+                                   positions, tvecs, v_atoms, active):
+        """Launch one batched HVP kernel for active coordinates.
+
+        If every coordinate in the family is active, use padded arrays to keep the
+        compiled shape stable. If inequality constraints deactivate some rows,
+        slice to the active unpadded coordinates so the kernel does no work for
+        inactive rows.
+        """
+        active = self._active_array(active)
+        if family.n_actual == 0 or not active.any():
+            return None
+
+        if active.all():
+            indices = family.indices_padded
+            pos = positions[indices]
+            tvec = tvecs[f"{spec.key}_padded"]
+            v_sub = v_atoms[indices]
+        else:
+            indices = family.indices[active]
+            pos = positions[indices]
+            tvec = tvecs[spec.key][active]
+            v_sub = v_atoms[indices]
+        return spec.hvp_fn(pos, tvec, v_sub)
+
+    def _scatter_batched_jacobian_family(self, B, row, indices, grads,
+                                         active):
+        active = self._active_array(active)
+        n_active = int(active.sum())
+        if n_active == 0:
+            return row
+        rows_idx = np.arange(row, row + n_active)[:, None]
+        B[rows_idx, indices[active]] = grads[active]
+        return row + n_active
+
+    def _append_batched_hessian_family(self, hessians, n_atoms, indices, hess,
+                                       active):
+        active = self._active_array(active)
+        if not active.any():
+            return
+        active_idx = indices[active]
+        active_hess = hess[active]
+        for i in range(len(active_idx)):
+            hessians.append(
+                SparseInternalHessian(n_atoms, active_idx[i], active_hess[i])
+            )
+
+    def _scatter_batched_cell_gradient_family(self, B_cell, row, grads,
+                                              active):
+        active = self._active_array(active)
+        n_active = int(active.sum())
+        if n_active > 0:
+            B_cell[row:row + n_active] = grads[active]
+        return row + n_active
+
+    def _scatter_full_row(self, hvp, idx, use_sparse, data, out, off, row,
+                          ndof):
+        """Scatter one dense HVP row (other/rotation coords) into the output.
+
+        Extracted verbatim from the three full-row blocks in hessian_rdot;
+        returns the advanced (off, row).
+        """
+        if use_sparse:
+            dense_row = np.zeros(ndof)
+            dense_row.reshape((-1, 3))[idx] = hvp
+            data[off:off + ndof] = dense_row
+            off += ndof
+        else:
+            out_row = out[row].reshape((-1, 3))
+            out_row[idx] = hvp
+        return off, row + 1
+
+    def _contract_batched_hvp_family(self, jax_result, active, n_actual,
+                                     indices, mat_atoms, out, row):
+        """Contract one batched HVP family with dense Cartesian columns."""
+        if jax_result is None:
+            return row
+        hvp = np.asarray(device_get(jax_result))
+        if active.all():
+            hvp = hvp[:n_actual]
+            idx = indices
+            n_coords = n_actual
+        else:
+            idx = indices[active]
+            n_coords = int(active.sum())
+        out[row:row + n_coords] = np.einsum('cij,cijk->ck',
+                                            hvp, mat_atoms[idx])
+        return row + n_coords
+
+    @staticmethod
+    def _contract_full_hvp_row(hvp, idx, mat_atoms):
+        """Contract one dense HVP row with dense Cartesian columns."""
+        return np.einsum('ij,ijk->k', hvp, mat_atoms[idx])
+
+    def hessian_rdot_mat(self, v: np.ndarray, mat: np.ndarray):
+        """Compute ``hessian_rdot(v) @ mat`` without forming hessian_rdot.
+
+        ``_q_ode`` only needs contractions of each coordinate Hessian-vector
+        product with a few Cartesian vectors.  Computing those contractions
+        directly avoids expanding compact per-coordinate HVPs into the sparse
+        ``(n_active, ndof)`` matrix and then multiplying it back down.
+        """
+        self._cache_check()
+        positions = self.all_positions
+        cell = self.atoms.cell.array
+        self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
+
+        mat = np.asarray(mat)
+        if mat.ndim == 1:
+            mat = mat[:, None]
+            squeeze = True
+        else:
+            squeeze = False
+
+        v_atoms = v.reshape((-1, 3))
+        mat_atoms = mat.reshape((-1, 3, mat.shape[1]))
+
+        active_mask = self._active_mask
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
+        bonds_active = np.asarray(bonds_active, dtype=bool)
+        angles_active = np.asarray(angles_active, dtype=bool)
+        dihedrals_active = np.asarray(dihedrals_active, dtype=bool)
+
+        out = np.zeros((sum(active_mask), mat.shape[1]), dtype=np.float64)
+        row = sum(trans_active)  # Translation Hessians are zero.
+
+        batched_active = (bonds_active, angles_active, dihedrals_active)
+        families = self._batched_family_arrays
+        batched_hvp = {
+            spec.key: self._launch_batched_hvp_family(
+                spec, families[spec.key], positions, tvecs, v_atoms, active
+            )
+            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
+        }
+
+        rot_closed_results = []
+        rot_batched_slots = None
+        rot_batched_frag_indices = None
+        rot_batched_hvp = None
+        all_rot_active = bool(np.asarray(rot_active, dtype=bool).all())
+        if all_rot_active and self.internals['rotations']:
+            pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+                self._rotation_padded_inputs(positions)
+            )
+        else:
+            valid = False
+        if valid:
+            qs = self._get_stabilized_quaternions(positions)
+            q_stable_all = np.array(qs) if qs is not None else None
+            cached_eigh = self._cache.get('stabilized_q_eigh', (None, None))
+            ws_cached, vecs_cached = cached_eigh
+            n_max = mask.shape[1]
+            v_pad = np.zeros((len(frag_indices), n_max, 3), dtype=np.float64)
+            for fi, fi_idx in enumerate(frag_indices):
+                v_pad[fi, :len(fi_idx)] = v_atoms[fi_idx]
+            rot_batched_hvp = _rotation_3axis_hvp_batched_closed(
+                pos_pad, ref_pad, mask, v_pad,
+                q_stable_all=q_stable_all,
+                ws_all=ws_cached, vecs_all=vecs_cached,
+            )
+            rot_batched_slots = slots
+            rot_batched_frag_indices = frag_indices
+        else:
+            for i, coord in enumerate(self.internals['rotations']):
+                if rot_active[i]:
+                    idx = np.array(coord.indices)
+                    pos = positions[idx]
+                    v_sub = v_atoms[idx]
+                    axis = coord.kwargs['axis']
+                    refpos = coord.kwargs['refpos']
+                    q = coord._stabilized_quaternion(pos)
+                    hvp = _rotation_hvp_closed(pos, axis, refpos, v_sub,
+                                               q_stable=q)
+                    rot_closed_results.append((hvp, idx))
+
+        for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
+            family = families[spec.key]
+            row = self._contract_batched_hvp_family(
+                batched_hvp[spec.key], active,
+                family.n_actual,
+                family.indices,
+                mat_atoms, out, row,
+            )
+
+        atoms = self.light_atoms
+        for i, coord in enumerate(self.internals['other']):
+            if other_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                out[row] = self._contract_full_hvp_row(hvp, idx, mat_atoms)
+                row += 1
+
+        if rot_batched_hvp is not None:
+            for fi, slot in enumerate(rot_batched_slots):
+                n = len(rot_batched_frag_indices[fi])
+                idx = rot_batched_frag_indices[fi]
+                contracted = np.einsum(
+                    'anj,njk->ak', rot_batched_hvp[fi, :, :n, :],
+                    mat_atoms[idx],
+                )
+                for axis, rot_idx in enumerate(slot):
+                    out[row + rot_idx] = contracted[axis]
+            row += len(self.internals['rotations'])
+        else:
+            for hvp, idx in rot_closed_results:
+                out[row] = self._contract_full_hvp_row(hvp, idx, mat_atoms)
+                row += 1
+
+        if squeeze:
+            return out[:, 0]
+        return out
 
     def hessian_rdot(self, v: np.ndarray):
         """Compute Hessian @ v for all internal coordinates using direct HVP.
@@ -2327,7 +3016,6 @@ class BaseInternals:
 
         # Reshape v for easy indexing
         v_atoms = v.reshape((-1, 3))  # (n_atoms, 3)
-        n_atoms = self.natoms + self.ndummies
         ndof = self.ndof  # Cache to avoid repeated property lookups
 
         # Get active mask and counts
@@ -2339,24 +3027,20 @@ class BaseInternals:
         n_other = len(self.internals['other'])
         n_rot = len(self.internals['rotations'])
 
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = np.array(active_mask[start:start+n_bonds], dtype=bool)
-        start += n_bonds
-        angles_active = np.array(active_mask[start:start+n_angles], dtype=bool)
-        start += n_angles
-        dihedrals_active = np.array(active_mask[start:start+n_dihedrals], dtype=bool)
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
+        bonds_active = np.array(bonds_active, dtype=bool)
+        angles_active = np.array(angles_active, dtype=bool)
+        dihedrals_active = np.array(dihedrals_active, dtype=bool)
 
         n_active = sum(active_mask)
 
         # Fast path: when all coords are active, use pre-built CSR structure
         use_sparse = (n_active == self._csr_n_active)
 
+        data = None
+        out = None
         if use_sparse:
             data = self._csr_data
             data[:] = 0
@@ -2377,53 +3061,14 @@ class BaseInternals:
         # Launch all JAX HVP computations, deferring device_get
         # This allows JAX to pipeline the computations before we block on transfer
 
-        bond_jax_result = None
-        bond_active_idx = None
-        if bonds_active.any() and self._n_bonds_actual > 0:
-            if bonds_active.all():
-                bond_pos = positions[self._bond_indices_padded]
-                bond_tvecs = tvecs['bonds_padded']
-                v_sub = v_atoms[self._bond_indices_padded]
-                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
-                bond_active_idx = self._bond_indices
-            else:
-                bond_active_idx = self._bond_indices[bonds_active]
-                bond_pos = positions[bond_active_idx]
-                bond_tvecs = tvecs['bonds'][bonds_active]
-                v_sub = v_atoms[bond_active_idx]
-                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
-
-        angle_jax_result = None
-        angle_active_idx = None
-        if angles_active.any() and self._n_angles_actual > 0:
-            if angles_active.all():
-                angle_pos = positions[self._angle_indices_padded]
-                angle_tvecs = tvecs['angles_padded']
-                v_sub = v_atoms[self._angle_indices_padded]
-                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-                angle_active_idx = self._angle_indices
-            else:
-                angle_active_idx = self._angle_indices[angles_active]
-                angle_pos = positions[angle_active_idx]
-                angle_tvecs = tvecs['angles'][angles_active]
-                v_sub = v_atoms[angle_active_idx]
-                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-
-        dih_jax_result = None
-        dih_active_idx = None
-        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
-            if dihedrals_active.all():
-                dih_pos = positions[self._dihedral_indices_padded]
-                dih_tvecs = tvecs['dihedrals_padded']
-                v_sub = v_atoms[self._dihedral_indices_padded]
-                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
-                dih_active_idx = self._dihedral_indices
-            else:
-                dih_active_idx = self._dihedral_indices[dihedrals_active]
-                dih_pos = positions[dih_active_idx]
-                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
-                v_sub = v_atoms[dih_active_idx]
-                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+        batched_active = (bonds_active, angles_active, dihedrals_active)
+        families = self._batched_family_arrays
+        batched_hvp = {
+            spec.key: self._launch_batched_hvp_family(
+                spec, families[spec.key], positions, tvecs, v_atoms, active
+            )
+            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
+        }
 
         # Compute rotation HVPs using closed-form Hessian (handles
         # degenerate eigenvalues for linear/near-linear fragments).
@@ -2462,53 +3107,22 @@ class BaseInternals:
                     v_sub = v_atoms[idx]
                     axis = coord.kwargs['axis']
                     refpos = coord.kwargs['refpos']
+                    q = coord._stabilized_quaternion(pos)
                     hvp = _rotation_hvp_closed(pos, axis, refpos, v_sub,
-                                               q_stable=coord.q_prev)
+                                               q_stable=q)
                     rot_closed_results.append((hvp, idx))
 
         # Now collect results with device_get and scatter into output
 
-        if bond_jax_result is not None:
-            hvp = np.asarray(device_get(bond_jax_result))
-            if bonds_active.all():
-                hvp = hvp[:self._n_bonds_actual]
-            n_coords = self._n_bonds_actual if bonds_active.all() else int(bonds_active.sum())
-            if use_sparse:
-                off = self._csr_bond_offset
-                data[off:off + n_coords * 6] = hvp.reshape(-1)
-            else:
-                flat_cols = self._bond_flat_cols if bonds_active.all() else self._bond_flat_cols[bonds_active]
-                out[row:row+n_coords, :] = 0
-                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
-            row += n_coords
-
-        if angle_jax_result is not None:
-            hvp = np.asarray(device_get(angle_jax_result))
-            if angles_active.all():
-                hvp = hvp[:self._n_angles_actual]
-            n_coords = self._n_angles_actual if angles_active.all() else int(angles_active.sum())
-            if use_sparse:
-                off = self._csr_angle_offset
-                data[off:off + n_coords * 9] = hvp.reshape(-1)
-            else:
-                flat_cols = self._angle_flat_cols if angles_active.all() else self._angle_flat_cols[angles_active]
-                out[row:row+n_coords, :] = 0
-                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
-            row += n_coords
-
-        if dih_jax_result is not None:
-            hvp = np.asarray(device_get(dih_jax_result))
-            if dihedrals_active.all():
-                hvp = hvp[:self._n_dihedrals_actual]
-            n_coords = self._n_dihedrals_actual if dihedrals_active.all() else int(dihedrals_active.sum())
-            if use_sparse:
-                off = self._csr_dih_offset
-                data[off:off + n_coords * 12] = hvp.reshape(-1)
-            else:
-                flat_cols = self._dihedral_flat_cols if dihedrals_active.all() else self._dihedral_flat_cols[dihedrals_active]
-                out[row:row+n_coords, :] = 0
-                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
-            row += n_coords
+        for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
+            family = families[spec.key]
+            row = self._scatter_batched_family(
+                batched_hvp[spec.key], active,
+                family.n_actual,
+                family.flat_cols,
+                family.csr_offset,
+                spec.width, use_sparse, data, out, row,
+            )
 
         # Other - use existing hessian computation (typically few coords, loop is fine)
         atoms = self.light_atoms
@@ -2519,15 +3133,8 @@ class BaseInternals:
                 idx = np.array(coord.indices)
                 v_sub = v_atoms[idx]
                 hvp = np.einsum('aibj,bj->ai', hess, v_sub)
-                if use_sparse:
-                    dense_row = np.zeros(ndof)
-                    dense_row.reshape((-1, 3))[idx] = hvp
-                    data[off:off + ndof] = dense_row
-                    off += ndof
-                else:
-                    out_row = out[row].reshape((-1, 3))
-                    out_row[idx] = hvp
-                row += 1
+                off, row = self._scatter_full_row(
+                    hvp, idx, use_sparse, data, out, off, row, ndof)
 
         # Rotations - collect results from closed-form Hessian (no NaN
         # for degenerate eigenvalues)
@@ -2546,26 +3153,12 @@ class BaseInternals:
                 if not rot_active[i]:
                     continue
                 hvp, idx = ordered[i]
-                if use_sparse:
-                    dense_row = np.zeros(ndof)
-                    dense_row.reshape((-1, 3))[idx] = hvp
-                    data[off:off + ndof] = dense_row
-                    off += ndof
-                else:
-                    out_row = out[row].reshape((-1, 3))
-                    out_row[idx] = hvp
-                row += 1
+                off, row = self._scatter_full_row(
+                    hvp, idx, use_sparse, data, out, off, row, ndof)
         else:
             for hvp, idx in rot_closed_results:
-                if use_sparse:
-                    dense_row = np.zeros(ndof)
-                    dense_row.reshape((-1, 3))[idx] = hvp
-                    data[off:off + ndof] = dense_row
-                    off += ndof
-                else:
-                    out_row = out[row].reshape((-1, 3))
-                    out_row[idx] = hvp
-                row += 1
+                off, row = self._scatter_full_row(
+                    hvp, idx, use_sparse, data, out, off, row, ndof)
 
         if use_sparse:
             return sparse.csr_matrix(
@@ -2574,28 +3167,40 @@ class BaseInternals:
             )
         return out[:row]
 
-    def wrap(self, vec: np.ndarray) -> np.ndarray:
+    def wrap(self, vec: np.ndarray, origin: np.ndarray = None) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""
         start = 0
         for name in self._names:
-            n = len(self.internals[name])
+            active = self._active[name]
+            n = sum(active)
             if name == 'dihedrals':
                 vec[start:start + n] = (vec[start:start + n] + np.pi) % (2 * np.pi) - np.pi
             elif name == 'rotations' and n > 0:
-                self._wrap_rotation_diff(vec, start)
+                self._wrap_rotation_diff(vec, start, active, origin=origin)
             start += n
         return vec
 
-    def _wrap_rotation_diff(self, vec, rot_start):
-        """Wrap rotation coordinate differences along rotation axis.
+    def _wrap_rotation_diff(self, vec, rot_start, active=None, origin=None):
+        """Wrap rotation differences using an equivalent target rotation.
 
-        The exponential map has period 2π along the rotation axis
-        direction. For each fragment's 3 rotation components, find the
-        minimum-image difference by adding/subtracting 2π * v̂.
+        A rotation vector ``target`` is equivalent to
+        ``target + 2π k target/|target|``.  Select the equivalent target that
+        is closest to ``origin``.  Wrapping along the displacement direction
+        is only valid when the two rotations share an axis and can change the
+        represented orientation for general rotations.
         """
         rotations = self.internals['rotations']
         if not rotations:
             return
+        if active is None:
+            active = [True] * len(rotations)
+        active = np.asarray(active, dtype=bool)
+        local_index = {}
+        n_active = 0
+        for i, is_active in enumerate(active):
+            if is_active:
+                local_index[i] = n_active
+                n_active += 1
         # Group rotations by fragment (same indices and refpos)
         groups = {}
         for i, r in enumerate(rotations):
@@ -2603,27 +3208,22 @@ class BaseInternals:
             groups.setdefault(key, []).append(i)
 
         for key, indices in groups.items():
-            if len(indices) != 3:
+            active_indices = [i for i in indices if active[i]]
+            if len(active_indices) != 3:
                 continue
             # Get the 3-component rotation difference vector
-            idx = [rot_start + i for i in indices]
+            idx = [rot_start + local_index[i] for i in active_indices]
             v = vec[idx].copy()
-            vnorm = np.linalg.norm(v)
-            if vnorm < 1e-10:
+            base = np.zeros(3) if origin is None else np.asarray(origin)[idx]
+            target = base + v
+            target_norm = np.linalg.norm(target)
+            if target_norm < 1e-10:
                 continue
-            vh = v / vnorm
-            # Try adding/subtracting 2π along v̂ to minimize |v|
-            best_v = v.copy()
-            best_d2 = np.dot(v, v)
-            for direction in [1, -1]:
-                vt = v.copy()
-                while True:
-                    vt += direction * 2 * np.pi * vh
-                    d2 = np.dot(vt, vt)
-                    if d2 >= best_d2:
-                        break
-                    best_v = vt.copy()
-                    best_d2 = d2
+            axis = target / target_norm
+            k0 = int(np.rint(-np.dot(v, axis) / (2 * np.pi)))
+            candidates = [v + 2 * np.pi * k * axis
+                          for k in (k0 - 1, k0, k0 + 1)]
+            best_v = min(candidates, key=lambda candidate: candidate @ candidate)
             vec[idx] = best_v
 
     def __iter__(self) -> Iterator[Coordinate]:
@@ -2712,25 +3312,91 @@ class BaseInternals:
         didx = self.dinds[idx]
         assert didx >= 0
         npos = len(self.all_positions)
-        for i, trans in enumerate(self.internals['translations']):
+
+        def dedupe(name, coords, active):
+            targets_by_name = getattr(self, '_targets', None)
+            kinds_by_name = getattr(self, '_kind', None)
+            has_metadata = targets_by_name is not None
+            if has_metadata:
+                targets = targets_by_name[name]
+                kinds = kinds_by_name[name]
+            else:
+                targets = kinds = None
+
+            new_coords = []
+            new_active = []
+            new_targets = []
+            new_kinds = []
+            changed = len(coords) != len(active)
+            for i, (coord, is_active) in enumerate(zip(coords, active)):
+                try:
+                    existing = new_coords.index(coord)
+                except ValueError:
+                    new_coords.append(coord)
+                    new_active.append(is_active)
+                    if has_metadata:
+                        new_targets.append(targets[i])
+                        new_kinds.append(kinds[i])
+                else:
+                    if has_metadata and (
+                        new_kinds[existing] != kinds[i]
+                        or new_targets[existing] != targets[i]
+                    ):
+                        raise DuplicateConstraintError(
+                            'Dummy expansion produced duplicate coordinates '
+                            'with conflicting constraints.'
+                        )
+                    new_active[existing] = new_active[existing] or is_active
+                    changed = True
+            if has_metadata:
+                targets_by_name[name] = new_targets
+                kinds_by_name[name] = new_kinds
+            return new_coords, new_active, changed
+
+        changed = False
+        translations = []
+        for trans in self.internals['translations']:
             if idx in trans.indices and didx not in trans.indices:
                 new_indices = (*trans.indices, didx)
-                new_trans = Translation(new_indices, trans.kwargs['dim'])
-                self.internals['translations'][i] = new_trans
+                translations.append(
+                    Translation(new_indices, trans.kwargs['dim'])
+                )
+                changed = True
+            else:
+                translations.append(trans)
+        translations, trans_active, trans_deduped = dedupe(
+            'translations', translations, self._active['translations']
+        )
+        self.internals['translations'] = translations
+        self._active['translations'] = trans_active
+        changed = changed or trans_deduped
 
-        for i, rot in enumerate(self.internals['rotations']):
+        rotations = []
+        for rot in self.internals['rotations']:
             if idx in rot.indices and didx not in rot.indices:
                 new_indices = np.array((*rot.indices, didx), dtype=np.int32)
                 if np.all(new_indices < npos):
-                    new_rot = Rotation(
+                    rotations.append(Rotation(
                         new_indices, rot.kwargs['axis'],
                         self.all_positions[new_indices]
-                    )
-                    self.internals['rotations'][i] = new_rot
+                    ))
+                    changed = True
+                    continue
+            rotations.append(rot)
+        rotations, rot_active, rot_deduped = dedupe(
+            'rotations', rotations, self._active['rotations']
+        )
+        self.internals['rotations'] = rotations
+        self._active['rotations'] = rot_active
+        changed = changed or rot_deduped
+
+        if changed:
+            self._invalidate_structure()
 
     def check_all_gradients(
         self, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
+        """Run check_gradient on every internal coordinate; True iff all pass."""
         success = True
         for coord in self:
             success &= coord.check_gradient(self.all_atoms, delta, atol)
@@ -2739,6 +3405,7 @@ class BaseInternals:
     def check_all_hessians(
         self, delta: float = 1e-4, atol: float = 1e-6,
     ) -> bool:
+        """Run check_hessian on every internal coordinate; True iff all pass."""
         success = True
         for coord in self:
             success &= coord.check_hessian(self.all_atoms, delta, atol)
@@ -2760,15 +3427,36 @@ class Constraints(BaseInternals):
         for ase_cons in atoms.constraints:
             self.merge_ase_constraint(ase_cons)
 
-    def copy(self) -> 'Constraints':
+    def copy(
+        self,
+        _coord_memo=None,
+        _dummies: Atoms = None,
+        _dinds: np.ndarray = None,
+    ) -> 'Constraints':
+        if _coord_memo is None:
+            _coord_memo = {}
+        if _dummies is None:
+            _dummies = self.dummies.copy()
+        if _dinds is None:
+            _dinds = self.dinds.copy()
+
+        def clone(coord):
+            key = id(coord)
+            if key not in _coord_memo:
+                _coord_memo[key] = coord.copy()
+            return _coord_memo[key]
+
         new = self.__class__(
-            self.atoms, self.dummies, self.dinds, self.ignore_rotation
+            self.atoms, _dummies, _dinds, self.ignore_rotation
         )
         for name in self._names:
-            new.internals[name] = self.internals[name].copy()
+            new.internals[name] = [
+                clone(coord) for coord in self.internals[name]
+            ]
             new._targets[name] = self._targets[name].copy()
             new._active[name] = self._active[name].copy()
             new._kind[name] = self._kind[name].copy()
+        new._invalidate_structure()
         return new
 
     @property
@@ -2780,7 +3468,8 @@ class Constraints(BaseInternals):
 
     def residual(self) -> np.ndarray:
         """Calculates the constraint residual vector."""
-        res = self.wrap(self.calc() - self.targets)
+        targets = self.targets
+        res = self.wrap(self.calc() - targets, origin=targets)
         if self.ignore_rotation and self.nrotations:
             res[-self.nrotations:] = 0.
         return res
@@ -2853,6 +3542,7 @@ class Constraints(BaseInternals):
             self._targets['rotations'].append(0.)
             self._active['rotations'].append(True)
             self._kind['rotations'].append('eq')
+            self._invalidate_structure()
         else:
             raise DuplicateConstraintError(
                 "This rotation has already been constrained!"
@@ -2894,6 +3584,7 @@ class Constraints(BaseInternals):
             self._targets['translations'].append(target)
             self._active['translations'].append(True)
             self._kind['translations'].append('eq')
+            self._invalidate_structure()
         else:
             if replace_ok:
                 self._targets['translations'][idx] = target
@@ -2936,6 +3627,7 @@ class Constraints(BaseInternals):
             self._targets[name].append(target)
             self._active[name].append(True)
             self._kind[name].append(comparator)
+            self._invalidate_structure()
         else:
             if replace_ok:
                 self._targets[name][idx] = target
@@ -2968,6 +3660,7 @@ class Constraints(BaseInternals):
             self._targets['other'].append(target)
             self._active['other'].append(True)
             self._kind['other'].append(comparator)
+            self._invalidate_structure()
         else:
             if replace_ok:
                 self._targets['other'][idx] = target
@@ -2978,56 +3671,67 @@ class Constraints(BaseInternals):
                 .format(coord, self._targets['other'][idx])
             )
 
-    def merge_ase_constraint(self, ase_cons: FixConstraint) -> None:
-        if isinstance(ase_cons, FixAtoms):
-            for index in ase_cons.index:
-                try:
-                    self.fix_translation(index)
-                except DuplicateConstraintError:
-                    pass
-        elif isinstance(ase_cons, FixCom):
-            try:
-                self.fix_translation()
-            except DuplicateConstraintError:
-                pass
-        elif isinstance(ase_cons, FixBondLengths):
-            for i, indices in enumerate(ase_cons.pairs):
-                if ase_cons.bondlengths is None:
-                    target = None
-                else:
-                    target = ase_cons.bondlengths[i]
-                try:
-                    self.fix_bond(indices, mic=True, target=target)
-                except DuplicateConstraintError:
-                    pass
-            return
-        elif isinstance(ase_cons, FixCartesian):
-            for dim, relaxed in enumerate(ase_cons.mask):
-                if relaxed:
-                    continue
-                try:
-                    self.fix_translation(ase_cons.a, dim=dim)
-                except DuplicateConstraintError:
-                    pass
-        elif isinstance(ase_cons, FixInternals):
-            for ase_cons_list, adder in zip(
-                (ase_cons.bonds, ase_cons.angles, ase_cons.dihedrals),
-                (self.fix_bond, self.fix_angle, self.fix_dihedral),
-            ):
-                for target, indices in ase_cons_list:
-                    try:
-                        adder(indices, target=target)
-                    except DuplicateInternalError:
-                        pass
-            if ase_cons.bondcombos:
-                raise RuntimeError(
-                    "Sella currently does not support combination constraints."
-                )
-        else:
-            raise RuntimeError(
-                "Sella does not currently implement the ASE {} Constraint "
-                "class.".format(ase_cons.__class__.__name__)
+    def _merge_fix_atoms(self, ase_cons):
+        for index in ase_cons.index:
+            self._ignore_duplicate(self.fix_translation, index)
+
+    def _merge_fix_com(self, ase_cons):
+        self._ignore_duplicate(self.fix_translation)
+
+    def _merge_fix_bond_lengths(self, ase_cons):
+        for i, indices in enumerate(ase_cons.pairs):
+            target = None if ase_cons.bondlengths is None else ase_cons.bondlengths[i]
+            self._ignore_duplicate(
+                self.fix_bond, indices, mic=True, target=target
             )
+
+    @staticmethod
+    def _fix_cartesian_indices_and_mask(ase_cons):
+        # ASE's FixCartesian API changed around 3.23: older versions store a
+        # scalar atom in .a and invert the mask at construction (stored mask
+        # True = *free*); newer versions store .index with mask True = fixed.
+        raw_mask = np.asarray(ase_cons.mask, dtype=bool)
+        if hasattr(ase_cons, 'index'):
+            return np.atleast_1d(ase_cons.index), raw_mask
+        return np.atleast_1d(ase_cons.a), ~raw_mask
+
+    def _merge_fix_cartesian(self, ase_cons):
+        indices, fixed_mask = self._fix_cartesian_indices_and_mask(ase_cons)
+        for atom in indices:
+            for dim in np.flatnonzero(fixed_mask):
+                self._ignore_duplicate(
+                    self.fix_translation, int(atom), dim=int(dim)
+                )
+
+    def _merge_fix_internals(self, ase_cons):
+        """Merge ASE FixInternals entries, preserving ASE target values."""
+        for ase_cons_list, adder in zip(
+            (ase_cons.bonds, ase_cons.angles, ase_cons.dihedrals),
+            (self.fix_bond, self.fix_angle, self.fix_dihedral),
+        ):
+            for target, indices in ase_cons_list:
+                self._ignore_duplicate(adder, indices, target=target)
+        if ase_cons.bondcombos:
+            raise RuntimeError(
+                "Sella currently does not support combination constraints."
+            )
+
+    def merge_ase_constraint(self, ase_cons: FixConstraint) -> None:
+        handlers = (
+            (FixAtoms, self._merge_fix_atoms),
+            (FixCom, self._merge_fix_com),
+            (FixBondLengths, self._merge_fix_bond_lengths),
+            (FixCartesian, self._merge_fix_cartesian),
+            (FixInternals, self._merge_fix_internals),
+        )
+        for ase_type, handler in handlers:
+            if isinstance(ase_cons, ase_type):
+                handler(ase_cons)
+                return
+        raise RuntimeError(
+            "Sella does not currently implement the ASE {} Constraint "
+            "class.".format(ase_cons.__class__.__name__)
+        )
 
 
 class Internals(BaseInternals):
@@ -3038,10 +3742,20 @@ class Internals(BaseInternals):
         atol: float = 15.,
         dinds: np.ndarray = None,
         cons: Constraints = None,
-        allow_fragments: bool = False
+        allow_fragments: bool = False,
     ) -> None:
         BaseInternals.__init__(self, atoms, dummies, dinds)
         self.atol = atol * np.pi / 180.
+        # Fragment-welding redundancy (see _mst_welding_bonds). Augmentation is
+        # ON by default: it closes fragment rings, symmetrizes extended contact
+        # interfaces, and makes welding permutation-invariant, at the cost of
+        # redundant internals (which Sella handles). It is provably inert on
+        # generic asymmetric systems -- the physical gate means only genuine
+        # near-degenerate contacts qualify -- so it only acts where the bare
+        # spanning tree would be biased.
+        self._weld_augment = True
+        self._weld_tol = 0.15    # add contacts within 15% of an interface min
+        self._weld_gate = 1.4    # ... and <= 1.4 x sum(covalent radii)
         self.forbidden = {key: [] for key in self._names}
         if cons is None:
             cons = Constraints(self.atoms, self.dummies, self.dinds)
@@ -3067,19 +3781,48 @@ class Internals(BaseInternals):
         self.fragment_atom_groups = None
 
     def copy(self) -> 'Internals':
+        coord_memo = {}
+        dummies = self.dummies.copy()
+        dinds = self.dinds.copy()
+
+        def clone(coord):
+            key = id(coord)
+            if key not in coord_memo:
+                coord_memo[key] = coord.copy()
+            return coord_memo[key]
+
         new = self.__class__(
             self.atoms,
-            self.dummies,
+            dummies,
             self.atol * 180. / np.pi,
-            self.dinds,
-            self.cons.copy(),
+            dinds,
+            self.cons.copy(
+                _coord_memo=coord_memo,
+                _dummies=dummies,
+                _dinds=dinds,
+            ),
             self.allow_fragments,
         )
         for name in self._names:
-            new.internals[name] = self.internals[name].copy()
-            new._internals_set[name] = self._internals_set[name].copy()
-            new.forbidden[name] = self.forbidden[name].copy()
+            new.internals[name] = [
+                clone(coord) for coord in self.internals[name]
+            ]
+            if name in ('bonds', 'angles', 'dihedrals'):
+                new._internals_set[name] = {
+                    new._internal_key(coord)
+                    for coord in new.internals[name]
+                }
+            else:
+                new._internals_set[name] = self._internals_set[name].copy()
+            new.forbidden[name] = [
+                clone(coord) for coord in self.forbidden[name]
+            ]
             new._active[name] = self._active[name].copy()
+        if self.fragment_atom_groups is not None:
+            new.fragment_atom_groups = [
+                g.copy() for g in self.fragment_atom_groups
+            ]
+        new._invalidate_structure()
         return new
 
     def add_rotation(
@@ -3113,6 +3856,7 @@ class Internals(BaseInternals):
             raise DuplicateInternalError
         self.internals['rotations'].append(new)
         self._active['rotations'].append(True)
+        self._invalidate_structure()
 
     def add_translation(
         self,
@@ -3122,7 +3866,7 @@ class Internals(BaseInternals):
         if isinstance(index, Translation):
             if dim is not None:
                 raise ValueError(
-                    '"dim" keyword cannot be used with explicit Cart'
+                    '"dim" keyword cannot be used with explicit Translation'
                 )
             new = index
         else:
@@ -3142,6 +3886,38 @@ class Internals(BaseInternals):
             raise DuplicateInternalError
         self.internals['translations'].append(new)
         self._active['translations'].append(True)
+        self._invalidate_structure()
+
+    def _add_fragment_coords(
+        self, group, with_rotation: bool = True
+    ) -> None:
+        """Add fragment translation (and optionally rotation) coordinates.
+
+        Idempotent: ``find_all_bonds()`` may run more than once on the same
+        Internals (e.g. a pre-populated fragment Internals passed to
+        InternalPES with auto_find_internals=True), so silently skip fragment
+        TRICs that already exist instead of raising DuplicateInternalError --
+        mirroring the duplicate handling on fragment-welding bonds.
+        """
+        for dim in range(3):
+            self._ignore_duplicate(self.add_translation, group, dim)
+        if with_rotation and len(group) >= 2:
+            for axis in range(3):
+                self._ignore_duplicate(self.add_rotation, group, axis)
+
+    @staticmethod
+    def _internal_key(coord: 'Internal') -> tuple:
+        """Orientation-independent dedup key for an Internal coordinate.
+
+        ``Internal.__eq__`` treats a coordinate and its reverse as equal, so
+        the ``_internals_set`` key must be canonical across orientation --
+        otherwise ``add_bond((1, 0))`` slips past a prior ``add_bond((0, 1))``.
+        Take the lexicographically smaller of the forward and reversed keys.
+        """
+        def raw(c: 'Internal') -> tuple:
+            return (tuple(int(i) for i in c.indices),
+                    tuple(map(tuple, c.kwargs['ncvecs'])))
+        return min(raw(coord), raw(coord.reverse()))
 
     def _add_internal(
         self,
@@ -3161,7 +3937,7 @@ class Internals(BaseInternals):
         else:
             ncvecs = self._get_ncvecs(indices, ncvecs, mic)
             new = kind(indices, ncvecs=ncvecs)
-        key = (tuple(new.indices), tuple(map(tuple, new.kwargs['ncvecs'])))
+        key = self._internal_key(new)
         if (
             key in self._internals_set[name]
             or new in self.forbidden[name]
@@ -3170,6 +3946,7 @@ class Internals(BaseInternals):
         self.internals[name].append(new)
         self._internals_set[name].add(key)
         self._active[name].append(True)
+        self._invalidate_structure()
 
     add_bond = partialmethod(_add_internal, Bond, 'bonds')
     add_angle = partialmethod(_add_internal, Angle, 'angles')
@@ -3184,6 +3961,7 @@ class Internals(BaseInternals):
         except ValueError:
             self.internals['other'].append(coord)
             self._active['other'].append(True)
+            self._invalidate_structure()
         else:
             raise DuplicateInternalError()
 
@@ -3195,7 +3973,7 @@ class Internals(BaseInternals):
         if isinstance(index, Translation):
             if dim is not None:
                 raise ValueError(
-                    '"dim" keyword cannot be used with explicit Cart'
+                    '"dim" keyword cannot be used with explicit Translation'
                 )
             new = index
         else:
@@ -3209,9 +3987,13 @@ class Internals(BaseInternals):
                 return
             new = Translation(index, dim)
         try:
-            self.internals['translations'].remove(new)
+            idx = self.internals['translations'].index(new)
         except ValueError:
             pass
+        else:
+            self.internals['translations'].pop(idx)
+            self._active['translations'].pop(idx)
+            self._invalidate_structure()
         if new not in self.forbidden['translations']:
             self.forbidden['translations'].append(new)
 
@@ -3234,9 +4016,14 @@ class Internals(BaseInternals):
             ncvecs = self._get_ncvecs(indices, ncvecs, mic)
             new = kind(indices, ncvecs=ncvecs)
         try:
-            self.forbidden[name].remove(new)
+            idx = self.internals[name].index(new)
         except ValueError:
             pass
+        else:
+            removed = self.internals[name].pop(idx)
+            self._active[name].pop(idx)
+            self._internals_set[name].discard(self._internal_key(removed))
+            self._invalidate_structure()
         if new not in self.forbidden[name]:
             self.forbidden[name].append(new)
 
@@ -3257,6 +4044,83 @@ class Internals(BaseInternals):
                 labels[j] = label
                 Internals.flood_fill(j, nbonds, c10y, labels, label)
 
+    @staticmethod
+    def _component_labels(labels, natoms):
+        comp = labels.copy()
+        next_label = int(comp.max()) + 1 if comp.size else 0
+        for atom in range(natoms):
+            if comp[atom] < 0:
+                comp[atom] = next_label
+                next_label += 1
+        return comp, next_label
+
+    @staticmethod
+    def _component_pair_key(comp_a, comp_b):
+        return frozenset((int(comp_a), int(comp_b)))
+
+    @staticmethod
+    def _record_link(links, have, a, b, ts):
+        pair = (min(a, b), max(a, b))
+        if pair in have:
+            return False
+        links.append((a, b, ts))
+        have.add(pair)
+        return True
+
+    def _ensure_reduced_cell_cache(self):
+        if self.cell is not None and np.allclose(self.cell, self.atoms.cell):
+            return
+        self.cell = self.atoms.cell.array.copy()
+        rcell, self.op = minkowski_reduce(
+            complete_cell(self.cell), pbc=self.atoms.pbc
+        )
+        self.rcell = Cell(rcell)
+        self._rcell_reciprocal_T = self.rcell.reciprocal().T
+
+    def _periodic_pair_chunk_size(self, n_images):
+        # Per pair-image, the peak contains integer translations, Cartesian
+        # translations, the displaced vectors used by norm(), and distances.
+        # Use a deliberately conservative estimate to keep real peaks bounded.
+        bytes_per_pair_image = (
+            3 * np.dtype(np.int32).itemsize
+            + 7 * np.dtype(np.float64).itemsize
+        )
+        bytes_per_pair = max(1, n_images * bytes_per_pair_image)
+        return max(1, PERIODIC_PAIR_CHUNK_BYTES // bytes_per_pair)
+
+    def _iter_periodic_pair_distances(self, ii, jj):
+        self._ensure_reduced_cell_cache()
+
+        ranges = [np.arange(-1 * p, p + 1) for p in self.atoms.pbc]
+        base_ts = np.array(list(product(*ranges)), dtype=np.int32)
+        chunk_size = self._periodic_pair_chunk_size(len(base_ts))
+        positions = self.atoms.positions
+        cell = self.atoms.cell.array
+
+        for start in range(0, len(ii), chunk_size):
+            stop = min(start + chunk_size, len(ii))
+            dx = positions[jj[start:stop]] - positions[ii[start:stop]]
+            dx_sc = dx @ self._rcell_reciprocal_T
+
+            offset = np.zeros(dx_sc.shape, dtype=np.int32)
+            for _ in range(2):
+                offset += (
+                    self.atoms.pbc * ((dx_sc - offset) // 1.)
+                ).astype(np.int32)
+
+            translations = (base_ts[None, :, :] - offset[:, None, :]) @ self.op
+            tvecs_cart = translations @ cell
+            dists = np.linalg.norm(dx[:, None, :] + tvecs_cart, axis=2)
+            yield start, stop, dists, translations
+
+    def _periodic_pair_distances(self, ii, jj):
+        chunks = list(self._iter_periodic_pair_distances(ii, jj))
+        if not chunks:
+            return np.empty((0, 0)), np.empty((0, 0, 3), dtype=np.int32)
+        dists = np.concatenate([chunk[2] for chunk in chunks])
+        translations = np.concatenate([chunk[3] for chunk in chunks])
+        return dists, translations
+
     def _find_bonds_vectorized(self, labels, scale, rcov):
         """Vectorized bond search across all candidate atom pairs.
 
@@ -3264,72 +4128,146 @@ class Internals(BaseInternals):
         distance threshold, where ts is the integer translation vector.
         """
         natoms = self.natoms
-        pos = self.atoms.positions
-        cell = self.atoms.cell.array
-        pbc = self.atoms.pbc
 
-        # Ensure cell/rcell/op are cached
-        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
-            self.cell = self.atoms.cell.array.copy()
-            rcell, self.op = minkowski_reduce(
-                complete_cell(self.cell), pbc=pbc
-            )
-            self.rcell = Cell(rcell)
-            self._rcell_reciprocal_T = self.rcell.reciprocal().T
-
-        # 1. Generate all candidate pairs (i <= j)
         ii, jj = np.triu_indices(natoms, k=0)
-        # Skip pairs in the same labeled fragment
         same_frag = (labels[ii] == labels[jj]) & (labels[ii] != -1)
         keep = ~same_frag
         ii, jj = ii[keep], jj[keep]
-
         if len(ii) == 0:
             return []
 
-        # 2. All pairwise displacements
-        dx = pos[jj] - pos[ii]  # (n_pairs, 3)
-
-        # 3. Pair-dependent offsets (vectorized _get_neighbors logic)
-        dx_sc = dx @ self._rcell_reciprocal_T
-        offset = np.zeros(dx_sc.shape, dtype=np.int32)
-        for _ in range(2):
-            offset += (pbc * ((dx_sc - offset) // 1.)).astype(np.int32)
-
-        # 4. Base translation vectors from PBC dimensions
-        ranges = [np.arange(-1 * p, p + 1) for p in pbc]
-        base_ts = np.array(
-            list(product(*ranges)), dtype=np.int32
-        )  # (n_ts, 3)
-
-        # 5. Shifted translations and Cartesian vectors
-        shifted = base_ts[None, :, :] - offset[:, None, :]  # (n_pairs, n_ts, 3)
-        tvecs_cart = (shifted @ self.op) @ cell  # (n_pairs, n_ts, 3)
-
-        # 6. Distances
-        dists = np.linalg.norm(
-            dx[:, None, :] + tvecs_cart, axis=2
-        )  # (n_pairs, n_ts)
-
-        # 7. Covalent radius threshold
-        thresholds = scale * (rcov[ii] + rcov[jj])
-        bond_mask = dists <= thresholds[:, None]
-
-        # 8. Exclude self-bonds (i==j) with zero translation
-        self_bond = (ii == jj)
-        zero_ts = np.all(shifted @ self.op == 0, axis=2)
-        bond_mask &= ~(self_bond[:, None] & zero_ts)
-
-        # 9. Collect hits
-        pair_idx, ts_idx = np.nonzero(bond_mask)
-        op = self.op
         results = []
-        for k in range(len(pair_idx)):
-            p = pair_idx[k]
-            t = ts_idx[k]
-            ts = (shifted[p, t] @ op).astype(np.int32)
-            results.append((int(ii[p]), int(jj[p]), ts))
+        for start, stop, dists, translations in (
+            self._iter_periodic_pair_distances(ii, jj)
+        ):
+            ii_chunk = ii[start:stop]
+            jj_chunk = jj[start:stop]
+            thresholds = scale * (rcov[ii_chunk] + rcov[jj_chunk])
+            bond_mask = dists <= thresholds[:, None]
+
+            self_bond = (ii_chunk == jj_chunk)
+            zero_ts = np.all(translations == 0, axis=2)
+            bond_mask &= ~(self_bond[:, None] & zero_ts)
+
+            pair_idx, ts_idx = np.nonzero(bond_mask)
+            for k in range(len(pair_idx)):
+                p = pair_idx[k]
+                t = ts_idx[k]
+                ts = translations[p, t].astype(np.int32)
+                results.append((int(ii_chunk[p]), int(jj_chunk[p]), ts))
         return results
+
+    def _mst_welding_bonds(self, labels):
+        """Connect disconnected fragments with a minimum-spanning-tree of the
+        shortest inter-fragment atom contacts.
+
+        Returns a list of ``(i, j, ts)`` links (``ts`` = integer cell
+        translation) that merge all fragments into one connected graph, adding
+        exactly ``n_components - 1`` bonds -- each the shortest contact joining
+        two still-separate components.
+
+        This replaces the old "inflate the covalent-radius multiplier until the
+        graph connects" welding, which grew the cutoff to ~2-3x and then added
+        *every* inter-fragment pair under it -- manufacturing grossly stretched
+        (4-6 A) and transannular bonds.  Shortest-first linking never prefers a
+        transannular contact over the genuine short link, and adds only the
+        minimal set needed for a complete internal-coordinate system.
+
+        ``labels`` follows the ``find_all_bonds`` convention: ``>= 0`` is a
+        fragment id and ``-1`` marks a lone (unbonded) atom, treated here as its
+        own singleton component.
+        """
+        comp, next_label = self._component_labels(labels, self.natoms)
+        n_components = len({int(c) for c in comp})
+
+        ii, jj = np.triu_indices(self.natoms, k=1)
+        keep = comp[ii] != comp[jj]
+        ii, jj = ii[keep], jj[keep]
+        if len(ii) == 0:
+            return []
+
+        best_dist = np.empty(len(ii), dtype=np.float64)
+        best_ts = np.empty((len(ii), 3), dtype=np.int32)
+        for start, stop, dists, translations in (
+            self._iter_periodic_pair_distances(ii, jj)
+        ):
+            best = dists.argmin(axis=1)
+            rows = np.arange(stop - start)
+            best_dist[start:stop] = dists[rows, best]
+            best_ts[start:stop] = translations[rows, best].astype(np.int32)
+
+        # Connect components. A bare minimum-spanning *tree* is minimal but
+        # biased: it under-determines extended contact interfaces (one weld
+        # where several comparable contacts exist), turns a ring of fragments
+        # into a chain (C- not O-shaped), and breaks symmetry on exact distance
+        # ties (tie-broken by atom index -> not permutation invariant). The
+        # optional augmentation pass first adds *all* physically-plausible
+        # near-minimum contacts per interface (redundant internals, which Sella
+        # handles via the pseudoinverse) to close rings and symmetrize; the MST
+        # pass then guarantees connectivity for whatever is still separate. The
+        # physical gate (<= `_weld_gate` x sum of covalent radii) ensures
+        # genuinely-separated fragments still get only a single minimal weld, so
+        # we never re-introduce the stretched/transannular bonds MST replaced.
+        order = np.argsort(best_dist, kind='stable')
+        links = []
+        have = set()
+        weld_set = _DisjointSet(next_label, n_components)
+
+        if self._weld_augment:
+            tol = self._weld_tol
+            gate = self._weld_gate
+            # Connection scale: the largest edge in a minimum spanning tree over
+            # the raw components -- the smallest possible "max contact distance"
+            # that connects everything, i.e. exactly where the old flooding
+            # welding stopped inflating its cutoff. Augmenting up to this scale
+            # (and never beyond) restores flooding's redundant-but-bounded
+            # contact set: it can never add a contact LONGER than the
+            # unavoidable minimal weld, yet it recovers the extra near-min
+            # contacts a bare tree drops. This is geometry-adaptive, so it
+            # handles weakly-bonded / large-vdW fragments (e.g. noble-gas
+            # clusters) whose real contacts sit far outside a covalent-radius
+            # gate, without loosening that gate for tightly-bonded organics.
+            raw_set = _DisjointSet(next_label, n_components)
+            dmst_max = 0.0
+            for k in order:
+                if raw_set.n_active == 1:
+                    break
+                if raw_set.union(int(comp[ii[k]]), int(comp[jj[k]])):
+                    if best_dist[k] > dmst_max:
+                        dmst_max = best_dist[k]
+
+            # Shortest contact per component-pair (order is sorted, so the first
+            # time a pair is seen is its minimum).
+            pair_min = {}
+            for k in order:
+                key = self._component_pair_key(comp[ii[k]], comp[jj[k]])
+                if key not in pair_min:
+                    pair_min[key] = best_dist[k]
+
+            for k in order:
+                a, b = int(ii[k]), int(jj[k])
+                dmin = pair_min[self._component_pair_key(comp[a], comp[b])]
+                rcov_sum = (covalent_radii[self.atoms.numbers[a]]
+                            + covalent_radii[self.atoms.numbers[b]])
+                # Near this interface's own minimum (never a transannular
+                # contact within a tight interface) AND within either the
+                # covalent gate or the geometry-adaptive connection scale.
+                if best_dist[k] <= dmin * (1. + tol) and (
+                    best_dist[k] <= gate * rcov_sum
+                    or best_dist[k] <= dmst_max * (1. + tol)
+                ):
+                    self._record_link(links, have, a, b, best_ts[k])
+                    weld_set.union(int(comp[a]), int(comp[b]))
+
+        # MST pass: add the shortest contact that still merges two separate
+        # components until the whole graph is connected.
+        for k in order:
+            if weld_set.n_active == 1:
+                break
+            a, b = int(ii[k]), int(jj[k])
+            if weld_set.union(int(comp[a]), int(comp[b])):
+                self._record_link(links, have, a, b, best_ts[k])
+        return links
 
     def _wrap_fragment_positions(self, group, cumshifts):
         """Shift atom positions so fragment atoms are contiguous across PBC.
@@ -3363,6 +4301,153 @@ class Internals(BaseInternals):
                 self.atoms.positions[j] += cumshifts[j] @ cell
                 queue.append(j)
 
+    def _remap_ncvecs_after_fragment_shifts(self, cumshifts):
+        """Keep periodic internal coordinates consistent after unwrapping.
+
+        Fragment unwrapping changes absolute Cartesian positions by integer
+        cell vectors. Every stored ncvec between consecutive atoms must be
+        shifted by the corresponding endpoint image changes so the represented
+        physical bond/angle/dihedral is unchanged.
+        """
+        zero = np.zeros(3, dtype=np.int32)
+        seen = set()
+        changed_names = set()
+
+        for name in ('bonds', 'angles', 'dihedrals'):
+            for collection in (self.internals[name], self.forbidden[name]):
+                for coord in collection:
+                    if id(coord) in seen:
+                        continue
+                    seen.add(id(coord))
+
+                    old = coord.kwargs['ncvecs']
+                    new = np.asarray(old, dtype=np.int32).copy()
+                    changed = False
+                    for k in range(len(new)):
+                        i = int(coord.indices[k])
+                        j = int(coord.indices[k + 1])
+                        shift_i = cumshifts.get(i, zero)
+                        shift_j = cumshifts.get(j, zero)
+                        if np.any(shift_i != 0) or np.any(shift_j != 0):
+                            new[k] = old[k] - shift_j + shift_i
+                            changed = True
+                    if changed and not np.array_equal(new, old):
+                        coord.kwargs['ncvecs'] = new
+                        changed_names.add(name)
+
+        for name in changed_names:
+            self._internals_set[name] = {
+                self._internal_key(coord) for coord in self.internals[name]
+            }
+        if changed_names:
+            self._invalidate_structure()
+            self.cons._invalidate_structure()
+
+    def _initial_bond_adjacency(self, max_bonds):
+        nbonds = np.zeros(self.natoms, dtype=np.int32)
+        c10y = -np.ones((self.natoms, max_bonds), dtype=np.int32)
+        for bond in self.internals['bonds']:
+            i, j = bond.indices
+            if i >= self.natoms or j >= self.natoms:
+                continue
+            c10y[i, nbonds[i]] = j
+            nbonds[i] += 1
+            c10y[j, nbonds[j]] = i
+            nbonds[j] += 1
+        return nbonds, c10y
+
+    def _connected_fragment_labels(self, nbonds, c10y, labels):
+        labels[:] = -1
+        nlabels = 0
+        for i in range(self.natoms):
+            if labels[i] == -1:
+                labels[i] = nlabels
+                self.flood_fill(i, nbonds, c10y, labels, nlabels)
+                nlabels += 1
+        return nlabels
+
+    def _add_bond_candidates(self, candidates, nbonds, c10y, max_bonds):
+        for i, j, ts in candidates:
+            if not self._ignore_duplicate(self.add_bond, (i, j), ts):
+                continue
+            if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
+                c10y[i, nbonds[i]] = j
+                nbonds[i] += 1
+                c10y[j, nbonds[j]] = i
+                nbonds[j] += 1
+
+    def _add_disconnected_fragment_coords(self, labels, nlabels):
+        assert nlabels > 1
+        groups = [[] for _ in range(nlabels)]
+        singletons = []
+        for i, label in enumerate(labels):
+            if label == -1:
+                self._add_fragment_coords([i], with_rotation=False)
+                singletons.append(i)
+            else:
+                groups[label].append(i)
+
+        cumshifts = {}
+        self.fragment_atom_groups = []
+        for group in groups:
+            if not group:
+                continue
+            self._wrap_fragment_positions(group, cumshifts)
+            self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
+            self._add_fragment_coords(group)
+
+        for i in singletons:
+            self.fragment_atom_groups.append(np.array([i], dtype=np.int32))
+        return cumshifts
+
+    def _add_single_fragment_pbc_coords(self):
+        group = list(range(self.natoms))
+        cumshifts = {}
+        self._wrap_fragment_positions(group, cumshifts)
+        self.fragment_atom_groups = [np.array(group, dtype=np.int32)]
+        self._add_fragment_coords(group)
+        return cumshifts
+
+    def _add_improper_dihedral_for_linear_angle(self, j, jbonds, b1, b2):
+        for b3 in jbonds:
+            if b3 in (b1, b2):
+                continue
+
+            ordered = (
+                (int(b1.indices[1]), b1.kwargs['ncvecs'][0]),
+                (int(b3.indices[1]), b3.kwargs['ncvecs'][0]),
+                (int(b2.indices[1]), b2.kwargs['ncvecs'][0]),
+            )
+            if not self._improper_dihedral_well_defined(j, ordered):
+                continue
+
+            indices = (b1.indices[1], j, b3.indices[1], b2.indices[1])
+            ncvecs = (
+                -b1.kwargs['ncvecs'][0],
+                b3.kwargs['ncvecs'][0],
+                b2.kwargs['ncvecs'][0] - b3.kwargs['ncvecs'][0]
+            )
+            self._ignore_duplicate(self.add_dihedral, indices, ncvecs)
+            return True
+        return False
+
+    def _add_linear_angle_replacements(self, j, jbonds, linear):
+        if len(jbonds) == 2:
+            self._add_linear_bend_dummy(j, jbonds, *jbonds)
+            return
+
+        dummy_added = False
+        for b1, b2 in linear:
+            if self._add_improper_dihedral_for_linear_angle(j, jbonds, b1, b2):
+                continue
+
+            # No existing third bond gives two well-defined dihedral planes.
+            # Fall back to the dummy linear bend machinery instead of adding an
+            # undefined improper with NaN derivatives.
+            if not dummy_added:
+                self._add_linear_bend_dummy(j, jbonds, b1, b2)
+                dummy_added = True
+
     def find_all_bonds(
         self,
         nbond_cart_thr: int = 6,
@@ -3370,30 +4455,12 @@ class Internals(BaseInternals):
         scale: float = 1.25,
     ) -> None:
         rcov = covalent_radii[self.atoms.numbers]
-        nbonds = np.zeros(self.natoms, dtype=np.int32)
+        nbonds, c10y = self._initial_bond_adjacency(max_bonds)
         labels = -np.ones(self.natoms, dtype=np.int32)
-        c10y = -np.ones((self.natoms, max_bonds), dtype=np.int32)
-
-        for bond in self.internals['bonds']:
-            i, j = bond.indices
-            c10y[i, nbonds[i]] = j
-            nbonds[i] += 1
-            c10y[j, nbonds[j]] = i
-            nbonds[j] += 1
 
         first_run = True
         while True:
-            # use flood fill algorithm to count the number of disconnected
-            # fragments
-            nlabels = 0
-            labels[:] = -1
-            for i in range(self.natoms):
-                if labels[i] == -1:
-                    labels[i] = nlabels
-                    self.flood_fill(i, nbonds, c10y, labels, nlabels)
-                    nlabels += 1
-            # if there is only one fragment, then the internal coordinates
-            # are complete, and we can stop
+            nlabels = self._connected_fragment_labels(nbonds, c10y, labels)
             if nlabels == 1:
                 break
 
@@ -3406,53 +4473,36 @@ class Internals(BaseInternals):
             if self.allow_fragments and not first_run:
                 break
 
-            candidates = self._find_bonds_vectorized(
-                labels, scale, rcov
-            )
-            for i, j, ts in candidates:
-                try:
-                    self.add_bond((i, j), ts)
-                except DuplicateInternalError:
-                    continue
-                if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
-                    c10y[i, nbonds[i]] = j
-                    nbonds[i] += 1
-                    c10y[j, nbonds[j]] = i
-                    nbonds[j] += 1
-            first_run = False
-            scale *= 1.05
+            if first_run:
+                candidates = self._find_bonds_vectorized(labels, scale, rcov)
+                first_run = False
+                weld_pass = False
+            else:
+                # Fragments remain and allow_fragments is False: weld them with
+                # a minimum-spanning-tree of the shortest inter-fragment
+                # contacts, rather than inflating the covalent-radius multiplier
+                # (which manufactures stretched/transannular bonds). This single
+                # pass connects every component.
+                candidates = self._mst_welding_bonds(labels)
+                weld_pass = True
+
+            self._add_bond_candidates(candidates, nbonds, c10y, max_bonds)
+            if weld_pass:
+                # MST spans all components in one pass; connectivity is
+                # guaranteed by construction, so we are done welding.
+                break
 
         if self.allow_fragments and nlabels != 1:
-            assert nlabels > 1
-            groups = [[] for _ in range(nlabels)]
-            for i, label in enumerate(labels):
-                if label == -1:
-                    # A lone atom not bonded to anything else
-                    self.add_translation(i)
-                else:
-                    groups[label].append(i)
+            cumshifts = self._add_disconnected_fragment_coords(labels, nlabels)
+        elif (self.allow_fragments and nlabels == 1
+              and np.any(self.atoms.pbc)
+              and len(self.internals['bonds']) > 0):
+            cumshifts = self._add_single_fragment_pbc_coords()
+        else:
             cumshifts = {}
-            self.fragment_atom_groups = []
-            for group in groups:
-                if not group:
-                    continue
-                self._wrap_fragment_positions(group, cumshifts)
-                self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
-                self.add_translation(group)
-                if len(group) >= 2:
-                    self.add_rotation(group)
 
-            # Update bond ncvecs to match the new wrapped positions.
-            # ncvec_new = ncvec_old - cumshift[j] + cumshift[i]
-            zero = np.zeros(3, dtype=int)
-            for bond in self.internals['bonds']:
-                i, j = bond.indices
-                shift_i = cumshifts.get(i, zero)
-                shift_j = cumshifts.get(j, zero)
-                if np.any(shift_i != 0) or np.any(shift_j != 0):
-                    bond.kwargs['ncvecs'] = np.array(
-                        [bond.kwargs['ncvecs'][0] - shift_j + shift_i]
-                    )
+        if cumshifts:
+            self._remap_ncvecs_after_fragment_shifts(cumshifts)
 
     def find_all_angles(
         self,
@@ -3460,129 +4510,119 @@ class Internals(BaseInternals):
         bonds = [[] for _ in range(self.natoms)]
         for bond in self.internals['bonds']:
             i, j = bond.indices
-            if i < self.natoms:
-                bonds[i].append(bond)
-            if j < self.natoms:
-                bonds[j].append(bond.reverse())
+            if i >= self.natoms or j >= self.natoms:
+                continue
+            bonds[i].append(bond)
+            bonds[j].append(bond.reverse())
 
         for j, jbonds in enumerate(bonds):
             linear = []
             for b1, b2 in combinations(jbonds, 2):
-                new = b1 + b2
-                assert new.indices[1] == j, new.indices
+                new = Angle(
+                    (b1.indices[1], j, b2.indices[1]),
+                    (-b1.kwargs['ncvecs'][0], b2.kwargs['ncvecs'][0]),
+                )
+                # Angles inside the linear window are kept as ordinary bends;
+                # near-linear ones get dummy/dihedral treatment.
                 if self.atol < new.calc(self.atoms) < np.pi - self.atol:
-                    try:
-                        self.add_angle(new)
-                    except DuplicateInternalError:
-                        pass
+                    self._ignore_duplicate(self.add_angle, new)
                 else:
                     self.forbid_angle(new)
                     linear.append((b1, b2))
             if linear:
-                if len(jbonds) == 2:
-                    # Add a dummy atom to an atom center with only 2 bonds
-                    # sort bonds from shortest to longest to ensure
-                    # permutational invariance
-                    b1, b2 = sorted(jbonds, key=lambda x: x.calc(self.atoms))
-                    # First try to take the cross product of the two bond
-                    # vectors. These two vectors are close to collinear, and
-                    # may be exactly collinear, so there's a backup strategy
-                    # if this results in the zero-vector.
-                    if self.dinds[j] < 0:
-                        self.dinds[j] = self.natoms + self.ndummies
-                        dx1 = -b1.calc_vec(self.atoms)
-                        dx1 /= np.linalg.norm(dx1)
-                        dx2 = b2.calc_vec(self.atoms)
-                        dx2 /= np.linalg.norm(dx2)
-                        dpos = np.cross(dx1, dx2)
-                        dpos_norm = np.linalg.norm(dpos)
-                        if dpos_norm < 1e-4:
-                            # the aforementioned backup strategy
-                            # pick the cartesian basis vector that is maximally
-                            # orthogonal with the shorter of the two
-                            # displacement vectors.
-                            # note: this is not rotationally invariant, but
-                            # there's not much we can do about that
-                            dim = np.argmin(np.abs(dx1))
-                            dpos[:] = 0.
-                            dpos[dim] = 1.
-                            dpos -= dx1 * (dpos @ dx1)
-                            dpos /= np.linalg.norm(dpos)
-                        else:
-                            dpos /= dpos_norm
-                        # Add the dummy atom
-                        dpos += self.atoms.positions[j]
-                        self.dummies += Atom('X', dpos)
-                        self._batched_arrays_valid = False
-                        self._cache.pop('all_positions', None)
-                    # Create and fix dummy bond
-                    dbond = Bond((j, self.dinds[j]))
-                    self.cons.fix_bond(dbond, replace_ok=False)
-                    self.add_bond(dbond)
-                    # Fix one dummy angle (only one — for linear O1-C-O2
-                    # the angles O1-C-dummy and O2-C-dummy are supplementary,
-                    # so constraining both over-constrains real atoms)
-                    dangle1 = b1 + dbond
-                    self.cons.fix_angle(dangle1, replace_ok=False)
-                    dangle2 = b2 + dbond
-                    # Fix the improper dihedral and update relevant internals
-                    if b2.indices[1] == j:
-                        b2 = b2.reverse()
-                    dbond2 = Bond(
-                        (self.dinds[j], b2.indices[1]), b2.kwargs['ncvecs']
-                    )
-                    dangle3 = dbond + dbond2
-                    ddihedral = dangle1 + dangle3
-                    self.add_dihedral(ddihedral)
-                    self.add_dummy_to_internals(j)
-                    self.cons.add_dummy_to_internals(j)
-                    # Add relevant angles
-                    for b1 in jbonds:
-                        new = b1 + dbond
-                        assert new.indices[1] == j
-                        angle = new.calc(self.all_atoms)
-                        if self.atol < angle < np.pi - self.atol:
-                            try:
-                                self.add_angle(new)
-                            except DuplicateInternalError:
-                                pass
-                        else:
-                            self.forbid_angle(new)
-                else:
-                    for b1, b2 in linear:
-                        for b3 in jbonds:
-                            if b3 in (b1, b2):
-                                continue
-                            indices = (
-                                b1.indices[1], j, b3.indices[1], b2.indices[1]
-                            )
-                            ncvecs = (
-                                -b1.kwargs['ncvecs'][0],
-                                b3.kwargs['ncvecs'][0],
-                                b2.kwargs['ncvecs'][0] - b3.kwargs['ncvecs'][0]
-                            )
-                            try:
-                                self.add_dihedral(indices, ncvecs)
-                            except DuplicateInternalError:
-                                pass
-                            break
-                        else:
-                            raise RuntimeError(
-                                "Unable to find improper dihedral to replace "
-                                "linear angle!"
-                            )
+                self._add_linear_angle_replacements(j, jbonds, linear)
 
-    def find_all_dihedrals(self) -> None:
-        # First, find proper dihedrals from angle combinations.
-        # Group angles by their bond edges so we only try pairs that
-        # share a bond (required for __add__ to succeed).
+    def _add_linear_bend_dummy(self, j, jbonds, b1, b2):
+        """Add the dummy-coordinate representation for a linear bend."""
+        # Sort the defining bonds from shortest to longest to keep the dummy
+        # orientation deterministic when both sides are equivalent.
+        b1, b2 = sorted((b1, b2), key=lambda x: x.calc(self.atoms))
+        if self.dinds[j] < 0:
+            self.dinds[j] = self.natoms + self.ndummies
+            dx1 = -b1.calc_vec(self.atoms)
+            dx1 /= np.linalg.norm(dx1)
+            dx2 = b2.calc_vec(self.atoms)
+            dx2 /= np.linalg.norm(dx2)
+            dpos = np.cross(dx1, dx2)
+            dpos_norm = np.linalg.norm(dpos)
+            if dpos_norm < 1e-4:
+                # Pick the cartesian basis vector that is maximally orthogonal
+                # with the shorter of the two displacement vectors.
+                dim = np.argmin(np.abs(dx1))
+                dpos[:] = 0.
+                dpos[dim] = 1.
+                dpos -= dx1 * (dpos @ dx1)
+                dpos /= np.linalg.norm(dpos)
+            else:
+                dpos /= dpos_norm
+            self.dummies += Atom('X', self.atoms.positions[j] + dpos)
+            self._invalidate_structure()
+
+        dbond = Bond((j, self.dinds[j]))
+        self._ignore_duplicate(self.cons.fix_bond, dbond, replace_ok=False)
+        self._ignore_duplicate(self.add_bond, dbond)
+
+        # Fix one dummy angle. For linear O1-C-O2, the two dummy angles are
+        # supplementary, so constraining both over-constrains real atoms.
+        dangle1 = b1 + dbond
+        self._ignore_duplicate(self.cons.fix_angle, dangle1, replace_ok=False)
+
+        if b2.indices[1] == j:
+            b2 = b2.reverse()
+        dbond2 = Bond(
+            (self.dinds[j], b2.indices[1]), b2.kwargs['ncvecs']
+        )
+        dangle3 = dbond + dbond2
+        self._ignore_duplicate(self.add_dihedral, dangle1 + dangle3)
+        self.add_dummy_to_internals(j)
+        self.cons.add_dummy_to_internals(j)
+
+        for bond in jbonds:
+            new = bond + dbond
+            assert new.indices[1] == j
+            angle = new.calc(self.all_atoms)
+            if self.atol < angle < np.pi - self.atol:
+                self._ignore_duplicate(self.add_angle, new)
+            else:
+                self.forbid_angle(new)
+
+    def _angles_by_bond_edge(self):
+        """Group angles by bond edge so only edge-sharing pairs are combined.
+
+        Proper dihedrals are formed from two angles that share a central bond;
+        ``Angle.__add__`` only succeeds for those pairs. Grouping keeps the loop
+        focused on valid candidates instead of trying every angle pair.
+        """
         edge_to_angles = {}
         for angle in self.internals['angles']:
             i, j, k = angle.indices
             for edge_key in ((min(i, j), max(i, j)), (min(j, k), max(j, k))):
                 edge_to_angles.setdefault(edge_key, []).append(angle)
+        return edge_to_angles
 
+    @staticmethod
+    def _dihedral_is_self_loop(dihedral):
+        """True when the first and last atom are the same exact periodic image."""
+        return (
+            dihedral.indices[0] == dihedral.indices[3]
+            and np.all(
+                np.sum(dihedral.kwargs['ncvecs'], axis=0)
+                == np.array((0, 0, 0))
+            )
+        )
+
+    def _add_proper_dihedrals(self):
+        """Add proper dihedrals and return the atoms they pass through."""
+        edge_to_angles = self._angles_by_bond_edge()
         seen_pairs = set()
+        centers = set()
+        active_keys = {
+            self._internal_key(dihedral)
+            for dihedral, active in zip(
+                self.internals['dihedrals'], self._active['dihedrals']
+            )
+            if active
+        }
         for angles_on_edge in edge_to_angles.values():
             for a1, a2 in combinations(angles_on_edge, 2):
                 pair_key = (id(a1), id(a2))
@@ -3593,44 +4633,18 @@ class Internals(BaseInternals):
                     new = a1 + a2
                 except NoValidInternalError:
                     continue
-                # this is a dihedral that has the same exact atom as both
-                # the first and last atom.
-                if (
-                    new.indices[0] == new.indices[3]
-                    and np.all(
-                        np.sum(new.kwargs['ncvecs'], axis=0)
-                        == np.array((0, 0, 0))
-                    )
-                ):
+                if self._dihedral_is_self_loop(new):
                     continue
-                try:
-                    self.add_dihedral(new)
-                except DuplicateInternalError:
-                    continue
+                key = self._internal_key(new)
+                if self._ignore_duplicate(self.add_dihedral, new):
+                    active_keys.add(key)
+                if key in active_keys:
+                    centers.add(int(new.indices[1]))
+                    centers.add(int(new.indices[2]))
+        return centers
 
-        # Second, add improper dihedrals for atoms with 3 or 4 neighbors that don't
-        # have any proper dihedral passing through them. This is needed because:
-        # 1. At planar geometries, bond/angle derivatives vanish for out-of-plane motion
-        # 2. Even starting non-planar, the geometry may planarize during optimization
-        # 3. Improper dihedrals capture the out-of-plane (umbrella) mode
-
-
-        # Note this does add some redundancy to the internals but it also makes it
-        # so that the Jacobian is well-conditioned in the case of planar systems,
-        # such as nitrate.
-        #
-        # We only add impropers when no proper dihedral exists through the atom,
-        # which avoids excessive unnecessary additional internals.
-
-        # First, find which atoms have proper dihedrals through them
-        dihedral_centers = set()
-        for d, a in zip(self.internals['dihedrals'], self._active['dihedrals']):
-            if a:
-                # Positions 1 and 2 are the "central" atoms of a dihedral
-                dihedral_centers.add(int(d.indices[1]))
-                dihedral_centers.add(int(d.indices[2]))
-
-        # Build neighbor list
+    def _bond_neighbor_list(self):
+        """Build per-atom bond neighbors with ncvecs pointing away from center."""
         neighbors = [[] for _ in range(self.natoms)]
         for bond in self.internals['bonds']:
             i, j = bond.indices
@@ -3638,37 +4652,177 @@ class Internals(BaseInternals):
                 neighbors[i].append((int(j), bond.kwargs['ncvecs'][0]))
             if j < self.natoms:
                 neighbors[j].append((int(i), -bond.kwargs['ncvecs'][0]))
+        return neighbors
 
-        for center in range(self.natoms):
-            # Consider atoms with 3 or 4 neighbors that lack proper dihedrals.
-            # - 3 neighbors: at planar geometries (e.g., NO3, sp2 carbons), the
-            #   3 angles sum to 360°, creating linear dependency.
-            # - 4 neighbors: at square planar geometries (e.g., Pt(II)), the
-            #   4 cis angles sum to 360°, similar issue. For tetrahedral, the
-            #   improper is redundant but harmless (pseudo-inverse handles it).
-            # - 5+ neighbors: rare, and typically have proper dihedrals anyway.
-            if len(neighbors[center]) not in (3, 4):
+    @staticmethod
+    def _improper_dihedral_args(center, ordered_neighbors):
+        """Return improper dihedral indices and ncvecs for one neighbor order."""
+        n0, n1, n2 = ordered_neighbors
+        i0, ncvec0 = n0
+        i1, ncvec1 = n1
+        i2, ncvec2 = n2
+        # Improper dihedral indices: (i0, center, i1, i2).
+        # The ncvecs connect consecutive atoms in the dihedral.
+        return (
+            (i0, center, i1, i2),
+            (-ncvec0, ncvec1, ncvec2 - ncvec1),
+        )
+
+    @staticmethod
+    def _neighbor_key(neighbor):
+        atom, ncvec = neighbor
+        return int(atom), tuple(int(x) for x in ncvec)
+
+    def _existing_improper_triples(self, center, center_neighbors):
+        """Return neighbor triples already used by impropers at ``center``."""
+        neighbor_keys = {
+            self._neighbor_key(neighbor) for neighbor in center_neighbors
+        }
+        triples = set()
+        for dihedral, active in zip(
+            self.internals['dihedrals'], self._active['dihedrals']
+        ):
+            if not active:
                 continue
 
-            # Skip if this atom already has proper dihedrals through it
-            if center in dihedral_centers:
-                continue
+            offsets = np.vstack((
+                np.zeros(3, dtype=np.int32),
+                np.cumsum(dihedral.kwargs['ncvecs'], axis=0),
+            ))
+            for center_pos in (1, 2):
+                if dihedral.indices[center_pos] != center:
+                    continue
+                keys = []
+                for pos, atom in enumerate(dihedral.indices):
+                    if pos == center_pos:
+                        continue
+                    keys.append((
+                        int(atom),
+                        tuple(int(x) for x in (
+                            offsets[pos] - offsets[center_pos]
+                        )),
+                    ))
+                triple = frozenset(keys)
+                if len(triple) == 3 and triple <= neighbor_keys:
+                    triples.add(triple)
+        return triples
 
-            # Add improper dihedral: neighbors[0]-center-neighbors[1]-neighbors[2]
-            n0, ncvec0 = neighbors[center][0]
-            n1, ncvec1 = neighbors[center][1]
-            n2, ncvec2 = neighbors[center][2]
-            # Improper dihedral indices: (n0, center, n1, n2)
-            # The ncvecs connect consecutive atoms in the dihedral
-            imp_ncvecs = (
-                -ncvec0,  # from n0 to center
-                ncvec1,   # from center to n1
-                ncvec2 - ncvec1,  # from n1 to n2
+    def _ordered_improper_neighbors(self, center, triple):
+        """Choose a numerically valid ordering for one topology-defined triple."""
+        for ordered in permutations(triple):
+            if not self._improper_dihedral_well_defined(center, ordered):
+                continue
+            return ordered
+        return None
+
+    def _improper_fan(self, center, center_neighbors, existing):
+        """Build a minimal ``degree - 2`` fan of local neighbor triples."""
+        pair_scores = {}
+        for triple in existing:
+            for pair in combinations(triple, 2):
+                pair = frozenset(pair)
+                pair_scores[pair] = pair_scores.get(pair, 0) + 1
+
+        anchor_pairs = list(combinations(range(len(center_neighbors)), 2))
+        anchor_pairs.sort(
+            key=lambda anchors: -pair_scores.get(
+                frozenset(
+                    self._neighbor_key(center_neighbors[i]) for i in anchors
+                ),
+                0,
             )
-            try:
-                self.add_dihedral((n0, center, n1, n2), imp_ncvecs)
-            except DuplicateInternalError:
-                pass
+        )
+        for anchors in anchor_pairs:
+            fan = []
+            for other in range(len(center_neighbors)):
+                if other in anchors:
+                    continue
+                triple = tuple(
+                    center_neighbors[i] for i in (*anchors, other)
+                )
+                ordered = self._ordered_improper_neighbors(center, triple)
+                if ordered is None:
+                    break
+                key = frozenset(self._neighbor_key(n) for n in triple)
+                fan.append((key, ordered))
+            else:
+                return fan
+        return None
+
+    def _add_improper_dihedrals(self, proper_centers) -> None:
+        """Add fallback improper dihedrals for under-constrained centers.
+
+        Improper dihedrals are needed because:
+        1. At planar geometries, bond/angle derivatives vanish for
+           out-of-plane motion.
+        2. Even if the initial geometry is non-planar, it may planarize during
+           optimization.
+        3. Improper dihedrals capture the out-of-plane umbrella modes.
+
+        A degree-k planar star has k - 2 internal out-of-plane modes that bond
+        and angle derivatives cannot span. Add exactly that many impropers as
+        a fan. The count depends only on the bond graph, so a non-planar star
+        retains the coordinates it would need if it later becomes planar.
+
+        This adds some redundancy away from planarity, but keeps the Jacobian
+        well-conditioned for planar systems such as nitrate. To avoid adding
+        unnecessary coordinates, the fan is omitted when generated proper
+        dihedrals pass through the center, and existing local impropers are
+        reused when completing it. With complete angle enumeration, one
+        proper-capable incident edge generates at least k - 2 distinct proper
+        torsions, so the boolean proper-center test is sufficient here.
+        """
+        neighbors = self._bond_neighbor_list()
+        for center in range(self.natoms):
+            center_neighbors = neighbors[center]
+            if len(center_neighbors) < 3 or center in proper_centers:
+                continue
+
+            existing = self._existing_improper_triples(
+                center, center_neighbors
+            )
+            fan = self._improper_fan(center, center_neighbors, existing)
+            if fan is None:
+                continue
+            for key, ordered in fan:
+                if key in existing:
+                    continue
+                indices, ncvecs = self._improper_dihedral_args(
+                    center, ordered
+                )
+                if self._ignore_duplicate(
+                    self.add_dihedral, indices, ncvecs
+                ):
+                    existing.add(key)
+
+    def find_all_dihedrals(self) -> None:
+        """Find proper dihedrals first, then add necessary improper fallbacks."""
+        proper_centers = self._add_proper_dihedrals()
+        self._add_improper_dihedrals(proper_centers)
+
+    def _improper_dihedral_well_defined(
+        self,
+        center: int,
+        ordered_neighbors,
+        rel_tol: float = 1e-8,
+    ) -> bool:
+        """Return True if an improper-dihedral ordering has two valid planes."""
+        pos = self.all_positions
+        cell = self.atoms.cell.array
+        vecs = []
+        for neighbor, ncvec in ordered_neighbors:
+            vecs.append(pos[neighbor] - pos[center] + ncvec @ cell)
+
+        def noncollinear(a, b):
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            if denom <= 1e-12:
+                return False
+            return np.linalg.norm(np.cross(a, b)) > rel_tol * denom
+
+        return (
+            noncollinear(vecs[0], vecs[1])
+            and noncollinear(vecs[1], vecs[2])
+        )
 
     def validate_basis(self) -> None:
         jac = self.jacobian()
@@ -3698,11 +4852,111 @@ class Internals(BaseInternals):
 
         if ndeloc != ndof:
             warnings.warn(
-                f'{ndeloc} coords found! Expected {ndof}.'
+                f'Internal coordinates ({ndeloc} DOF) do not span the '
+                f'full coordinate space ({ndof} DOF). This is expected '
+                f'when using user-specified internals or constraint-only '
+                f'coordinates, but may indicate missing coordinates if '
+                f'auto-detection was used.'
             )
 
+    def _rotation_fragment_is_linear(self, indices, rel_tol=1e-3):
+        """True if a fragment's atoms are (near-)collinear.
+
+        A collinear rigid fragment has only two well-defined rotational DOF;
+        rotation about the molecular axis is a null mode, so its quaternion
+        F-matrix always has a (near-)degenerate top eigenpair. That degeneracy
+        is expected and already handled continuously by ``_stabilize_quaternion``
+        (value/branch) and by the redundant-coordinate SVD (rank), so it must
+        NOT be treated as a "bad internal" -- doing so triggers a PES rebuild
+        and geodesic abort on every step, freezing the optimizer. Compact
+        fragments keep the degeneracy guard, where a small gap signals a genuine
+        orientational ambiguity. Single-atom fragments never get a rotation
+        (see ``add_rotation`` callers, ``len(group) >= 2``) so are never checked.
+        """
+        idx = np.asarray(indices, dtype=int)
+        if len(idx) < 3:
+            return True  # a 2-atom fragment is always collinear
+        dx = self.all_positions[idx]
+        dx = dx - dx.mean(0)
+        w = np.linalg.eigvalsh(dx.T @ dx)  # ascending: w[0] <= w[1] <= w[2]
+        # Collinear iff the second-largest spatial extent is negligible relative
+        # to the largest (rank-1 gyration tensor).
+        return w[2] <= 0 or w[1] <= rel_tol * w[2]
+
+    @staticmethod
+    def _rotation_gap_is_bad(ws, threshold=0.02):
+        """True when the top quaternion F-matrix eigenpair is near-degenerate."""
+        gap = ws[-1] - ws[-2]
+        spread = ws[-1] - ws[0]
+        return spread > 0 and gap / spread < threshold
+
+    def _bad_angles(self):
+        """Return angle coordinates near 0 or pi using the padded JAX batch."""
+        self._build_batched_arrays()
+        angles = self._batched_family_arrays['angles']
+        if angles.n_actual == 0:
+            return []
+        tvecs = self._get_cached_tvecs(self.atoms.cell.array)
+        angle_pos = self.all_positions[angles.indices_padded]
+        angle_vals_padded = np.asarray(
+            _angle_value_batched(angle_pos, tvecs['angles_padded'])
+        )
+        angle_vals = angle_vals_padded[:angles.n_actual]
+        bad_mask = ~((self.atol < angle_vals)
+                     & (angle_vals < np.pi - self.atol))
+        return [self.internals['angles'][idx] for idx in np.where(bad_mask)[0]]
+
+    def _bad_rotation_from_cached_eigh(self, rotations, cached_eigh):
+        """Check rotation F-matrix gaps using eigenvalues cached by Jacobian eval."""
+        ws_all, _ = cached_eigh
+        if ws_all is None:
+            return None
+        _, _, _, _, slots, valid = self._rotation_padded_inputs(
+            self.all_positions
+        )
+        if not valid:
+            return None
+        for fi, slot in enumerate(slots):
+            if not self._rotation_gap_is_bad(ws_all[fi]):
+                continue
+            candidate = rotations[slot[0]]
+            if self._rotation_fragment_is_linear(candidate.indices):
+                continue
+            return candidate
+        return None
+
+    def _bad_rotation_from_direct_eigh(self, rotations):
+        """Compute rotation F-matrix eigenvalues directly on the first check."""
+        positions = self.all_positions
+        seen_fragments = set()
+        for rot in rotations:
+            frag_key = tuple(rot.indices)
+            if frag_key in seen_fragments:
+                continue
+            seen_fragments.add(frag_key)
+            idx = np.array(rot.indices)
+            pos = positions[idx]
+            dx = pos - pos.mean(0)
+            ws = np.linalg.eigvalsh(_build_F_matrix_np(dx, rot.kwargs['refpos']))
+            if not self._rotation_gap_is_bad(ws):
+                continue
+            if self._rotation_fragment_is_linear(rot.indices):
+                continue
+            return rot
+        return None
+
+    def _bad_rotation(self):
+        """Return the first near-degenerate non-linear rotation coordinate."""
+        rotations = self.internals['rotations']
+        if not rotations:
+            return None
+        cached_eigh = self._cache.get('stabilized_q_eigh')
+        if cached_eigh is not None:
+            return self._bad_rotation_from_cached_eigh(rotations, cached_eigh)
+        return self._bad_rotation_from_direct_eigh(rotations)
+
     def check_for_bad_internals(self) -> Optional[Dict[str, List[Coordinate]]]:
-        """Check for angles that are too close to 0 or pi (linear).
+        """Check for angles near 0/pi or near-degenerate rotation F-matrices.
 
         Uses vectorized computation for efficiency.
         """
@@ -3712,23 +4966,10 @@ class Internals(BaseInternals):
         if not angles:
             return None
 
-        # Use vectorized computation to check all angles at once
-        # Use padded arrays for consistent JAX shapes (avoids recompilation)
-        self._build_batched_arrays()
-        if self._n_angles_actual > 0:
-            positions = self.all_positions
-            cell = self.atoms.cell.array
-            tvecs = self._get_cached_tvecs(cell)
-            angle_pos = positions[self._angle_indices_padded]
-            angle_vals_padded = np.asarray(_angle_value_batched(angle_pos, tvecs['angles_padded']))
-            angle_vals = angle_vals_padded[:self._n_angles_actual]
-
-            # Find bad angles
-            bad_mask = ~((self.atol < angle_vals) & (angle_vals < np.pi - self.atol))
-            if np.any(bad_mask):
-                bad_indices = np.where(bad_mask)[0]
-                for idx in bad_indices:
-                    bad['angles'].append(angles[idx])
+        bad['angles'].extend(self._bad_angles())
+        bad_rotation = self._bad_rotation()
+        if bad_rotation is not None:
+            bad['angles'].append(bad_rotation)
 
         for ints in bad.values():
             if ints:
@@ -3790,31 +5031,50 @@ class Internals(BaseInternals):
         return h0 * units.Hartree
 
     def guess_hessian(self, h0cart=70.) -> np.ndarray:
+        # Bond count per atom (molecular topology) feeds the dihedral
+        # curvature heuristic; count over all bonds, independent of which
+        # coordinates are currently active.
         nbonds = np.zeros(len(self.all_atoms), dtype=np.int32)
-        h0 = np.zeros(self.nint, dtype=np.float64)
-        h0_tr = 0.05 * units.Hartree
-        idx = 0
-        for trans in self.internals['translations']:
-            h0[idx] = h0_tr if self.allow_fragments else h0cart
-            idx += 1
         for bond in self.internals['bonds']:
-            h0[idx] = self._h0_bond(bond)
-            idx += 1
-            # count number of bonds per atom for dihedral later
             i, j = bond.indices
             nbonds[i] += 1
             nbonds[j] += 1
-        for angle in self.internals['angles']:
-            h0[idx] = self._h0_angle(angle)
-            idx += 1
+
+        h0_tr = 0.05 * units.Hartree
+        periodic = np.any(self.atoms.pbc)
+        if periodic and self.allow_fragments:
+            h0_trans = 5.0
+            h0_rot = 15.0
+        else:
+            h0_trans = h0_tr
+            h0_rot = h0_tr
         dummy_set = set(range(self.natoms, self.natoms + self.ndummies))
-        for dihedral in self.internals['dihedrals']:
-            if any(j in dummy_set for j in dihedral.indices):
-                h0[idx] = 0.5 * units.Hartree
-            else:
-                h0[idx] = self._h0_dihedral(dihedral, nbonds)
-            idx += 1
-        for rot in self.internals['rotations']:
-            h0[idx] = h0_tr if self.allow_fragments else h0cart
-            idx += 1
+
+        def _h0_value(name, coord):
+            if name == 'translations':
+                return h0_trans if self.allow_fragments else h0cart
+            if name == 'bonds':
+                return self._h0_bond(coord)
+            if name == 'angles':
+                return self._h0_angle(coord)
+            if name == 'dihedrals':
+                if any(k in dummy_set for k in coord.indices):
+                    return 0.5 * units.Hartree
+                return self._h0_dihedral(coord, nbonds)
+            if name == 'rotations':
+                return h0_rot if self.allow_fragments else h0cart
+            # 'other': generic coordinate, use the default Cartesian curvature.
+            return h0cart
+
+        # Walk the coordinate families in canonical order, active coords only,
+        # so the diagonal stays aligned with jacobian()/hessian() row ordering.
+        h0 = np.zeros(self.nint, dtype=np.float64)
+        idx = 0
+        for name in self._names:
+            for coord, active in zip(self.internals[name],
+                                     self._active[name]):
+                if not active:
+                    continue
+                h0[idx] = _h0_value(name, coord)
+                idx += 1
         return np.diag(np.abs(h0))
