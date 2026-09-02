@@ -16,7 +16,12 @@ classifiers = [
   "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
   "Natural Language :: English",
   "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Chemistry",
   "Topic :: Scientific/Engineering :: Mathematics",
   "Topic :: Scientific/Engineering :: Physics",
@@ -24,10 +29,17 @@ classifiers = [
 dependencies = [
   "numpy >= 1.14.0",
   "scipy >= 1.1.0",
-  "ase >= 3.22.0",
+  "ase >= 3.26.0",
   "jax >= 0.4.20",
   "jaxlib >= 0.4.20",
 ]
+
+[project.urls]
+Homepage = "https://github.com/zadorlab/sella"
+Repository = "https://github.com/zadorlab/sella"
+Documentation = "https://github.com/zadorlab/sella/wiki"
+Issues = "https://github.com/zadorlab/sella/issues"
+Changelog = "https://github.com/zadorlab/sella/blob/master/CHANGELOG.md"
 
 [build-system]
 requires = [
