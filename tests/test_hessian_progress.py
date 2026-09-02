@@ -48,4 +48,9 @@ def test_hessian_progress_is_disabled_by_default(tmp_path):
     opt._ensure_initialized()
     opt.close()
 
-    assert '# Sella ' not in logfile.read_text()
+    # ASE >= 3.28 wraps the logfile in a Log object that opens the file
+    # lazily on the first write, so with progress logging disabled the file
+    # is never created at all. Older ASE opens it eagerly. Both mean the
+    # same thing here: nothing was logged.
+    contents = logfile.read_text() if logfile.exists() else ''
+    assert '# Sella ' not in contents
