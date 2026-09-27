@@ -94,9 +94,17 @@ class IRC(Optimizer):
             _, vecs = eigh(Hw)
             self.v0ts = self.dx * vecs[:, 0] / self.sqrtm
 
-            # force v0ts to be the direction where the first non-zero
-            # component is positive
-            if self.v0ts[np.nonzero(self.v0ts)[0][0]] < 0:
+            # force v0ts to be the direction where the first component
+            # whose magnitude is not numerically zero relative to the
+            # largest one is positive. Components of constrained atoms can
+            # be residue, which must not decide the sign. On a small FixAtoms
+            # slab that residue was about 1e-9 Angstrom against a largest
+            # component of about 3e-3 Angstrom, so 1e-3 of the largest
+            # component is well above it there; this is not a guarantee for
+            # arbitrary force noise.
+            v0abs = np.abs(self.v0ts)
+            first = np.flatnonzero(v0abs > 1e-3 * v0abs.max())[0]
+            if self.v0ts[first] < 0:
                 self.v0ts *= -1
 
             self.pescurr = self.pes.curr.copy()
